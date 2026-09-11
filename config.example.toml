@@ -1,0 +1,117 @@
+# light-ai-gateway configuration
+#
+# Copy to ~/.light-ai-gateway/config.toml (or pass --config) and fill in keys.
+# Secrets should come from the environment or a 0600 file, not from this file.
+
+[server]
+# Loopback by default: this process holds paid provider credentials.
+listen = "127.0.0.1:8787"
+db_path = "~/.light-ai-gateway/gateway.db"
+# Strongly recommended. Without it any local process can spend your quota.
+# local_key = { env = "AI_GW_LOCAL_KEY" }
+
+[policy]
+# Soft threshold: accounts at or above this stop taking NEW sessions but keep
+# serving sessions already bound to them. Keep it at 0.80 -- the gap up to the
+# hard gate is the reserve that stops a request overflowing into paid credits.
+soft_threshold = 0.80
+
+# When false (the default) a request is refused rather than allowed to spend a
+# wallet or purchased credits. Command Code does NOT return an error when a
+# 5-hour window is exhausted; it silently bills purchased credits instead. This
+# flag is the only thing standing between a window limit and real money.
+allow_metered = false
+
+# Probe cadence. Tightens while traffic is flowing, relaxes when idle.
+poll_interval_secs = 1200
+poll_interval_active_secs = 300
+poll_interval_idle_secs = 3600
+
+# Refresh the target account immediately before switching to it.
+probe_before_switch = true
+
+# Extra fixed safety margin added to the in-flight p95 on the hard gate.
+hard_margin = 0.0
+
+max_retries = 2
+connect_timeout_secs = 10
+ttft_timeout_secs = 120
+idle_timeout_secs = 120
+max_body_bytes = 33554432
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+
+[providers.xkiro]
+# GET /v1/usage gives spend windows (covered) plus a wallet (metered).
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+currency = "USD"
+
+[providers.xkiro.accounts.acc-1]
+key = { env = "XKIRO_KEY_1" }
+label = "xkiro primary"
+
+[providers.xkiro.accounts.acc-2]
+key = { env = "XKIRO_KEY_2" }
+label = "xkiro secondary"
+
+[providers.commandcode]
+# Traffic goes to /provider/v1; quota probes live on the bare host. The probe
+# host is pinned here so credentials never follow a client-supplied URL.
+adapter = "command-code"
+base_url = "https://api.commandcode.ai/provider/v1"
+probe_base_url = "https://api.commandcode.ai"
+currency = "USD"
+
+[providers.commandcode.accounts.acc-1]
+key = { env = "COMMANDCODE_KEY_1" }
+label = "command code"
+
+[providers.deepseek]
+# Wallet only: every request here is real money, so it is used last.
+adapter = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+probe_base_url = "https://api.deepseek.com"
+currency = "USD"
+
+[providers.deepseek.accounts.main]
+key = { env = "DEEPSEEK_KEY" }
+label = "deepseek"
+
+# ---------------------------------------------------------------------------
+# Routes: a model maps to exactly ONE provider.
+#
+# Cross-provider fallback and cross-model downgrade are deliberately out of
+# scope. Two providers offering the same model name would be ambiguous, so
+# either keep names unique or enable provider_prefix_aliases below.
+# ---------------------------------------------------------------------------
+
+[routes]
+"deepseek/deepseek-v3.2" = "xkiro"
+"openai/gpt-5.6-sol" = "xkiro"
+"claude/opus-4.8" = "commandcode"
+"deepseek/deepseek-chat" = "deepseek"
+
+# Optional escape hatch for name collisions. When set, a client may prefix the
+# model with the provider alias, for example "xkiro/deepseek/deepseek-v3.2".
+# [provider_prefix_aliases]
+# xkiro = "xkiro"
+# commandcode = "commandcode"
+
+# ---------------------------------------------------------------------------
+# Optional pricing, USD per million tokens.
+#
+# Models absent here are priced at a deliberately conservative fallback (the
+# rates of a premium frontier model). Under-estimating cost would make the hard
+# gate too permissive and spend real money, so the bias is intentional.
+# The gateway also learns effective per-model prices from the spend difference
+# between consecutive quota probes, which absorbs provider multipliers and
+# promotions automatically.
+# ---------------------------------------------------------------------------
+
+[prices."deepseek/deepseek-v3.2"]
+prompt_per_million = 0.28
+completion_per_million = 0.42
+cached_prompt_discount = 0.1

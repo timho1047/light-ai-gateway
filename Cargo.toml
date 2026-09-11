@@ -1,0 +1,24 @@
+[package]
+name = "light-ai-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive"] }
+futures-util = "0.3.34"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rust_decimal = { version = "1.43.0", features = ["serde-with-str"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.26.1", features = ["v4"] }

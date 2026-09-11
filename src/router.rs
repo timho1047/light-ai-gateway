@@ -1,0 +1,433 @@
+//! Integration layer: routing, probe orchestration, and persistence glue.
+//!
+//! FILE OWNER: Lead.
+//!
+//! The Gateway is the single object the HTTP layer talks to. It owns the account
+//! pool, the price table, the quota probes, and the database writer, and it is
+//! the only place that decides which pot of money pays for a request.
+
+use crate::accounts::{AttemptPlan, PlanError, Pool};
+use crate::config::{Config, ResolvedRoute};
+use crate::domain::{
+    now, Account, AttemptRecord, GateClass, RequestRecord, TokenUsage,
+};
+use crate::error::UpstreamErrorClass;
+use crate::meter::PriceTable;
+use crate::quota::{probe_for, QuotaProbe};
+use crate::store::StoreHandle;
+use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use time::OffsetDateTime;
+
+/// Provider spend observed at the last probe, for price learning.
+#[derive(Debug, Clone, Copy, Default)]
+struct SpendSample {
+    covered_spend: Decimal,
+}
+
+pub struct Gateway {
+    pub config: Config,
+    pub pool: Pool,
+    pub store: StoreHandle,
+    pub http: reqwest::Client,
+    pub prices: Mutex<PriceTable>,
+    pub probes: HashMap<String, Arc<dyn QuotaProbe>>,
+    /// Token usage accumulated since the last successful probe, keyed by
+    /// (provider, model). Only used to attribute probe-to-probe spend deltas.
+    pending: Mutex<HashMap<(String, String), TokenUsage>>,
+    last_spend: Mutex<HashMap<String, SpendSample>>,
+}
+
+impl Gateway {
+    pub async fn new(config: Config) -> Result<Arc<Self>> {
+        let accounts = config.build_accounts()?;
+        let pool = Pool::new(accounts, &config.policy);
+
+        // Probes are pinned to configured hosts so credentials can never be
+        // redirected to an address that came in with a request.
+        let mut probes: HashMap<String, Arc<dyn QuotaProbe>> = HashMap::new();
+        for (provider, adapter, base_url) in config.probe_targets() {
+            if let Some(p) = probe_for(adapter, &base_url) {
+                probes.insert(provider, p);
+            }
+        }
+
+        let db_path = config.db_path();
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let store = StoreHandle::spawn(&db_path)
+            .with_context(|| format!("opening database {}", db_path.display()))?;
+
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(config.policy.connect_timeout_secs))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("building upstream HTTP client")?;
+
+        // Seed the price table from configuration. seed_from_config skips
+        // non-finite and negative entries instead of coercing them: a NaN price
+        // silently becoming zero would make the model look free, and an
+        // under-estimated cost is what lets a request slip into metered spend.
+        let mut prices = PriceTable::new();
+        let seeded = prices.seed_from_config(&config.prices);
+        if seeded < config.prices.len() {
+            tracing::warn!(
+                skipped = config.prices.len() - seeded,
+                "ignored configured prices that are not usable"
+            );
+        }
+
+        let gateway = Arc::new(Gateway {
+            config,
+            pool,
+            store,
+            http,
+            prices: Mutex::new(prices),
+            probes,
+            pending: Mutex::new(HashMap::new()),
+            last_spend: Mutex::new(HashMap::new()),
+        });
+
+        // Restore the persisted ledger. Accounts come back in Unknown state, so
+        // nothing can serve traffic until it has been probed: resuming with a
+        // stale ledger is how a gateway re-spends quota it already consumed.
+        gateway.restore_from_disk();
+
+        // Probe everything once before accepting traffic.
+        gateway.probe_all().await;
+        gateway.save_accounts();
+
+        Ok(gateway)
+    }
+
+    /// Load persisted accounts into the pool, then persist the fresh snapshot.
+    fn restore_from_disk(&self) {
+        let path = self.config.db_path();
+        let Ok(conn) = crate::store::open_readonly(&path) else {
+            return;
+        };
+        let Ok(accounts) = crate::store::load_accounts(&conn) else {
+            return;
+        };
+        if !accounts.is_empty() {
+            tracing::info!(count = accounts.len(), "restored account ledger from disk");
+            self.pool.restore(accounts);
+        }
+    }
+
+    pub fn resolve(&self, client_model: &str) -> Result<ResolvedRoute> {
+        self.config.resolve(client_model)
+    }
+
+    /// Choose an account for a request.
+    ///
+    /// A routing failure is not a generic error: it carries how long the client
+    /// should wait, so the HTTP layer can answer 429 with a real Retry-After.
+    pub fn plan(
+        &self,
+        client_model: &str,
+        session_key: Option<&str>,
+        est_cost: Decimal,
+        request_id: &str,
+        attempt_no: u32,
+    ) -> Result<(ResolvedRoute, AttemptPlan), PlanError> {
+        let route = self
+            .config
+            .resolve(client_model)
+            .map_err(|_| PlanError::UnknownProvider(client_model.to_string()))?;
+        let plan = self.pool.select(
+            &route.provider,
+            &route.model,
+            session_key,
+            est_cost,
+            request_id,
+            attempt_no,
+        )?;
+        Ok((route, plan))
+    }
+
+    /// Estimated cost of a request, used to size the hard gate.
+    ///
+    /// Unknown models are priced at the conservative fallback rather than at
+    /// zero, so an unpriced model can never silently drain a wallet.
+    pub fn estimate_cost(
+        &self,
+        model: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        multiplier: Decimal,
+    ) -> Decimal {
+        let usage = TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            measured: false,
+        };
+        if let Ok(prices) = self.prices.lock() {
+            if let Some(c) = prices.estimate(model, &usage, multiplier) {
+                return c;
+            }
+        }
+        // Nothing known about this model: over-state rather than under-state.
+        crate::meter::conservative_estimate(&usage, multiplier)
+    }
+
+    /// Commit the estimated cost before the upstream call.
+    pub fn reserve(&self, plan: &AttemptPlan, est_cost: Decimal) {
+        self.pool.reserve(plan, est_cost);
+    }
+
+    /// Record a completed attempt that succeeded.
+    pub fn record_success(
+        &self,
+        plan: &AttemptPlan,
+        usage: &TokenUsage,
+        cost: Decimal,
+        attempt: AttemptRecord,
+        record: RequestRecord,
+    ) {
+        self.pool.settle(plan, cost, true);
+        self.pool.note_activity();
+        self.accumulate_usage(&plan.provider, &plan.model, usage);
+        // Standing contract with the store: persist the ledger after EVERY
+        // state transition. A lost ledger is not just a stale display -- on
+        // restart it means re-spending quota already consumed, which on
+        // Command Code silently becomes real money.
+        self.save_accounts();
+        self.store.record_attempt(attempt);
+        self.store.record_request(record);
+    }
+
+    /// Record a failed attempt.
+    ///
+    /// A failure that delivered nothing must not be charged to the gate, so the
+    /// reservation is released with billed = false.
+    pub fn record_failure(
+        &self,
+        plan: &AttemptPlan,
+        class: UpstreamErrorClass,
+        retry_after: Option<Duration>,
+        window_reset: Option<OffsetDateTime>,
+        attempt: AttemptRecord,
+    ) {
+        let billed = attempt.billed;
+        self.pool.settle(plan, Decimal::ZERO, billed);
+        self.pool
+            .note_error(&plan.account_id, class, retry_after, window_reset);
+        self.save_accounts();
+        self.store.record_attempt(attempt);
+    }
+
+    fn accumulate_usage(&self, provider: &str, model: &str, usage: &TokenUsage) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let e = pending
+            .entry((provider.to_string(), model.to_string()))
+            .or_default();
+        e.prompt_tokens += usage.prompt_tokens;
+        e.completion_tokens += usage.completion_tokens;
+        e.cached_tokens += usage.cached_tokens;
+        e.reasoning_tokens += usage.reasoning_tokens;
+    }
+
+    /// Probe every account of every provider that has an adapter.
+    pub async fn probe_all(&self) {
+        for provider in self.pool.providers() {
+            let Some(_probe) = self.probes.get(&provider) else {
+                continue;
+            };
+            for account in self.pool.accounts_of(&provider) {
+                self.probe_one(&provider, &account).await;
+            }
+            self.learn_from_probe(&provider);
+        }
+    }
+
+    /// Probe a single account by id, looking up which provider owns it.
+    pub async fn probe_account(&self, provider: &str, account_id: &str) {
+        let Some(account) = self
+            .pool
+            .accounts_of(provider)
+            .into_iter()
+            .find(|a| a.id == account_id)
+        else {
+            return;
+        };
+        self.probe_one(provider, &account).await;
+        self.learn_from_probe(provider);
+    }
+
+    /// Refresh one account if policy asks for it before switching to it.
+    pub async fn ensure_fresh(&self, provider: &str, account_id: &str) {
+        if !self.config.policy.probe_before_switch {
+            return;
+        }
+        self.probe_account(provider, account_id).await;
+    }
+
+    async fn probe_one(&self, provider: &str, account: &Account) {
+        let Some(probe) = self.probes.get(provider).cloned() else {
+            return;
+        };
+        match probe.probe(account, &self.http).await {
+            Ok(outcome) => {
+                if outcome.gates.is_empty() {
+                    self.pool
+                        .mark_stale(&account.id, "probe returned no gates");
+                    self.save_accounts();
+                    return;
+                }
+                tracing::debug!(
+                    provider,
+                    account = %account.id,
+                    gates = outcome.gates.len(),
+                    plan = ?outcome.plan,
+                    "quota probe ok"
+                );
+                self.pool.apply_probe(&account.id, outcome.gates, now());
+                self.save_accounts();
+            }
+            Err(e) => {
+                // Keep the previous reading and flag it stale. Writing zeros on
+                // failure would both overstate availability and make the CLI
+                // claim a funded account is empty.
+                tracing::warn!(provider, account = %account.id, error = %e, "quota probe failed");
+                self.pool.mark_stale(&account.id, &e.message);
+                self.save_accounts();
+            }
+        }
+    }
+
+    /// Attribute spend observed between probes to the models used in that
+    /// interval, so per-model effective prices (including provider multipliers
+    /// and promotions) are learned from real numbers rather than maintained by
+    /// hand.
+    fn learn_from_probe(&self, provider: &str) {
+        let accounts = self.pool.accounts_of(provider);
+        let covered: Decimal = accounts
+            .iter()
+            .flat_map(|a| a.covered_gates())
+            .filter(|g| !g.stale)
+            .map(|g| g.used)
+            .sum();
+
+        let previous = {
+            let Ok(mut last) = self.last_spend.lock() else {
+                return;
+            };
+            let prev = last.get(provider).copied().unwrap_or_default();
+            last.insert(
+                provider.to_string(),
+                SpendSample {
+                    covered_spend: covered,
+                },
+            );
+            prev
+        };
+
+        let delta = covered - previous.covered_spend;
+        if delta <= Decimal::ZERO {
+            return;
+        }
+
+        let drained: Vec<((String, String), TokenUsage)> = {
+            let Ok(mut pending) = self.pending.lock() else {
+                return;
+            };
+            let keys: Vec<(String, String)> = pending
+                .keys()
+                .filter(|(p, _)| p == provider)
+                .cloned()
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| pending.remove(&k).map(|u| (k, u)))
+                .collect()
+        };
+        if drained.is_empty() {
+            return;
+        }
+
+        let total_tokens: u64 = drained.iter().map(|(_, u)| u.total_tokens()).sum();
+        if total_tokens == 0 {
+            return;
+        }
+
+        let Ok(mut prices) = self.prices.lock() else {
+            return;
+        };
+        for ((_, model), usage) in drained {
+            let share = Decimal::from(usage.total_tokens()) / Decimal::from(total_tokens);
+            prices.observe(&model, delta * share, &usage);
+        }
+    }
+
+    /// Persist a request that failed across every attempt.
+    ///
+    /// Individual attempts are recorded as they happen. Without this the
+    /// request-level row for a total failure would be missing, so failures
+    /// would never appear in history or usage reports.
+    pub fn record_failed_request(&self, record: RequestRecord) {
+        self.save_accounts();
+        self.store.record_request(record);
+    }
+
+    /// Persist the current ledger.
+    pub fn save_accounts(&self) {
+        self.store.save_accounts(&self.pool.snapshot());
+    }
+
+    /// Background probe loop. Cadence tightens while traffic is flowing and
+    /// relaxes when the gateway is idle, which keeps probe volume low without
+    /// letting the ledger drift during a burst.
+    pub fn spawn_poller(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            // Give the initial probe a moment to settle before the first tick.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            loop {
+                let idle = this.pool.idle_for();
+                let p = &this.config.policy;
+                let secs = if idle < Duration::from_secs(300) {
+                    p.poll_interval_active_secs
+                } else if idle < Duration::from_secs(1800) {
+                    p.poll_interval_secs
+                } else {
+                    p.poll_interval_idle_secs
+                }
+                .max(15);
+
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+
+                this.probe_all().await;
+                this.save_accounts();
+            }
+        });
+    }
+
+    /// Persist the ledger and wait for the writer to commit, so a shutdown
+    /// never loses the most recent spend.
+    pub fn shutdown(&self) -> Result<()> {
+        self.save_accounts();
+        self.store.flush_blocking()
+    }
+
+    pub fn snapshot(&self) -> Vec<Account> {
+        self.pool.snapshot()
+    }
+
+    /// Which pot will pay for an account's next request, for display.
+    pub fn coverage_of(&self, account: &Account) -> GateClass {
+        if account.has_covered() {
+            GateClass::Covered
+        } else {
+            GateClass::Metered
+        }
+    }
+}
