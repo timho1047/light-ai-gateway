@@ -169,11 +169,10 @@ impl Gateway {
             reasoning_tokens: 0,
             measured: false,
         };
-        if let Ok(prices) = self.prices.lock() {
-            if let Some(c) = prices.estimate(model, &usage, multiplier) {
+        if let Ok(prices) = self.prices.lock()
+            && let Some(c) = prices.estimate(model, &usage, multiplier) {
                 return c;
             }
-        }
         // Nothing known about this model: over-state rather than under-state.
         crate::meter::conservative_estimate(&usage, multiplier)
     }

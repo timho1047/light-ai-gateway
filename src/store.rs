@@ -174,12 +174,11 @@ fn configure(conn: &Connection) -> Result<()> {
 
 /// Open (creating if needed) the database and apply the schema.
 pub fn open(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating database directory {}", parent.display()))?;
         }
-    }
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     configure(&conn)?;
     init_schema(&conn)?;
@@ -1378,7 +1377,9 @@ mod tests {
         handle.flush_blocking().expect("flush");
 
         let conn = open(&tmp.path).expect("open");
-        let row: (i64, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, i64) = conn
+        /// attempt_no, ttft_ms, error_class, error_code, retry_after_ms, billed, bytes_sent
+        type AttemptRow = (i64, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, i64);
+        let row: AttemptRow = conn
             .query_row(
                 "SELECT attempt_no, ttft_ms, error_class, error_code, retry_after_ms, billed, bytes_sent
                  FROM attempts WHERE request_id = 'req-1'",

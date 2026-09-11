@@ -402,18 +402,15 @@ impl Config {
         }
 
         // Optional provider-prefix escape hatch for name collisions.
-        if !self.provider_prefix_aliases.is_empty() {
-            if let Some((head, rest)) = client_model.split_once('/') {
-                if let Some(provider) = self.provider_prefix_aliases.get(head) {
-                    if !rest.is_empty() {
+        if !self.provider_prefix_aliases.is_empty()
+            && let Some((head, rest)) = client_model.split_once('/')
+                && let Some(provider) = self.provider_prefix_aliases.get(head)
+                    && !rest.is_empty() {
                         return Ok(ResolvedRoute {
                             provider: provider.clone(),
                             model: rest.to_string(),
                         });
                     }
-                }
-            }
-        }
 
         let mut known: Vec<&str> = self.routes.keys().map(String::as_str).collect();
         known.sort_unstable();

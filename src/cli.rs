@@ -1014,12 +1014,11 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
             path.display()
         );
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-    }
     std::fs::write(path, crate::config::sample_toml())
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote example config to {}", path.display());

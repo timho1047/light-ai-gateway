@@ -75,20 +75,18 @@ pub(crate) fn outcome_from_body(body: &str) -> Result<ProbeOutcome, ProbeError> 
         }
     }
 
-    if let Some(free) = object.get("free_tokens").and_then(Value::as_object) {
-        if let Some(g) = free_tokens_gate(free) {
+    if let Some(free) = object.get("free_tokens").and_then(Value::as_object)
+        && let Some(g) = free_tokens_gate(free) {
             gates.push(g);
         }
-    }
 
     // An explicit null wallet is a real reading ("no wallet on this plan"), so
     // it must not become a zero-balance gate. A missing amount inside a present
     // wallet object is likewise not treated as zero.
-    if let Some(wallet) = object.get("wallet").and_then(Value::as_object) {
-        if let Some(g) = wallet_gate(wallet) {
+    if let Some(wallet) = object.get("wallet").and_then(Value::as_object)
+        && let Some(g) = wallet_gate(wallet) {
             gates.push(g);
         }
-    }
 
     if gates.is_empty() {
         // Never report an empty success: the caller would carry nothing forward
@@ -136,7 +134,7 @@ fn free_tokens_gate(free: &Map<String, Value>) -> Option<Gate> {
     let limit = free.get("limit_per_day").and_then(json_u64);
     let remaining = free.get("remaining").and_then(json_u64);
 
-    let cap = limit.or_else(|| Some(used_today?.checked_add(remaining?)?))?;
+    let cap = limit.or_else(|| used_today?.checked_add(remaining?))?;
     let used = used_today.or_else(|| remaining.map(|r| cap.saturating_sub(r)))?;
 
     // The allowance is a rolling 24h window the provider does not timestamp.

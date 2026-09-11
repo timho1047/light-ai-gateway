@@ -112,11 +112,10 @@ pub(crate) fn outcome_from_credits_body(
     // scoped to the CURRENT period: the unscoped summary is lifetime spend, and
     // comparing it with this cycle's remaining credits produces a nonsense
     // percentage. No period -> no monthly gate (the windows are still real).
-    if let (Some(credits), Some(spend)) = (credits, period_spend) {
-        if let Some(monthly) = credits.get("monthlyCredits").and_then(json_money) {
+    if let (Some(credits), Some(spend)) = (credits, period_spend)
+        && let Some(monthly) = credits.get("monthlyCredits").and_then(json_money) {
             gates.push(gate(GateKind::Monthly, monthly, spend, period_end));
         }
-    }
 
     // Purchased credits never expire and are real money (Metered). They are a
     // bearer balance: the cap is what is left, nothing has been drawn from it

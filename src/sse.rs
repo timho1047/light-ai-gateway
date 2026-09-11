@@ -84,15 +84,14 @@ impl SseMeter {
         }
 
         let is_first_content = self.inner.content_chunks == 0;
-        if let Some(text) = content_text(&value) {
-            if !text.is_empty() {
+        if let Some(text) = content_text(&value)
+            && !text.is_empty() {
                 self.inner.content_chunks += 1;
                 self.content_chars = self
                     .content_chars
                     .saturating_add(text.chars().count() as u64);
                 obs.first_content = is_first_content;
             }
-        }
 
         if stream_finished(&value) {
             self.inner.saw_done = true;
@@ -223,25 +222,23 @@ impl StreamMeter {
                     self.drain_lines(true);
                 }
                 MeterMode::Json => {
-                    if !self.json_truncated {
-                        if let Ok(value) = serde_json::from_slice::<Value>(&self.json_buf) {
+                    if !self.json_truncated
+                        && let Ok(value) = serde_json::from_slice::<Value>(&self.json_buf) {
                             if let Some(usage) = usage_from_json(&value) {
                                 self.sse.merge_usage(&usage);
                             }
                             // Keep the content-length hint for the local
                             // estimate when no usage frame was present.
-                            if let Some(text) = content_text(&value) {
-                                if !text.is_empty() {
+                            if let Some(text) = content_text(&value)
+                                && !text.is_empty() {
                                     self.sse.inner.content_chunks += 1;
                                     self.sse.content_chars = self
                                         .sse
                                         .content_chars
                                         .saturating_add(text.chars().count() as u64);
                                 }
-                            }
                             self.sse.inner.saw_done = true;
                         }
-                    }
                 }
             }
         }
@@ -398,21 +395,18 @@ fn content_text(v: &Value) -> Option<&str> {
     // OpenAI: choices[].delta.content (or the non-streaming message.content).
     let choices = v.get("choices")?.as_array()?;
     for c in choices {
-        if let Some(t) = c.get("delta").and_then(|d| d.get("content")) {
-            if let Some(s) = text_of(t) {
+        if let Some(t) = c.get("delta").and_then(|d| d.get("content"))
+            && let Some(s) = text_of(t) {
                 return Some(s);
             }
-        }
-        if let Some(t) = c.get("message").and_then(|m| m.get("content")) {
-            if let Some(s) = text_of(t) {
+        if let Some(t) = c.get("message").and_then(|m| m.get("content"))
+            && let Some(s) = text_of(t) {
                 return Some(s);
             }
-        }
-        if let Some(t) = c.get("text") {
-            if let Some(s) = text_of(t) {
+        if let Some(t) = c.get("text")
+            && let Some(s) = text_of(t) {
                 return Some(s);
             }
-        }
     }
     None
 }
@@ -441,14 +435,13 @@ fn stream_finished(v: &Value) -> bool {
     {
         return true;
     }
-    if let Some(choices) = v.get("choices").and_then(Value::as_array) {
-        if choices
+    if let Some(choices) = v.get("choices").and_then(Value::as_array)
+        && choices
             .iter()
             .any(|c| !c.get("finish_reason").map(Value::is_null).unwrap_or(true))
         {
             return true;
         }
-    }
     false
 }
 

@@ -282,9 +282,9 @@ impl Pool {
     /// Move a parked account back to active once its window has reset.
     fn reap(&self, inner: &mut PoolInner, at: OffsetDateTime) {
         for acct in inner.accounts.iter_mut() {
-            if acct.state == AccountState::Parked {
-                if let Some(when) = acct.available_at {
-                    if when <= at {
+            if acct.state == AccountState::Parked
+                && let Some(when) = acct.available_at
+                    && when <= at {
                         acct.state = AccountState::Active;
                         acct.available_at = None;
                         acct.window_started_at = None;
@@ -297,8 +297,6 @@ impl Pool {
                             }
                         }
                     }
-                }
-            }
         }
     }
 
@@ -385,8 +383,8 @@ impl Pool {
 
         // Sticky affinity first: keeping a live session on its account is worth
         // more than any utilisation ordering.
-        if let Some(key) = session_key {
-            if let Some(bound) = inner.sticky.get(key) {
+        if let Some(key) = session_key
+            && let Some(bound) = inner.sticky.get(key) {
                 let usable = covered_cands
                     .iter()
                     .find(|c| &c.id == bound)
@@ -417,7 +415,6 @@ impl Pool {
                 }
                 // Bound account no longer acceptable: fall through and rebind.
             }
-        }
 
         // Prefer covered over metered, always.
         let (mut pool, coverage) = if !covered_cands.is_empty() {
@@ -500,11 +497,10 @@ impl Pool {
             });
         e.committed += est_cost;
         e.count += 1;
-        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id) {
-            if acct.window_started_at.is_none() {
+        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id)
+            && acct.window_started_at.is_none() {
                 acct.window_started_at = Some(now());
             }
-        }
     }
 
     /// Reconcile a reservation with actual usage and update the ledger.
@@ -569,15 +565,12 @@ impl Pool {
         // Crossing the soft threshold retires the account from NEW sessions.
         // Sticky sessions are deliberately left bound so they keep their cache.
         let soft = self.soft_threshold;
-        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id) {
-            if acct.state == AccountState::Active {
-                if let Some(u) = acct.peak_covered_utilization() {
-                    if u >= soft {
+        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id)
+            && acct.state == AccountState::Active
+                && let Some(u) = acct.peak_covered_utilization()
+                    && u >= soft {
                         acct.state = AccountState::Draining;
                     }
-                }
-            }
-        }
 
         self.maybe_forget_sticky(&mut inner, plan);
     }
@@ -692,13 +685,11 @@ impl Pool {
         }
 
         // Reflect the soft threshold against freshly probed numbers.
-        if acct.state == AccountState::Active {
-            if let Some(u) = acct.peak_covered_utilization() {
-                if u >= soft {
+        if acct.state == AccountState::Active
+            && let Some(u) = acct.peak_covered_utilization()
+                && u >= soft {
                     acct.state = AccountState::Draining;
                 }
-            }
-        }
     }
 
     /// Mark a probe as failed: keep the last reading and flag it stale.
@@ -923,7 +914,6 @@ mod tests {
         assert_eq!(plan.coverage, GateClass::Covered);
     }
 
-    #[test]
     #[test]
     fn a_spent_window_reports_when_it_will_roll_over() {
         // The account is not Parked, but its covered window is gone. A client

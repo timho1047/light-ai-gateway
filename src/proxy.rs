@@ -374,11 +374,10 @@ async fn chat_completions(
     // Without this flag the upstream never emits a usage frame and the local
     // ledger records zero forever, which silently disables cost control.
     let mut upstream_body = body.clone();
-    if stream && inject_include_usage(&mut value) {
-        if let Ok(bytes) = serde_json::to_vec(&value) {
+    if stream && inject_include_usage(&mut value)
+        && let Ok(bytes) = serde_json::to_vec(&value) {
             upstream_body = Bytes::from(bytes);
         }
-    }
 
     let max_attempts = state.backend.config().policy.max_retries.max(1);
     let connect_timeout = Duration::from_secs(
@@ -568,11 +567,10 @@ async fn chat_completions(
             if matches!(
                 class,
                 UpstreamErrorClass::RateLimitBurst | UpstreamErrorClass::Overloaded
-            ) {
-                if let Some(delay) = retry_after {
+            )
+                && let Some(delay) = retry_after {
                     tokio::time::sleep(delay.min(MAX_BACKOFF)).await;
                 }
-            }
             continue;
         }
 
@@ -634,8 +632,8 @@ async fn chat_completions(
         Some(failure) => {
             // Every attempt failed. Record the request itself so failures show
             // up in history instead of existing only as orphaned attempt rows.
-            if let Some(plan) = last_plan.as_ref() {
-                if let Some(account) = state.backend.account(&plan.account_id) {
+            if let Some(plan) = last_plan.as_ref()
+                && let Some(account) = state.backend.account(&plan.account_id) {
                     let total_ms = (now() - request_started).whole_milliseconds().max(0) as u64;
                     state.backend.record_failed_request(RequestRecord {
                         request_id: request_id.clone(),
@@ -658,7 +656,6 @@ async fn chat_completions(
                         provider_request_id: None,
                     });
                 }
-            }
             error_response_retry(
                 failure.status,
                 failure.kind.as_str(),
