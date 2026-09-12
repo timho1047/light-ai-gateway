@@ -15,6 +15,7 @@ pub mod router;
 pub mod secrets;
 pub mod sse;
 pub mod store;
+pub mod table;
 pub mod tier;
 
 pub use config::Config;

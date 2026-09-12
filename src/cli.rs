@@ -354,10 +354,14 @@ fn overview_of(a: &Account) -> AccountOverview {
     }
 }
 
-const BOARD_HEADERS: [&str; 6] = [
-    "PROVIDER", "ACCOUNT", "COVERED", "METERED", "RESETS", "STATE",
+const BOARD_HEADERS: [(&str, crate::table::Align); 6] = [
+    ("PROVIDER", crate::table::Align::Left),
+    ("ACCOUNT", crate::table::Align::Left),
+    ("COVERED", crate::table::Align::Left),
+    ("METERED", crate::table::Align::Left),
+    ("RESETS", crate::table::Align::Right),
+    ("STATE", crate::table::Align::Left),
 ];
-const BOARD_WIDTHS: [usize; 5] = [14, 18, 26, 26, 8];
 
 /// Render the account board.
 ///
@@ -365,23 +369,34 @@ const BOARD_WIDTHS: [usize; 5] = [14, 18, 26, 26, 8];
 /// METERED shows the money that is left, and says plainly when none of it has
 /// been touched. The two are deliberately different shapes so that an operator
 /// scanning the table cannot mistake one for the other.
+///
+/// Both are composite columns: several readings, each with its own label, plus a
+/// unit. Their sub-columns are measured across the whole board (see BoardWidths)
+/// rather than per cell, so a fraction, a window label and a currency code line
+/// up down the page even though accounts hold different numbers of windows.
 fn render_board(rows: &[AccountOverview], now: OffsetDateTime) -> String {
-    let mut out = String::new();
-    out.push_str(&board_row(&BOARD_HEADERS));
-    for r in rows {
-        let covered = covered_cell(r);
-        let metered = metered_cell(r);
-        let resets = reset_cell(r, now);
-        let state = state_cell(r);
-        out.push_str(&board_row(&[
-            r.provider.as_str(),
-            r.account_id.as_str(),
-            &covered,
-            &metered,
-            &resets,
-            &state,
-        ]));
+    // Measured widths, like every other table here. The board used to carry its
+    // own [14, 18, 26, 26, 8], and an account whose state explanation ran long --
+    // "DISABLED (insufficient_credit)" is exactly 32 -- pulled the columns after
+    // it out of line.
+    let covered: Vec<Option<Covered>> = rows.iter().map(covered_of).collect();
+    let metered: Vec<Option<Metered>> = rows.iter().map(metered_of).collect();
+    let covered_refs: Vec<&Covered> = covered.iter().flatten().collect();
+    let metered_refs: Vec<&Metered> = metered.iter().flatten().collect();
+    let widths = BoardWidths::measure(&covered_refs, &metered_refs);
+
+    let mut table = crate::table::Table::new(&BOARD_HEADERS);
+    for (i, r) in rows.iter().enumerate() {
+        table.push(vec![
+            r.provider.clone(),
+            r.account_id.clone(),
+            render_or_dash(covered[i].as_ref(), |c| widths.covered(c)),
+            render_or_dash(metered[i].as_ref(), |m| widths.metered(m)),
+            reset_cell(r, now),
+            state_cell(r),
+        ]);
     }
+    let mut out = table.render();
     out.push('\n');
     out.push_str(
         "covered = prepaid allowance consumed (used/cap, forfeited at reset)   \
@@ -393,18 +408,141 @@ fn render_board(rows: &[AccountOverview], now: OffsetDateTime) -> String {
     out
 }
 
-fn board_row(cells: &[&str; 6]) -> String {
-    let mut line = String::new();
-    for (i, cell) in cells.iter().enumerate() {
-        if i == cells.len() - 1 {
-            line.push_str(cell);
-        } else {
-            line.push_str(&format!("{:<width$}", cell, width = BOARD_WIDTHS[i]));
-            line.push_str("  ");
-        }
+/// An account with nothing to show in a composite column gets a dash rather than
+/// a blank: a blank cell reads as "nobody looked", a dash as "there is nothing
+/// there to look at".
+fn render_or_dash<T>(cell: Option<&T>, render: impl Fn(&T) -> String) -> String {
+    match cell {
+        Some(cell) => render(cell),
+        None => "-".to_string(),
     }
-    line.push('\n');
-    line
+}
+
+/// One window of prepaid allowance: its label, what has been consumed, and its cap.
+struct Window {
+    label: String,
+    used: String,
+    cap: String,
+}
+
+/// The covered column of one account, before the board's shared widths are known.
+struct Covered {
+    windows: Vec<Window>,
+    currency: String,
+    marks: String,
+}
+
+impl Covered {
+    /// The windows on one line, with each sub-column padded to the shared widths.
+    ///
+    /// The cap is padded on the right, so the slashes of two accounts sit in the
+    /// same column and "which of these is closer to its limit" is answered by
+    /// reading down instead of by counting characters.
+    fn windows_text(&self, w: &BoardWidths) -> String {
+        let (lw, uw, cw) = (w.window, w.used, w.cap);
+        self.windows
+            .iter()
+            .map(|win| {
+                format!(
+                    "{label:<lw$} {used:>uw$}/{cap:<cw$}",
+                    label = win.label,
+                    used = win.used,
+                    cap = win.cap
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+}
+
+/// One money pot: what it is, what is left, and what has happened to it.
+struct Pot {
+    label: String,
+    left: String,
+    note: String,
+}
+
+/// The metered column of one account, before the board's shared widths are known.
+struct Metered {
+    pots: Vec<Pot>,
+    currency: String,
+    marks: String,
+}
+
+/// The widths of the sub-columns inside the two composite cells, measured across
+/// every row of the board.
+///
+/// Without this each account brought its own widths: a "1320.1/1320" pushed that
+/// row's unit a column right of everyone else's, and two fractions could not be
+/// compared by scanning one vertical line. Measuring the sub-columns the way the
+/// outer table measures its own columns is what makes the board a table rather
+/// than a stack of formatted strings.
+#[derive(Clone, Copy, Default)]
+struct BoardWidths {
+    window: usize,
+    used: usize,
+    cap: usize,
+    pot: usize,
+    left: usize,
+    /// Width of the window part of the widest row. Rows carry different numbers
+    /// of windows, so the unit is another column that has to be lined up rather
+    /// than simply appended.
+    windows_part: usize,
+}
+
+impl BoardWidths {
+    fn measure(covered: &[&Covered], metered: &[&Metered]) -> Self {
+        let mut w = BoardWidths::default();
+        for c in covered {
+            for win in &c.windows {
+                w.window = w.window.max(win.label.chars().count());
+                w.used = w.used.max(win.used.chars().count());
+                w.cap = w.cap.max(win.cap.chars().count());
+            }
+        }
+        for m in metered {
+            for p in &m.pots {
+                w.pot = w.pot.max(p.label.chars().count());
+                w.left = w.left.max(p.left.chars().count());
+            }
+        }
+        // A second pass, because the width of the window part depends on the
+        // widths just measured.
+        for c in covered {
+            w.windows_part = w.windows_part.max(c.windows_text(&w).chars().count());
+        }
+        w
+    }
+
+    fn covered(&self, c: &Covered) -> String {
+        let mut out = c.windows_text(self);
+        // The unit is a column of its own: two spaces past the widest row's
+        // windows, so it lands in the same place on every line.
+        let gap = 2 + self.windows_part.saturating_sub(out.chars().count());
+        out.push_str(&" ".repeat(gap));
+        out.push_str(&c.currency);
+        out.push_str(&c.marks);
+        out
+    }
+
+    fn metered(&self, m: &Metered) -> String {
+        let (pw, lw) = (self.pot, self.left);
+        let pots = m
+            .pots
+            .iter()
+            .map(|p| {
+                format!(
+                    "{label:<pw$} {left:>lw$} {currency} ({note})",
+                    label = p.label,
+                    left = p.left,
+                    currency = m.currency,
+                    note = p.note
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        format!("{pots}{}", m.marks)
+    }
 }
 
 /// The covered column: the money-denominated allowances this account still has.
@@ -419,61 +557,81 @@ fn board_row(cells: &[&str; 6]) -> String {
 /// Every gate carries its own label. Without one the column is a row of bare
 /// fractions whose meaning depends on knowing the order, which is exactly how an
 /// allowance gets mistaken for a monthly cap.
-fn covered_cell(r: &AccountOverview) -> String {
+fn covered_of(r: &AccountOverview) -> Option<Covered> {
     let mut gates: Vec<&Gate> = r
         .gates
         .iter()
         .filter(|g| g.class() == GateClass::Covered && g.kind != GateKind::FreeTokens)
         .collect();
     if gates.is_empty() {
-        return "-".to_string();
+        return None;
     }
     gates.sort_by_key(|g| gate_rank(g.kind));
-
-    let mut out = String::new();
-    for g in &gates {
-        out.push_str(&format!(
-            "{} {}/{}  ",
-            g.kind.label(),
-            board_amount(g.used),
-            board_amount(g.cap)
-        ));
-    }
-    out.push_str(&r.currency);
-    out.push_str(&markers(&gates));
-    out
+    let windows = gates
+        .iter()
+        .map(|g| Window {
+            label: g.kind.label().to_string(),
+            used: board_amount(g.used),
+            cap: board_amount(g.cap),
+        })
+        .collect();
+    Some(Covered {
+        windows,
+        currency: r.currency.clone(),
+        marks: markers(&gates),
+    })
 }
 
-fn metered_cell(r: &AccountOverview) -> String {
+fn metered_of(r: &AccountOverview) -> Option<Metered> {
     let mut gates: Vec<&Gate> = r
         .gates
         .iter()
         .filter(|g| g.class() == GateClass::Metered)
         .collect();
     if gates.is_empty() {
-        return "-".to_string();
+        return None;
     }
     gates.sort_by_key(|g| gate_rank(g.kind));
-    let parts: Vec<String> = gates
+    let pots = gates
         .iter()
-        .map(|g| {
-            let note = if g.used <= Decimal::ZERO {
+        .map(|g| Pot {
+            label: g.kind.label().to_string(),
+            left: board_amount(g.remaining()),
+            // Spelled out rather than left to the reader: a balance that has
+            // never been touched is the strongest evidence the account is whole,
+            // and "0 spent" is a number to decode.
+            note: if g.used <= Decimal::ZERO {
                 "unused".to_string()
             } else {
                 format!("{} spent", board_amount(g.used))
-            };
-            // Label the pot too: a wallet and a purchased-credit balance are both
-            // real money but they behave differently on exhaustion.
-            format!(
-                "{} {} {}({})",
-                g.kind.label(),
-                board_amount(g.remaining()),
-                r.currency,
-                note
-            )
+            },
         })
         .collect();
-    format!("{}{}", parts.join("  "), markers(&gates))
+    Some(Metered {
+        pots,
+        currency: r.currency.clone(),
+        marks: markers(&gates),
+    })
+}
+
+/// The two cells as the board would render them for one account on its own.
+///
+/// The board itself measures across every row, so these single-row forms exist
+/// only for the tests that assert on one cell at a time.
+#[cfg(test)]
+fn covered_cell(r: &AccountOverview) -> String {
+    match covered_of(r) {
+        Some(c) => BoardWidths::measure(&[&c], &[]).covered(&c),
+        None => "-".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn metered_cell(r: &AccountOverview) -> String {
+    match metered_of(r) {
+        Some(m) => BoardWidths::measure(&[], &[&m]).metered(&m),
+        None => "-".to_string(),
+    }
 }
 
 /// A stale reading dominates an estimated one: it is the reading most likely to
@@ -562,14 +720,6 @@ fn gate_rank(kind: GateKind) -> u8 {
         GateKind::PurchasedCredits => 5,
         GateKind::Rpm => 6,
     }
-}
-
-/// Decimal without trailing zeros: 12.3400 prints as 12.34, 0 as 0.
-///
-/// Used for cost columns, where a request can genuinely cost 0.0000036 and must
-/// not be rounded away. Board amounts use board_amount instead.
-fn short(d: Decimal) -> String {
-    d.normalize().to_string()
 }
 
 /// An amount on the account board, rounded to ONE decimal place.
@@ -692,30 +842,41 @@ fn cmd_usage(path: &Path, args: &UsageArgs) -> Result<()> {
 
 /// The drift table, shared by the usage and prices commands.
 fn render_price_rows(rows: &[PriceRow]) -> String {
+    use crate::table::{Align, Table};
+
     let mut out = String::new();
-    out.push_str("DRIFT   observed spend against the configured schedule\n\n");
-    out.push_str(&format!(
-        "{:<13} {:<26} {:<10} {:<10} {:<14} {:<11} {:<11} {:<9} SAMPLES\n",
-        "PROVIDER", "MODEL", "TIER", "SOURCE", "MIX in/out/cr", "EXPECTED", "ACTUAL", "DRIFT"
-    ));
+    out.push_str(
+        "DRIFT   observed spend against the configured schedule, USD per million tokens\n\n",
+    );
+    let mut table = Table::new(&[
+        ("PROVIDER", Align::Left),
+        ("MODEL", Align::Left),
+        ("TIER", Align::Left),
+        ("SOURCE", Align::Left),
+        ("MIX", Align::Left),
+        ("EXPECTED", Align::Right),
+        ("ACTUAL", Align::Right),
+        ("DRIFT", Align::Right),
+        ("SAMPLES", Align::Right),
+    ]);
     for r in rows {
-        out.push_str(&format!(
-            "{:<13} {:<26} {:<10} {:<10} {:<14} {:<11} {:<11} {:<9} {}\n",
-            r.provider,
-            r.model,
-            r.tier_name,
-            r.source,
-            r.mix,
-            r.expected_per_million,
-            r.actual_per_million,
+        table.push(vec![
+            r.provider.clone(),
+            r.model.clone(),
+            r.tier_name.clone(),
+            r.source.clone(),
+            r.mix.clone(),
+            r.expected_per_million.clone(),
+            r.actual_per_million.clone(),
             if r.significant {
                 format!("{} !", r.drift)
             } else {
                 r.drift.clone()
             },
-            r.samples
-        ));
+            r.samples.to_string(),
+        ]);
     }
+    out.push_str(&table.render());
     out.push('\n');
     out.push_str(
         "EXPECTED is your configured rates applied to the observed usage for that tier.\n",
@@ -856,7 +1017,6 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
         .map(|d| d.column_header())
         .collect::<Vec<_>>()
         .join("+");
-    let key_width = header.len().max(16);
 
     // One key can legitimately appear once per currency, and the two must not
     // be added together (DESIGN section 7). Suffix the key in exactly that case
@@ -881,29 +1041,35 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
 
     let mut out = String::new();
     out.push_str(&format!(
-        "USAGE since {} (grouped by {})\n",
+        "USAGE since {} (grouped by {})\n\n",
         stamp(since),
         dims.iter()
             .map(|d| d.column_header().to_ascii_lowercase())
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    out.push_str(&format!(
-        "{:<key_width$}  {:>9}  {:>8}  {:>8}  {:>8}  {}\n",
-        header, "REQUESTS", "IN", "OUT", "CACHED", "COST"
-    ));
+
+    // Widths are measured, and the counts are scaled, so a nine-digit token count
+    // cannot push the cost column out of line the way it used to.
+    let mut table = crate::table::Table::new(&[
+        (&header, crate::table::Align::Left),
+        ("REQUESTS", crate::table::Align::Right),
+        ("IN", crate::table::Align::Right),
+        ("OUT", crate::table::Align::Right),
+        ("CACHED", crate::table::Align::Right),
+        ("COST", crate::table::Align::Right),
+    ]);
     for r in rows {
-        out.push_str(&format!(
-            "{:<key_width$}  {:>9}  {:>8}  {:>8}  {:>8}  {} {}\n",
+        table.push(vec![
             display_key(r),
-            r.requests,
-            r.input_tokens,
-            r.output_tokens,
-            r.cached_tokens,
-            short(r.cost),
-            r.currency
-        ));
+            r.requests.to_string(),
+            crate::table::tokens(r.input_tokens),
+            crate::table::tokens(r.output_tokens),
+            crate::table::tokens(r.cached_tokens),
+            crate::table::money_with(r.cost, &r.currency),
+        ]);
     }
+    out.push_str(&table.render());
 
     // Totals are per currency. Adding CNY to USD would be meaningless, and
     // DESIGN section 7 calls that out explicitly.
@@ -920,8 +1086,11 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
         out.push('\n');
         for (currency, (requests, input, output, cached, cost)) in totals {
             out.push_str(&format!(
-                "TOTAL {currency}: {requests} requests, in {input}, out {output}, cached {cached}, cost {} {currency}\n",
-                short(cost)
+                "TOTAL {currency}: {requests} requests, in {}, out {}, cached {}, cost {} {currency}\n",
+                crate::table::tokens(input),
+                crate::table::tokens(output),
+                crate::table::tokens(cached),
+                crate::table::money(cost),
             ));
         }
     }
@@ -945,21 +1114,28 @@ fn cmd_tail(path: &Path, limit: u32) -> Result<()> {
 }
 
 fn render_tail(rows: &[RequestSummary]) -> String {
+    use crate::table::{Align, Table, tokens};
+
     let mut out = String::new();
-    out.push_str(&format!(
-        "{:<8}  {:<9}  {:<12}  {:<10}  {:<28}  {:>7}  {:>7}  {:>7}  {:>8}  {:>7}  {}\n",
-        "TIME",
-        "STATUS",
-        "PROVIDER",
-        "ACCOUNT",
-        "MODEL",
-        "IN",
-        "OUT",
-        "CACHED",
-        "TTFT",
-        "TPS",
-        "COVERAGE"
-    ));
+
+    // MODEL is truncated rather than measured: a model name can be sixty
+    // characters, and one long row would otherwise stretch every column of the
+    // table to fit it. Everything else is measured.
+    const MODEL_WIDTH: usize = 28;
+
+    let mut table = Table::new(&[
+        ("TIME", Align::Left),
+        ("STATUS", Align::Left),
+        ("PROVIDER", Align::Left),
+        ("ACCOUNT", Align::Left),
+        ("MODEL", Align::Left),
+        ("IN", Align::Right),
+        ("OUT", Align::Right),
+        ("CACHED", Align::Right),
+        ("TTFT", Align::Right),
+        ("TPS", Align::Right),
+        ("COVERAGE", Align::Left),
+    ]);
     for r in rows {
         let ttft = r
             .ttft_ms
@@ -969,21 +1145,21 @@ fn render_tail(rows: &[RequestSummary]) -> String {
             .tps
             .map(|t| format!("{t:.1}"))
             .unwrap_or_else(|| "-".to_string());
-        out.push_str(&format!(
-            "{:<8}  {:<9}  {:<12}  {:<10}  {:<28}  {:>7}  {:>7}  {:>7}  {:>8}  {:>7}  {}\n",
+        table.push(vec![
             clock(r.ts),
-            status_label(r.status),
-            r.provider,
-            r.account_id,
-            truncate(&r.model, 28),
-            r.input_tokens,
-            r.output_tokens,
-            r.cached_tokens,
+            status_label(r.status).to_string(),
+            r.provider.clone(),
+            r.account_id.clone(),
+            truncate(&r.model, MODEL_WIDTH),
+            tokens(r.input_tokens),
+            tokens(r.output_tokens),
+            tokens(r.cached_tokens),
             ttft,
             tps,
-            coverage_label(r.coverage),
-        ));
+            coverage_label(r.coverage).to_string(),
+        ]);
     }
+    out.push_str(&table.render());
     out
 }
 
@@ -1588,16 +1764,21 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
         );
     }
     println!();
-    println!(
-        "{:<16} {:<20} {:<32} STATUS",
-        "PROVIDER", "ACCOUNT", "SOURCE"
-    );
+    let mut table = crate::table::Table::new(&[
+        ("PROVIDER", crate::table::Align::Left),
+        ("ACCOUNT", crate::table::Align::Left),
+        ("SOURCE", crate::table::Align::Left),
+        ("STATUS", crate::table::Align::Left),
+    ]);
     for row in &rows {
-        println!(
-            "{:<16} {:<20} {:<32} {}",
-            row.provider, row.account, row.source, row.status
-        );
+        table.push(vec![
+            row.provider.clone(),
+            row.account.clone(),
+            row.source.clone(),
+            row.status.clone(),
+        ]);
     }
+    print!("{}", table.render());
     println!();
     if per_account > 0 {
         println!(
@@ -1797,11 +1978,16 @@ fn usd(per_token: rust_decimal::Decimal) -> String {
     out
 }
 
-fn usd_from_million(per_million: f64) -> String {
-    let mut out = String::new();
-    out.push('$');
-    out.push_str(&format!("{per_million:.3}"));
-    out
+/// A rate, already per million tokens, with a dollar sign and a readable scale.
+///
+/// The old name said "from_million" but nothing was converted: it just printed
+/// three decimals whether or not the number had any, so $0.30 read as $0.300 and
+/// $15 as $15.000.
+fn usd_rate(per_million: f64) -> String {
+    match Decimal::try_from(per_million) {
+        Ok(rate) => format!("${}", crate::table::money(rate)),
+        Err(_) => format!("${per_million:.3}"),
+    }
 }
 
 /// A human reading of a configured window: "Mon-Fri 01:00-04:00, 06:00-10:00 UTC".
@@ -1854,9 +2040,9 @@ pub fn price_panel(
                     label: tier.name.clone(),
                     when: window_label(&s.days, &s.hours, s.tz.as_deref()),
                     ratio,
-                    input: usd_from_million(tier.input),
-                    output: usd_from_million(tier.output),
-                    cache_read: usd_from_million(tier.cache_read),
+                    input: usd_rate(tier.input),
+                    output: usd_rate(tier.output),
+                    cache_read: usd_rate(tier.cache_read),
                 });
             }
 
@@ -1869,9 +2055,9 @@ pub fn price_panel(
                     "every other hour".to_string()
                 },
                 ratio: "x1.00".to_string(),
-                input: usd_from_million(d.input),
-                output: usd_from_million(d.output),
-                cache_read: usd_from_million(d.cache_read),
+                input: usd_rate(d.input),
+                output: usd_rate(d.output),
+                cache_read: usd_rate(d.cache_read),
             });
 
             // A learned rate for a model with no configured price is the only
@@ -1916,31 +2102,61 @@ pub fn fallback_row() -> PricePanelRow {
         label: "fallback".to_string(),
         when: "any model with no configured price".to_string(),
         ratio: "-".to_string(),
-        input: usd_from_million(input),
-        output: usd_from_million(OUT as f64),
-        cache_read: usd_from_million(cache_read),
+        input: usd_rate(input),
+        output: usd_rate(OUT as f64),
+        cache_read: usd_rate(cache_read),
     }
 }
 
 fn print_price_panel(config: &Config, table: &crate::meter::PriceTable) {
+    use crate::table::{Align, Table};
+
+    /// The columns every panel shares, so a reader compares like with like across
+    /// models instead of re-reading an inline "in ... out ..." label each time.
+    const HEADERS: [(&str, Align); 6] = [
+        ("RATE", Align::Left),
+        ("WINDOW", Align::Left),
+        ("RATIO", Align::Right),
+        ("INPUT", Align::Right),
+        ("OUTPUT", Align::Right),
+        ("CACHE READ", Align::Right),
+    ];
+
+    let row_cells = |r: &PricePanelRow| {
+        vec![
+            r.label.clone(),
+            r.when.clone(),
+            r.ratio.clone(),
+            r.input.clone(),
+            r.output.clone(),
+            r.cache_read.clone(),
+        ]
+    };
+
+    // Rows sit under the model they belong to, so they are indented by two and
+    // the header goes with them.
+    let block = |rows: Vec<Vec<String>>| -> String {
+        let mut t = Table::new(&HEADERS);
+        for r in rows {
+            t.push(r);
+        }
+        t.render()
+            .lines()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let panels = price_panel(config, table);
     println!("PRICES   rates in effect, USD per million tokens");
     for (label, rows) in &panels {
         println!();
         println!("{label}");
-        for r in rows {
-            println!(
-                "  {:<16} {:<38} {:<6} in {:<8} out {:<8} cache-read {}",
-                r.label, r.when, r.ratio, r.input, r.output, r.cache_read
-            );
-        }
+        println!("{}", block(rows.iter().map(row_cells).collect()));
     }
     let f = fallback_row();
     println!();
-    println!(
-        "  {:<16} {:<38} {:<6} in {:<8} out {:<8} cache-read {}",
-        f.label, f.when, f.ratio, f.input, f.output, f.cache_read
-    );
+    println!("{}", block(vec![row_cells(&f)]));
     println!("  deliberately high - under-estimating is what spends money");
 }
 
@@ -2020,13 +2236,15 @@ pub fn price_rows(table: &crate::meter::PriceTable, names: &TierNames) -> Vec<Pr
             // expressed in money over the SAME observed mix, which is what makes
             // them readable: I expected this much per million, I am paying that.
             let drift = table.drift(provider, model, tier);
+            // Formatted straight from the Decimal: the f64 detour this used to
+            // take could not represent the value it was printing.
             let expected_per_million = drift
                 .as_ref()
-                .map(|d| format!("${:.4}", f64_of(d.expected_per_million)))
+                .map(|d| format!("${}", crate::table::money(d.expected_per_million)))
                 .unwrap_or_else(|| "-".to_string());
             let actual_per_million = table
                 .actual_per_million(provider, model, tier)
-                .map(|(v, _)| format!("${:.4}", f64_of(v)))
+                .map(|(v, _)| format!("${}", crate::table::money(v)))
                 .unwrap_or_else(|| "-".to_string());
 
             let samples = entry.learned.map(|p| p.samples).unwrap_or(0);
@@ -2135,8 +2353,10 @@ mod tests {
         assert_ne!(board_amount(dec("0.0000001")), "0");
         assert_eq!(board_amount(dec("-0.0000001")), "<-0.000001");
 
-        // Money is not rounded away in the cost columns, which use short().
-        assert_eq!(short(dec("0.0000036")), "0.0000036");
+        // Money is not rounded away in the cost columns either. board_amount is
+        // for the board; the report columns go through table::money, which keeps a
+        // per-request cost like this one intact.
+        assert_eq!(crate::table::money(dec("0.0000036")), "0.0000036");
     }
     // -- prices --------------------------------------------------------------
 
@@ -2199,8 +2419,10 @@ mod tests {
         assert_eq!(glm.mix, "100/0/0%");
         // Configured $0.30/M input applied to that mix, against the $0.90/M the
         // observed spend actually works out to.
-        assert_eq!(glm.expected_per_million, "$0.3000");
-        assert_eq!(glm.actual_per_million, "$0.9000");
+        // Trailing zeros are not precision: $0.3000 and $0.3 are the same money,
+        // and the column is right-aligned so the decimal points still line up.
+        assert_eq!(glm.expected_per_million, "$0.3");
+        assert_eq!(glm.actual_per_million, "$0.9");
         assert_eq!(glm.drift, "+200.0%");
         assert!(glm.significant, "a tripling must be flagged");
         assert_eq!(glm.samples, 1);
@@ -2482,7 +2704,7 @@ key = {{ key_file = "{key_file}" }}
             "covered shows used/cap and its unit"
         );
         assert_eq!(
-            metered, "credits 12 USD(unused)",
+            metered, "credits 12 USD (unused)",
             "metered shows the money left and says it is untouched"
         );
         assert_ne!(covered, metered);
@@ -2491,12 +2713,121 @@ key = {{ key_file = "{key_file}" }}
         assert!(board.contains("COVERED"));
         assert!(board.contains("METERED"));
         assert!(board.contains("5h 40/100  7d 25/500  USD"));
-        assert!(board.contains("credits 12 USD(unused)"));
+        assert!(board.contains("credits 12 USD (unused)"));
         assert!(board.contains("DRAINING"));
         assert!(
             board.contains("metered = real money remaining"),
             "the legend must explain the two columns: {board}"
         );
+    }
+
+    /// The composite cells are measured across the whole board, not per row.
+    ///
+    /// Two accounts with different numbers of windows and wildly different
+    /// fractions must still agree on where the slashes and the unit sit: that is
+    /// the difference between a table of allowances and two lines of text that
+    /// happen to be stacked.
+    #[test]
+    fn board_lines_up_the_sub_columns_of_every_row() {
+        let t = now();
+        let short = overview(
+            "xkiro",
+            "xk-1",
+            "USD",
+            AccountState::Active,
+            vec![
+                gate(
+                    GateKind::FiveHour,
+                    "20",
+                    "0",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+                gate(
+                    GateKind::Weekly,
+                    "132",
+                    "0.001",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+                gate(
+                    GateKind::PurchasedCredits,
+                    "4",
+                    "0",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+            ],
+        );
+        let long = overview(
+            "deepseek",
+            "ds-1",
+            "USD",
+            AccountState::Active,
+            vec![
+                gate(
+                    GateKind::FiveHour,
+                    "200",
+                    "0",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+                gate(
+                    GateKind::Weekly,
+                    "1320",
+                    "1320.1",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+                gate(
+                    GateKind::Wallet,
+                    "700",
+                    "16.05",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+            ],
+        );
+
+        let board = render_board(&[short, long], t);
+        let rows: Vec<&str> = board
+            .lines()
+            .filter(|l| l.starts_with("xkiro") || l.starts_with("deepseek"))
+            .collect();
+        assert_eq!(rows.len(), 2, "{board}");
+
+        let slashes = |l: &str| l.match_indices('/').map(|(i, _)| i).collect::<Vec<_>>();
+        assert_eq!(
+            slashes(rows[0]),
+            slashes(rows[1]),
+            "the fractions drifted apart: {board}"
+        );
+        let unit = |l: &str| l.find("USD").expect("every row carries its unit");
+        assert_eq!(
+            unit(rows[0]),
+            unit(rows[1]),
+            "the unit column drifted: {board}"
+        );
+        let note = |l: &str| l.find('(').expect("the note follows the money");
+        assert_eq!(
+            note(rows[0]),
+            note(rows[1]),
+            "the pot labels are not the same width: {board}"
+        );
+        assert!(rows[0].contains("credits"), "the pot is labelled: {board}");
+        assert!(rows[1].contains("wallet"), "the pot is labelled: {board}");
     }
 
     /// The board must not print a free-token allowance.
@@ -2582,7 +2913,7 @@ key = {{ key_file = "{key_file}" }}
             )],
         );
         assert_eq!(covered_cell(&acct), "-", "covered must be blank, not 0/0");
-        assert_eq!(metered_cell(&acct), "wallet 12.3 USD(unused)");
+        assert_eq!(metered_cell(&acct), "wallet 12.3 USD (unused)");
         assert!(state_cell(&acct).contains("metered only"));
         assert_eq!(reset_cell(&acct, t), "-", "a wallet has no reset");
     }
@@ -2605,7 +2936,7 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        assert_eq!(metered_cell(&acct), "wallet 684 USD(16.1 spent)");
+        assert_eq!(metered_cell(&acct), "wallet 684 USD (16.1 spent)");
     }
 
     #[test]

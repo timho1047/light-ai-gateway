@@ -265,17 +265,17 @@ plausible number is worth more than a table that quietly wedges the hard gate.
 
     lgw prices
 
-    PROVIDER  MODEL                SOURCE   MIX in/out/cr  EXPECTED  ACTUAL   DRIFT   SAMPLES
-    xkiro     z-ai/glm-5.3-flash   learned  79/1/20%       $0.2554   $0.9000  +252.3% !  12
+    PROVIDER  MODEL               SOURCE   MIX       EXPECTED  ACTUAL  DRIFT      SAMPLES
+    xkiro     z-ai/glm-5.3-flash  learned  79/1/20%  $0.2554   $0.9    +252.3% !       12
 
 Both money columns are **USD per million tokens over the same observed mix**:
 EXPECTED is your configured prices applied to that mix, ACTUAL is what the
 observed spend works out to. Read together they say "I expected $0.26 per
-million and I am paying $0.90".
+million and I am paying $0.9".
 
 The MIX column is not decoration. The same prices cost very different amounts
 per million on different mixes -- measured, $0.2166/M on an input-heavy mix
-against $0.9000/M on an output-heavy one -- so a per-million figure only means
+against $0.9/M on an output-heavy one -- so a per-million figure only means
 something next to the mix it was measured on. Never compare one across mixes.
 
 DRIFT is the exception: it is zero whenever prices match, whatever the mix,
