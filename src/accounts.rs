@@ -23,8 +23,11 @@
 //!    the upstream prompt cache.
 //!
 //! Unit note: gate arithmetic assumes a money-like unit (USD or credits).
-//! FreeTokens gates are counted in tokens and are therefore excluded from the
-//! cost comparison; they are enforced through the soft threshold and the
+//! FreeTokens gates are counted in tokens, so they are excluded from every
+//! account-level decision here -- the hard gate, the soft threshold and the
+//! consume-first ordering. Exhausting a free allowance blocks free models only;
+//! letting it retire the account would take paid models offline because an
+//! allowance nobody was spending ran out. It reaches the client as the
 //! provider's own 429.
 
 use crate::config::PolicyConfig;
@@ -213,14 +216,12 @@ impl Pool {
     }
 
     /// Headroom on covered gates only, in gate units.
+    ///
+    /// account_gates() already drops the token-denominated allowance: comparing
+    /// a USD estimate against a token cap would be meaningless.
     fn covered_headroom(&self, acct: &Account) -> Option<Decimal> {
         let mut min: Option<Decimal> = None;
-        for g in acct.covered_gates() {
-            // FreeTokens is denominated in tokens, not money; comparing a USD
-            // estimate against it would be meaningless.
-            if g.kind == GateKind::FreeTokens {
-                continue;
-            }
+        for g in acct.account_gates() {
             if g.cap <= Decimal::ZERO {
                 continue;
             }
@@ -955,6 +956,83 @@ mod tests {
             p.account("commandcode/acc-1").unwrap().state,
             AccountState::Active
         );
+    }
+
+    /// The free-token allowance must not gate paid traffic.
+    ///
+    /// Free models are not routed through this gateway, so an allowance nobody
+    /// spends must not be able to retire an account that still has plenty of
+    /// paid quota. Before this, a daily free allowance at 99% pushed the account
+    /// past the soft threshold and stopped new sessions on models that never
+    /// touch it -- an outage caused by a resource that was not being used.
+    #[test]
+    fn a_nearly_spent_free_allowance_does_not_retire_the_account() {
+        let p = Pool::new(
+            vec![acct("xk-1", "xkiro", vec![cover(200, 20)], AccountState::Active)],
+            &policy(),
+        );
+
+        p.apply_probe(
+            "xkiro/xk-1",
+            vec![
+                cover(200, 30),
+                gate(
+                    GateKind::FreeTokens,
+                    Decimal::from(30_000_000u64),
+                    Decimal::from(29_700_000u64),
+                    None,
+                ),
+            ],
+            crate::domain::now(),
+        );
+
+        let a = p.account("xkiro/xk-1").unwrap();
+        let u = a.peak_covered_utilization().unwrap();
+        assert!(
+            (u - 0.15).abs() < 1e-9,
+            "the threshold must read the paid window, not the free allowance: {u}"
+        );
+        assert_eq!(
+            a.state,
+            AccountState::Active,
+            "99% of a free allowance must not drain an account at 15% of paid quota"
+        );
+    }
+
+    /// The same allowance must not skew consume-first ordering either, or the
+    /// account with the biggest free bucket wins every request.
+    #[test]
+    fn a_free_allowance_does_not_skew_consume_first_ordering() {
+        let free = |cap: i64, used: i64| {
+            gate(
+                GateKind::FreeTokens,
+                Decimal::from(cap),
+                Decimal::from(used),
+                None,
+            )
+        };
+        let p = Pool::new(
+            vec![
+                acct(
+                    "big-free",
+                    "xkiro",
+                    vec![cover(100, 10), free(30_000_000, 0)],
+                    AccountState::Active,
+                ),
+                acct(
+                    "no-free",
+                    "xkiro",
+                    vec![cover(100, 60)],
+                    AccountState::Active,
+                ),
+            ],
+            &policy(),
+        );
+
+        // Consume-first picks the MOST utilised account, and now only the paid
+        // windows count: 60/100 beats 10/100 regardless of the free bucket.
+        let plan = p.select("xkiro", "m", None, Decimal::ONE, "r", 1).unwrap();
+        assert_eq!(plan.qualified_account(), "xkiro/no-free");
     }
 
     #[test]

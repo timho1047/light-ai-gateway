@@ -390,51 +390,31 @@ fn board_row(cells: &[&str; 6]) -> String {
     line
 }
 
-/// Token counts on the board.
+/// The covered column: the money-denominated allowances this account still has.
 ///
-/// A daily allowance of 30000000 reads better as 30M, and unlike a spend this is
-/// an allowance rather than a measurement, so the exact digits carry no
-/// information at a glance.
-fn token_count(d: Decimal) -> String {
-    use rust_decimal::prelude::ToPrimitive;
-    let v = d.to_f64().unwrap_or(0.0);
-    if v >= 1_000_000.0 {
-        format!("{:.0}M", v / 1_000_000.0)
-    } else if v >= 1_000.0 {
-        format!("{:.0}k", v / 1_000.0)
-    } else {
-        board_amount(d)
-    }
-}
-
-/// Whether a gate is denominated in money or in tokens.
+/// Only money-denominated gates appear. A gate counted in tokens is a limit on
+/// a different thing -- the free-token allowance gates free models, not the paid
+/// traffic this board is about -- and printing its raw number next to a currency
+/// code claimed that 30000000 tokens were 30000000 dollars. It is hidden rather
+/// than converted because an operator paying for every request has no use for
+/// it, and an unused allowance nobody spends is not worth a column.
 ///
-/// This distinction has to survive into the display. The free-token allowance is
-/// counted in TOKENS, and printing it under the account's currency label claimed
-/// that 30000000 tokens were 30000000 dollars.
-fn is_money(g: &Gate) -> bool {
-    g.kind != GateKind::FreeTokens
-}
-
+/// Every gate carries its own label. Without one the column is a row of bare
+/// fractions whose meaning depends on knowing the order, which is exactly how an
+/// allowance gets mistaken for a monthly cap.
 fn covered_cell(r: &AccountOverview) -> String {
     let mut gates: Vec<&Gate> = r
         .gates
         .iter()
-        .filter(|g| g.class() == GateClass::Covered)
+        .filter(|g| g.class() == GateClass::Covered && g.kind != GateKind::FreeTokens)
         .collect();
     if gates.is_empty() {
         return "-".to_string();
     }
     gates.sort_by_key(|g| gate_rank(g.kind));
 
-    // Every gate carries its own label. Without one the column is a row of bare
-    // fractions whose meaning depends on knowing the order, which is exactly how
-    // a free-token allowance gets mistaken for a monthly cap.
-    let money: Vec<&&Gate> = gates.iter().filter(|g| is_money(g)).collect();
-    let tokens: Vec<&&Gate> = gates.iter().filter(|g| !is_money(g)).collect();
-
     let mut out = String::new();
-    for g in &money {
+    for g in &gates {
         out.push_str(&format!(
             "{} {}/{}  ",
             g.kind.label(),
@@ -442,20 +422,7 @@ fn covered_cell(r: &AccountOverview) -> String {
             board_amount(g.cap)
         ));
     }
-    if !money.is_empty() {
-        out.push_str(&r.currency);
-    }
-    for (i, g) in tokens.iter().enumerate() {
-        if !money.is_empty() || i > 0 {
-            out.push_str("  ");
-        }
-        out.push_str(&format!(
-            "{} {}/{} tok",
-            g.kind.label(),
-            token_count(g.used),
-            token_count(g.cap)
-        ));
-    }
+    out.push_str(&r.currency);
     out.push_str(&markers(&gates));
     out
 }
@@ -2184,6 +2151,62 @@ key = {{ key_file = "{key_file}" }}
             board.contains("metered = real money remaining"),
             "the legend must explain the two columns: {board}"
         );
+    }
+
+    /// The board must not print a free-token allowance.
+    ///
+    /// It is counted in tokens rather than money, so it has no place sitting
+    /// under a currency code, and an operator who never calls a free model has
+    /// no use for the number. The gate is still probed and stored -- this board
+    /// simply does not show it.
+    #[test]
+    fn board_hides_the_free_token_allowance() {
+        let t = now();
+        let acct = overview(
+            "xkiro",
+            "xk-1",
+            "USD",
+            AccountState::Active,
+            vec![
+                gate(GateKind::FiveHour, "20", "0.5", None, Confidence::Exact, false, t),
+                gate(
+                    GateKind::FreeTokens,
+                    "30000000",
+                    "368",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+            ],
+        );
+
+        let covered = covered_cell(&acct);
+        assert_eq!(covered, "5h 0.5/20  USD");
+        assert!(!covered.contains("free"), "no free allowance: {covered}");
+        assert!(!covered.contains("tok"), "no token count: {covered}");
+    }
+
+    /// A free allowance on its own is not a covered reading at all.
+    #[test]
+    fn a_free_allowance_alone_leaves_the_covered_column_blank() {
+        let t = now();
+        let acct = overview(
+            "xkiro",
+            "xk-2",
+            "USD",
+            AccountState::Active,
+            vec![gate(
+                GateKind::FreeTokens,
+                "30000000",
+                "0",
+                None,
+                Confidence::Exact,
+                false,
+                t,
+            )],
+        );
+        assert_eq!(covered_cell(&acct), "-");
     }
 
     #[test]

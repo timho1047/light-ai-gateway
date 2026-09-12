@@ -263,20 +263,38 @@ impl Account {
         self.gates.iter().filter(|g| g.class() == GateClass::Metered)
     }
 
-    /// Highest utilization across covered gates, if any.
+    /// Covered gates that gate the ACCOUNT itself, which means the
+    /// money-denominated ones.
+    ///
+    /// The free-token allowance is deliberately excluded. Exhausting it blocks
+    /// only free models; paid models keep working. Letting it drive the account
+    /// threshold would retire an account from paid traffic because an allowance
+    /// nobody was using ran out, which is not what that limit means.
+    pub fn account_gates(&self) -> impl Iterator<Item = &Gate> {
+        self.covered_gates().filter(|g| g.kind != GateKind::FreeTokens)
+    }
+
+    /// Highest utilization across the gates that actually gate the account.
     pub fn peak_covered_utilization(&self) -> Option<f64> {
-        self.covered_gates()
+        self.account_gates()
             .map(|g| g.utilization_f64())
             .reduce(f64::max)
     }
 
-    /// Lowest covered remaining, for consume-first ordering.
+    /// Lowest account-level covered remaining, for consume-first ordering.
     pub fn min_covered_remaining(&self) -> Option<Decimal> {
-        self.covered_gates()
+        self.account_gates()
             .map(|g| g.remaining())
             .reduce(Decimal::min)
     }
 
+    /// Whether any prepaid allowance is reported at all.
+    ///
+    /// Any covered gate counts, including the free-token allowance, because this
+    /// answers "did the provider report a prepaid pot". Whether that pot may be
+    /// spent is a different question -- see account_gates() and the headroom
+    /// calculation in the pool, which returns None for a free-only account and
+    /// so routes it down the metered path.
     pub fn has_covered(&self) -> bool {
         self.covered_gates().next().is_some()
     }

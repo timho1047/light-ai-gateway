@@ -184,8 +184,15 @@ Every quota check is one of two kinds, and the gateway never conflates them:
 
 | Class | Examples | Behaviour |
 |---|---|---|
-| **Covered** | xKiro 5h/7d spend windows, Command Code monthly credits, free token allowance | Prepaid by a subscription. Forfeited when the window resets. Preferred. |
+| **Covered** | xKiro 5h/7d spend windows, Command Code monthly credits | Prepaid by a subscription. Forfeited when the window resets. Preferred. |
 | **Metered** | xKiro wallet, Command Code purchased credits, DeepSeek balance | Real money. Permanent once spent. Refused unless the operator opts in. |
+
+A third kind sits outside this table: xKiro's daily **free-token allowance**. It
+is read and stored, but it is counted in tokens rather than money, so it takes no
+part in routing, in the hard gate or in the board. Exhausting it blocks free
+models only, and free models are not routed here; letting it retire an account
+would take paid models offline because an allowance nobody was spending ran out.
+It reaches the client as the provider's own 429.
 
 The distinction is not cosmetic. Command Code does not return an error when a
 5-hour window is exhausted; it silently bills your purchased credits instead, so
