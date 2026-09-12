@@ -1061,6 +1061,24 @@ fn listens_on_loopback(listen: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
 }
 
+/// HTTP client for quota probes.
+///
+/// ONE constructor on purpose. The policy here is load-bearing and two call
+/// sites had already drifted apart once: the daemon pinned redirects and the CLI
+/// probes did not, so a 3xx could have carried a bearer token to whatever host a
+/// Location header named. Two copies of a security policy is one copy too many.
+fn probe_client(config: &Config) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            config.policy.connect_timeout_secs.max(1),
+        ))
+        // The bearer token is attached before the request leaves, so following a
+        // redirect would hand the credential to the host it names.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building the probe HTTP client")
+}
+
 fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
     let config = load_config(path)?;
     let provider = provider_of(&config, account_id)?;
@@ -1211,12 +1229,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     }
 
     println!("probes      :");
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(
-            config.policy.connect_timeout_secs.max(1),
-        ))
-        .build()
-        .context("building the probe HTTP client")?;
+    let client = probe_client(&config)?;
 
     let mut targets: HashMap<String, (QuotaAdapter, String)> = HashMap::new();
     for (provider, adapter, base) in config.probe_targets() {
@@ -1694,12 +1707,7 @@ async fn cmd_keys_test(
         last_error: None,
     };
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(
-            config.policy.connect_timeout_secs.max(1),
-        ))
-        .build()
-        .context("building the probe HTTP client")?;
+    let client = probe_client(config)?;
 
     match probe.probe(&account_model, &client).await {
         Ok(outcome) => {
