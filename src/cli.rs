@@ -1335,42 +1335,21 @@ pub struct PriceRow {
     pub provider: String,
     pub model: String,
     pub source: String,
-    /// Rendering of the configured prompt/completion split, per million tokens.
-    pub configured: String,
-    /// Rendering of the learned blended rate, per million tokens.
-    pub learned: String,
+    /// Input / output / cache-read share of the tokens actually used.
+    pub mix: String,
+    /// Configured prices applied to that mix, per million tokens.
+    pub expected_per_million: String,
+    /// Observed spend over that same mix, per million tokens.
+    pub actual_per_million: String,
     /// Cost drift against the configured price, or a dash when not comparable.
     pub drift: String,
     pub significant: bool,
     pub samples: u64,
 }
 
-/// Render a per-token price as USD per million tokens, without trailing zeros.
-///
-/// Prices span a wide range (a free model is 0, a frontier model is tens of
-/// dollars per million), so the precision adapts; the trimming keeps a table of
-/// prices readable rather than a wall of zeros.
-fn per_million(per_token: Decimal) -> String {
+fn f64_of(d: Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
-    let v = per_token.to_f64().unwrap_or(0.0) * 1_000_000.0;
-    if v == 0.0 {
-        return "0".to_string();
-    }
-    let magnitude = v.abs();
-    let raw = if magnitude < 0.001 {
-        format!("{v:.6}")
-    } else if magnitude < 1.0 {
-        format!("{v:.4}")
-    } else if magnitude < 100.0 {
-        format!("{v:.3}")
-    } else {
-        format!("{v:.2}")
-    };
-    if raw.contains('.') {
-        raw.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        raw
-    }
+    d.to_f64().unwrap_or(0.0)
 }
 
 /// Build the price report. Pure, so it can be tested without a terminal.
@@ -1379,34 +1358,34 @@ pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
         .entries()
         .filter_map(|(provider, model, entry)| {
             let source = entry.source()?.label().to_string();
-            let configured = match entry.configured {
-                Some(p) => format!(
-                    "{} / {} / {}",
-                    per_million(p.input_per_token),
-                    per_million(p.output_per_token),
-                    per_million(p.cache_read_per_token)
-                ),
+
+            // The mix is what makes a per-million figure mean anything: the same
+            // prices produce very different per-million costs on different mixes.
+            let mix = match entry.mix_percentages() {
+                Some((i, o, c)) => format!("{i:.0}/{o:.0}/{c:.0}%"),
                 None => "-".to_string(),
             };
-            // The learned figure is a single blended rate: one equation cannot
-            // separate an input rate from an output rate. Input and output are
-            // therefore shown once, and the cache-read share is carried over from
-            // whatever was configured, so it is not mistaken for a measured split.
-            let learned = match entry.learned {
-                Some(p) => format!(
-                    "{} (in=out)",
-                    per_million(p.input_per_token)
-                ),
-                None => "-".to_string(),
-            };
+            // The two per-million figures are the same comparison as the ratio,
+            // expressed in money over the SAME observed mix, which is what makes
+            // them readable: I expected this much per million, I am paying that.
             let drift = table.drift(provider, model);
+            let expected_per_million = drift
+                .as_ref()
+                .map(|d| format!("${:.4}", f64_of(d.expected_per_million)))
+                .unwrap_or_else(|| "-".to_string());
+            let actual_per_million = table
+                .actual_per_million(provider, model)
+                .map(|(v, _)| format!("${:.4}", f64_of(v)))
+                .unwrap_or_else(|| "-".to_string());
+
             let samples = entry.learned.map(|p| p.samples).unwrap_or(0);
             Some(PriceRow {
                 provider: provider.to_string(),
                 model: model.to_string(),
                 source,
-                configured,
-                learned,
+                mix,
+                expected_per_million,
+                actual_per_million,
                 drift: match drift {
                     Some(d) => format!("{:+.1}%", d.ratio * 100.0),
                     None => "-".to_string(),
@@ -1466,17 +1445,18 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
     }
 
     println!(
-        "{:<14} {:<30} {:<11} {:<23} {:<16} {:<9} SAMPLES",
-        "PROVIDER", "MODEL", "SOURCE", "CONFIGURED in/out/cache-read", "LEARNED($/M)", "DRIFT"
+        "{:<13} {:<29} {:<10} {:<14} {:<11} {:<11} {:<9} SAMPLES",
+        "PROVIDER", "MODEL", "SOURCE", "MIX in/out/cr", "EXPECTED", "ACTUAL", "DRIFT"
     );
     for r in &rows {
         println!(
-            "{:<14} {:<30} {:<11} {:<23} {:<16} {:<9} {}",
+            "{:<13} {:<29} {:<10} {:<14} {:<11} {:<11} {:<9} {}",
             r.provider,
             r.model,
             r.source,
-            r.configured,
-            r.learned,
+            r.mix,
+            r.expected_per_million,
+            r.actual_per_million,
             if r.significant {
                 format!("{} !", r.drift)
             } else {
@@ -1486,12 +1466,18 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
         );
     }
     println!();
-    println!("CONFIGURED is the price you set: input / output / cache read, USD per million tokens.");
-    println!("LEARNED is the blended rate recovered from real spend; it is what billing uses.");
-    println!("A learned rate cannot separate input from output, so it is shown once.");
-    println!("DRIFT compares the two costs over the same usage. Positive means reality is");
-    println!("MORE EXPENSIVE than configured, and ! marks a divergence of 20% or more -");
-    println!("either a repricing you were told about, or one you were not.");
+    println!("MIX is your input / output / cache-read share of tokens. It is what makes the");
+    println!("per-million figures mean anything: identical prices cost very different amounts");
+    println!("per million on different mixes, so never compare them across mixes.");
+    println!("EXPECTED is your configured prices applied to that mix; ACTUAL is what the");
+    println!("observed spend works out to over the same mix. Both are USD per million tokens.");
+    println!("DRIFT is ACTUAL against EXPECTED. It is zero whenever the prices match, whatever");
+    println!("the mix, so it is the alarm; ! marks a 20% divergence or more, which means the");
+    println!("upstream is no longer charging what you configured.");
+    println!();
+    println!("A learned rate is a single blended figure - one probe gives one equation for");
+    println!("three unknown prices, so input and output cannot be separated without usage");
+    println!("whose mix varies. The split is therefore trusted only where you configured it.");
 
     let drifted = rows.iter().filter(|r| r.significant).count();
     if drifted > 0 {
@@ -1558,18 +1544,24 @@ mod tests {
         let glm = rows.iter().find(|r| r.model == "z-ai/glm-5.3-flash").unwrap();
         assert_eq!(glm.provider, "xkiro");
         assert_eq!(glm.source, "learned", "an observed price outranks the expectation");
-        assert_eq!(glm.configured, "0.3 / 1.2 / 0.03");
-        assert_eq!(glm.learned, "0.9 (in=out)");
+        // 1M input tokens, nothing else: the mix says so.
+        assert_eq!(glm.mix, "100/0/0%");
+        // Configured $0.30/M input applied to that mix, against the $0.90/M the
+        // observed spend actually works out to.
+        assert_eq!(glm.expected_per_million, "$0.3000");
+        assert_eq!(glm.actual_per_million, "$0.9000");
         assert_eq!(glm.drift, "+200.0%");
         assert!(glm.significant, "a tripling must be flagged");
         assert_eq!(glm.samples, 1);
 
-        // No configured price means no drift claim can be made.
+        // No configured price: the actual figure is still useful, but there is
+        // nothing to compare it against, so no drift claim is made.
         let ds = rows
             .iter()
             .find(|r| r.model == "deepseek/deepseek-v4.1-flash")
             .unwrap();
-        assert_eq!(ds.configured, "-");
+        assert_eq!(ds.expected_per_million, "-");
+        assert_ne!(ds.actual_per_million, "-", "the observed cost is still shown");
         assert_eq!(ds.drift, "-");
         assert!(!ds.significant);
     }
@@ -1599,8 +1591,11 @@ mod tests {
         let rows = price_rows(&table);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "configured");
-        assert_eq!(rows[0].configured, "1 / 4 / 0.1");
-        assert_eq!(rows[0].learned, "-");
+        // Nothing observed yet, so there is no mix and no per-million figure:
+        // a dash rather than a claim computed from nothing.
+        assert_eq!(rows[0].mix, "-");
+        assert_eq!(rows[0].expected_per_million, "-");
+        assert_eq!(rows[0].actual_per_million, "-");
         assert_eq!(rows[0].drift, "-");
         assert_eq!(rows[0].samples, 0);
     }

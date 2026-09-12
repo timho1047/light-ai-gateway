@@ -148,6 +148,30 @@ impl PriceEntry {
         }
     }
 
+    /// Share of tokens that were input, output and cache read, as percentages.
+    ///
+    /// The per-million figures are only interpretable next to this: the same
+    /// prices produce very different $/M on different mixes.
+    pub fn mix_percentages(&self) -> Option<(f64, f64, f64)> {
+        let total = self
+            .observed_prompt_tokens
+            .saturating_add(self.observed_completion_tokens);
+        if total == 0 {
+            return None;
+        }
+        let t = total as f64;
+        // Cache read is a subset of the prompt tokens in the OpenAI dialect, so
+        // it is shown as its own share of the total for readability and the
+        // input share is what remains.
+        let cached = self.observed_cached_tokens.min(self.observed_prompt_tokens);
+        let plain_input = self.observed_prompt_tokens - cached;
+        Some((
+            plain_input as f64 / t * 100.0,
+            self.observed_completion_tokens as f64 / t * 100.0,
+            cached as f64 / t * 100.0,
+        ))
+    }
+
     /// The usage this entry has accumulated, for drift comparison.
     pub fn observed_usage(&self) -> TokenUsage {
         TokenUsage {
@@ -167,6 +191,18 @@ pub struct PriceDrift {
     pub expected: Decimal,
     /// What the learned rate says it actually cost.
     pub observed: Decimal,
+    /// The same two figures per million tokens, over the SAME observed mix, so
+    /// they can be read side by side: "I expected $0.22/M, I am paying $0.90/M".
+    ///
+    /// Never compare a per-million figure across different mixes. It moves with
+    /// the mix even when the prices have not changed at all: identical prices
+    /// produced $0.2166/M on an input-heavy mix and $0.9000/M on an
+    /// output-heavy one. That is why the ratio, which is zero whenever prices
+    /// match regardless of mix, remains the alarm and these are the explanation.
+    pub expected_per_million: Decimal,
+    pub actual_per_million: Decimal,
+    /// Token volume behind the two figures.
+    pub total_tokens: u64,
     /// observed / expected - 1. Positive means reality is MORE EXPENSIVE than
     /// configured, which is the direction that threatens the hard gate.
     pub ratio: f64,
@@ -467,6 +503,31 @@ impl PriceTable {
         self.effective(provider, model)
     }
 
+    /// What the observed spend works out to per million tokens, at the mix that
+    /// produced it.
+    ///
+    /// Available without a configured price, because it is a useful figure on
+    /// its own. Returns the figure and the token volume behind it.
+    pub fn actual_per_million(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<(Decimal, u64)> {
+        let entry = self.entries.get(&Self::key(provider, model))?;
+        let learned = entry.learned.filter(|p| p.samples > 0)?;
+        let usage = entry.observed_usage();
+        let total = usage.total_tokens();
+        if total == 0 {
+            return None;
+        }
+        let weighted = weighted_tokens(&usage, learned.cache_read_ratio());
+        let cost = sat_mul(learned.input_per_token, weighted);
+        Some((
+            sat_mul(cost, Decimal::from(1_000_000u64)) / Decimal::from(total),
+            total,
+        ))
+    }
+
     /// How far reality has diverged from the configured expectation.
     ///
     /// None when either side is missing: with no configured price there is
@@ -495,9 +556,17 @@ impl PriceTable {
             if e > 0.0 { (o / e) - 1.0 } else { 0.0 }
         };
 
+        let total_tokens = usage.total_tokens();
+        let per_million = |cost: Decimal| -> Decimal {
+            sat_mul(cost, Decimal::from(1_000_000u64)) / Decimal::from(total_tokens)
+        };
+
         Some(PriceDrift {
             expected,
             observed,
+            expected_per_million: per_million(expected),
+            actual_per_million: per_million(observed),
+            total_tokens,
             ratio,
             samples: learned.samples,
             significant: ratio.abs() >= PRICE_DRIFT_THRESHOLD,
@@ -1151,6 +1220,84 @@ mod tests {
             entry.configured.unwrap().input_per_token,
             Decimal::new(3, 6)
         );
+    }
+
+    /// Regression for the trap in blended pricing: identical prices produce very
+    /// different per-million figures on different mixes, so the per-million
+    /// number is only meaningful next to the mix, while the ratio is what can be
+    /// watched over time because it is zero whenever prices match.
+    #[test]
+    fn the_same_prices_produce_different_per_million_figures_on_different_mixes() {
+        let mut prices: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        prices.entry(P.to_string()).or_default().insert(
+            "m".to_string(),
+            ModelPriceConfig {
+                input: 0.30,
+                output: 1.20,
+                cache_read: Some(0.03),
+            },
+        );
+
+        // Input-heavy: 1M prompt (200k of it cache read) + 10k output.
+        //   800k x 0.30/M + 200k x 0.03/M + 10k x 1.20/M = 0.258
+        let mut heavy_in = PriceTable::new();
+        heavy_in.seed_from_config(&prices);
+        heavy_in.observe(P, "m", Decimal::new(258, 3), &usage(1_000_000, 10_000, 200_000));
+
+        // Output-heavy: 100k prompt + 200k output.
+        //   100k x 0.30/M + 200k x 1.20/M = 0.27
+        let mut heavy_out = PriceTable::new();
+        heavy_out.seed_from_config(&prices);
+        heavy_out.observe(P, "m", Decimal::new(270, 3), &usage(100_000, 200_000, 0));
+
+        let a = heavy_in.drift(P, "m").unwrap();
+        let b = heavy_out.drift(P, "m").unwrap();
+
+        // Both are exactly on price, so neither is a repricing.
+        assert!(a.ratio.abs() < 0.02, "got {:+.1}%", a.ratio * 100.0);
+        assert!(b.ratio.abs() < 0.02, "got {:+.1}%", b.ratio * 100.0);
+        assert!(!a.significant && !b.significant);
+
+        // Yet their per-million figures are nowhere near each other.
+        assert!(
+            b.actual_per_million > a.actual_per_million * Decimal::from(2),
+            "same prices: {} vs {}",
+            a.actual_per_million,
+            b.actual_per_million
+        );
+        let (input_pct, out_pct, cache_pct) =
+            heavy_in.entry(P, "m").unwrap().mix_percentages().unwrap();
+        assert!(
+            (input_pct - 79.2).abs() < 0.1 && (out_pct - 1.0).abs() < 0.1 && (cache_pct - 19.8).abs() < 0.1,
+            "the mix is what explains the difference, got {input_pct}/{out_pct}/{cache_pct}"
+        );
+    }
+
+    #[test]
+    fn a_repricing_shows_up_in_the_ratio_whatever_the_mix_is() {
+        let mut prices: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        prices.entry(P.to_string()).or_default().insert(
+            "m".to_string(),
+            ModelPriceConfig {
+                input: 0.30,
+                output: 1.20,
+                cache_read: Some(0.03),
+            },
+        );
+        // 100k input tokens at the configured $0.30/M would be $0.03; the
+        // observed spend says $0.06, i.e. the input price has doubled to $0.60/M.
+        let mut t = PriceTable::new();
+        t.seed_from_config(&prices);
+        t.observe(P, "m", Decimal::new(6, 2), &usage(100_000, 0, 0));
+        let d = t.drift(P, "m").unwrap();
+        assert!(
+            (d.ratio - 1.0).abs() < 0.01,
+            "a doubling must read as +100%, got {:+.1}%",
+            d.ratio * 100.0
+        );
+        assert!(d.significant);
+        assert_eq!(d.expected_per_million, Decimal::new(30, 2));
+        assert_eq!(d.actual_per_million, Decimal::new(60, 2));
     }
 
     #[test]

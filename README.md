@@ -147,12 +147,25 @@ billing as soon as there is one. The configured value is kept unchanged.
 
     ai-gw prices
 
-    PROVIDER  MODEL                SOURCE   CONFIGURED in/out/cache-read  LEARNED($/M)  DRIFT   SAMPLES
-    xkiro     z-ai/glm-5.3-flash   learned  0.3 / 1.2 / 0.03             0.8776        -15.2%  1
+    PROVIDER  MODEL                SOURCE   MIX in/out/cr  EXPECTED  ACTUAL   DRIFT   SAMPLES
+    xkiro     z-ai/glm-5.3-flash   learned  79/1/20%       $0.2554   $0.9000  +252.3% !  12
 
-A learned rate is a single blended figure -- one equation cannot separate an
-input rate from an output rate -- so it is shown once rather than pretending to
-be a split.
+Both money columns are **USD per million tokens over the same observed mix**:
+EXPECTED is your configured prices applied to that mix, ACTUAL is what the
+observed spend works out to. Read together they say "I expected $0.26 per
+million and I am paying $0.90".
+
+The MIX column is not decoration. The same prices cost very different amounts
+per million on different mixes -- measured, $0.2166/M on an input-heavy mix
+against $0.9000/M on an output-heavy one -- so a per-million figure only means
+something next to the mix it was measured on. Never compare one across mixes.
+
+DRIFT is the exception: it is zero whenever prices match, whatever the mix,
+which is why it is the thing to watch and the money columns are the explanation.
+
+A learned rate is a single blended figure. One probe gives one equation for
+three unknown prices, so input and output cannot be separated unless your usage
+mix varies; the split is therefore trusted only where you configured it.
 
 That combination is a monitoring tool, not just a display. If the two agree,
 nothing has changed. If they diverge by 20% or more the row is flagged and a
