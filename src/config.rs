@@ -335,18 +335,31 @@ impl ProviderConfig {
     }
 }
 
-/// Optional per-model pricing. Models absent from this table are priced at a
-/// deliberately conservative default, because under-estimating cost makes the
-/// hard gate too permissive and spends real money.
+/// Optional per-model pricing, in USD per MILLION tokens.
+///
+/// The names are the ones every provider's pricing page uses. Models absent from
+/// this table are priced at a deliberately conservative default, because
+/// under-estimating cost makes the hard gate too permissive and spends real
+/// money.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelPriceConfig {
-    pub prompt_per_million: f64,
-    pub completion_per_million: f64,
-    #[serde(default = "default_cached_discount")]
-    pub cached_prompt_discount: f64,
+    /// USD per million input tokens.
+    pub input: f64,
+    /// USD per million output tokens.
+    pub output: f64,
+    /// USD per million cache-read input tokens.
+    ///
+    /// A price, not a ratio, so it reads the same way as input and output.
+    /// Providers discount cache reads heavily (commonly to a tenth of input), so
+    /// omitting this defaults to input / 10 rather than to zero. Zero would make
+    /// a cache read look free, and under-estimating is the direction that spends.
+    #[serde(rename = "cache read", alias = "cache_read", default)]
+    pub cache_read: Option<f64>,
 }
 
-fn default_cached_discount() -> f64 {
+/// The share of the input price a cache read costs when none is given. Matches
+/// the ratio every major provider uses.
+pub fn default_cache_read_ratio() -> f64 {
     0.1
 }
 
@@ -374,8 +387,9 @@ pub struct Config {
     ///
     /// ```toml
     /// [prices.xkiro."z-ai/glm-5.3-flash"]
-    /// prompt_per_million = 0.28
-    /// completion_per_million = 0.42
+    /// input = 0.28
+    /// output = 0.42
+    /// "cache read" = 0.028
     /// ```
     #[serde(default)]
     pub prices: BTreeMap<ProviderId, BTreeMap<String, ModelPriceConfig>>,
@@ -862,6 +876,91 @@ key = "k"
         // An explicit probe_base_url always wins.
         let cc = targets.iter().find(|t| t.0 == "cc").unwrap();
         assert_eq!(cc.2, "https://api.commandcode.ai");
+    }
+
+    #[test]
+    fn prices_use_the_vocabulary_of_a_pricing_page() {
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+
+[providers.xkiro.accounts.a]
+key = "k"
+
+[routes]
+"m" = "xkiro"
+
+[prices.xkiro."m"]
+input = 3.0
+output = 15.0
+"cache read" = 0.3
+
+[prices.xkiro."no-cache-read"]
+input = 3.0
+output = 15.0
+"#,
+        )
+        .expect("input / output / cache read must parse, including the spaced key");
+
+        let m = &cfg.prices["xkiro"]["m"];
+        assert_eq!(m.input, 3.0);
+        assert_eq!(m.output, 15.0);
+        assert_eq!(m.cache_read, Some(0.3));
+
+        // Omitting it is allowed; the gateway then assumes a tenth of input.
+        let n = &cfg.prices["xkiro"]["no-cache-read"];
+        assert_eq!(n.cache_read, None);
+    }
+
+    #[test]
+    fn cache_read_also_parses_with_an_underscore() {
+        // A space in a key is legal TOML but easy to mistype, so the underscore
+        // spelling is accepted too.
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+[providers.xkiro.accounts.a]
+key = "k"
+[routes]
+"m" = "xkiro"
+[prices.xkiro."m"]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.prices["xkiro"]["m"].cache_read, Some(0.3));
+    }
+
+    #[test]
+    fn an_omitted_cache_read_price_becomes_a_tenth_of_input() {
+        use crate::meter::PriceTable;
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+[providers.xkiro.accounts.a]
+key = "k"
+[routes]
+"m" = "xkiro"
+[prices.xkiro."m"]
+input = 3.0
+output = 15.0
+"#,
+        )
+        .unwrap();
+        let mut table = PriceTable::new();
+        assert_eq!(table.seed_from_config(&cfg.prices), 1);
+        let p = table.get("xkiro", "m").unwrap();
+        // $3/M input -> $0.30/M cache read, never zero: a free-looking cache
+        // read would under-estimate cost, which is the spending direction.
+        assert_eq!(p.cache_read_per_token, rust_decimal::Decimal::new(3, 7));
     }
 
     #[test]

@@ -1381,17 +1381,22 @@ pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
             let source = entry.source()?.label().to_string();
             let configured = match entry.configured {
                 Some(p) => format!(
-                    "{} / {}",
-                    per_million(p.prompt_per_token),
-                    per_million(p.completion_per_token)
+                    "{} / {} / {}",
+                    per_million(p.input_per_token),
+                    per_million(p.output_per_token),
+                    per_million(p.cache_read_per_token)
                 ),
                 None => "-".to_string(),
             };
             // The learned figure is a single blended rate: one equation cannot
-            // separate a prompt rate from a completion rate. Shown once, not
-            // twice, so it is not mistaken for a split.
+            // separate an input rate from an output rate. Input and output are
+            // therefore shown once, and the cache-read share is carried over from
+            // whatever was configured, so it is not mistaken for a measured split.
             let learned = match entry.learned {
-                Some(p) => per_million(p.prompt_per_token),
+                Some(p) => format!(
+                    "{} (in=out)",
+                    per_million(p.input_per_token)
+                ),
                 None => "-".to_string(),
             };
             let drift = table.drift(provider, model);
@@ -1453,19 +1458,20 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
             println!("from the spend difference between quota probes:");
             println!();
             println!("  [prices.xkiro.\"z-ai/glm-5.3-flash\"]");
-            println!("  prompt_per_million = 0.30");
-            println!("  completion_per_million = 1.20");
+            println!("  input = 0.30");
+            println!("  output = 1.20");
+            println!("  \"cache read\" = 0.03   # optional; defaults to input / 10");
         }
         return Ok(());
     }
 
     println!(
-        "{:<14} {:<30} {:<11} {:<17} {:<11} {:<9} SAMPLES",
-        "PROVIDER", "MODEL", "SOURCE", "CONFIGURED($/M)", "LEARNED($/M)", "DRIFT"
+        "{:<14} {:<30} {:<11} {:<23} {:<16} {:<9} SAMPLES",
+        "PROVIDER", "MODEL", "SOURCE", "CONFIGURED in/out/cache-read", "LEARNED($/M)", "DRIFT"
     );
     for r in &rows {
         println!(
-            "{:<14} {:<30} {:<11} {:<17} {:<11} {:<9} {}",
+            "{:<14} {:<30} {:<11} {:<23} {:<16} {:<9} {}",
             r.provider,
             r.model,
             r.source,
@@ -1480,8 +1486,9 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
         );
     }
     println!();
-    println!("CONFIGURED is the price you set (prompt / completion, USD per million tokens).");
+    println!("CONFIGURED is the price you set: input / output / cache read, USD per million tokens.");
     println!("LEARNED is the blended rate recovered from real spend; it is what billing uses.");
+    println!("A learned rate cannot separate input from output, so it is shown once.");
     println!("DRIFT compares the two costs over the same usage. Positive means reality is");
     println!("MORE EXPENSIVE than configured, and ! marks a divergence of 20% or more -");
     println!("either a repricing you were told about, or one you were not.");
@@ -1513,9 +1520,9 @@ mod tests {
         cfg.entry("xkiro".to_string()).or_default().insert(
             "z-ai/glm-5.3-flash".to_string(),
             ModelPriceConfig {
-                prompt_per_million: 0.30,
-                completion_per_million: 1.20,
-                cached_prompt_discount: 0.1,
+                input: 0.30,
+                output: 1.20,
+                cache_read: None,
             },
         );
         table.seed_from_config(&cfg);
@@ -1551,8 +1558,8 @@ mod tests {
         let glm = rows.iter().find(|r| r.model == "z-ai/glm-5.3-flash").unwrap();
         assert_eq!(glm.provider, "xkiro");
         assert_eq!(glm.source, "learned", "an observed price outranks the expectation");
-        assert_eq!(glm.configured, "0.3 / 1.2");
-        assert_eq!(glm.learned, "0.9");
+        assert_eq!(glm.configured, "0.3 / 1.2 / 0.03");
+        assert_eq!(glm.learned, "0.9 (in=out)");
         assert_eq!(glm.drift, "+200.0%");
         assert!(glm.significant, "a tripling must be flagged");
         assert_eq!(glm.samples, 1);
@@ -1582,9 +1589,9 @@ mod tests {
         cfg.entry("xkiro".to_string()).or_default().insert(
             "m".to_string(),
             ModelPriceConfig {
-                prompt_per_million: 1.0,
-                completion_per_million: 4.0,
-                cached_prompt_discount: 0.1,
+                input: 1.0,
+                output: 4.0,
+                cache_read: None,
             },
         );
         table.seed_from_config(&cfg);
@@ -1592,7 +1599,7 @@ mod tests {
         let rows = price_rows(&table);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "configured");
-        assert_eq!(rows[0].configured, "1 / 4");
+        assert_eq!(rows[0].configured, "1 / 4 / 0.1");
         assert_eq!(rows[0].learned, "-");
         assert_eq!(rows[0].drift, "-");
         assert_eq!(rows[0].samples, 0);

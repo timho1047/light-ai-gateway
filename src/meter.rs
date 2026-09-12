@@ -41,11 +41,13 @@ const REQUEST_PRIMING: u64 = 3;
 /// Effective price of one model, in USD per token.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelPrice {
-    pub prompt_per_token: Decimal,
-    pub completion_per_token: Decimal,
-    /// Cached prompt tokens are typically billed at a fraction of the
-    /// uncached rate. 0.1 matches the major providers.
-    pub cached_prompt_discount: Decimal,
+    /// USD per input token.
+    pub input_per_token: Decimal,
+    /// USD per output token.
+    pub output_per_token: Decimal,
+    /// USD per cache-read input token. A price, not a ratio, so it reads the
+    /// same way as the other two. Providers commonly charge a tenth of input.
+    pub cache_read_per_token: Decimal,
     /// How many observations this estimate is based on.
     pub samples: u64,
 }
@@ -65,14 +67,23 @@ impl ModelPrice {
         let cached = usage.cached_tokens.min(usage.prompt_tokens);
         let uncached = usage.prompt_tokens - cached;
 
-        let prompt = sat_mul(Decimal::from(uncached), self.prompt_per_token);
-        let cached_prompt = sat_mul(
-            sat_mul(Decimal::from(cached), self.prompt_per_token),
-            self.cached_prompt_discount,
-        );
-        let completion = sat_mul(Decimal::from(usage.completion_tokens), self.completion_per_token);
+        let input = sat_mul(Decimal::from(uncached), self.input_per_token);
+        let cache_read = sat_mul(Decimal::from(cached), self.cache_read_per_token);
+        let output = sat_mul(Decimal::from(usage.completion_tokens), self.output_per_token);
 
-        sat_add(prompt, sat_add(cached_prompt, completion))
+        sat_add(input, sat_add(cache_read, output))
+    }
+
+    /// Cache-read price as a share of the input price.
+    ///
+    /// The learned rate is a single blended figure, so reducing a spend delta by
+    /// a token count needs the cache read expressed relative to input.
+    pub fn cache_read_ratio(&self) -> Decimal {
+        if self.input_per_token > Decimal::ZERO {
+            self.cache_read_per_token / self.input_per_token
+        } else {
+            Decimal::ZERO
+        }
     }
 
     /// `base_cost` scaled by the account's credit multiplier.
@@ -290,15 +301,18 @@ impl PriceTable {
             Some(p) if p.samples > 0 => Some(p),
             _ => None,
         };
-        let discount = previous
-            .map(|p| p.cached_prompt_discount)
-            .or_else(|| entry.configured.map(|p| p.cached_prompt_discount))
-            .unwrap_or_else(default_cached_discount);
+        // Cache reads are priced at a share of input. Carry that share over from
+        // whatever we already know: the learned figure, else the configured one,
+        // else the provider-standard tenth.
+        let ratio = previous
+            .map(|p| p.cache_read_ratio())
+            .or_else(|| entry.configured.map(|p| p.cache_read_ratio()))
+            .unwrap_or_else(default_cache_read_ratio);
 
         let weighted = sat_add(
             Decimal::from(uncached),
             sat_add(
-                sat_mul(Decimal::from(cached), discount),
+                sat_mul(Decimal::from(cached), ratio),
                 Decimal::from(usage.completion_tokens),
             ),
         );
@@ -315,26 +329,33 @@ impl PriceTable {
         }
 
         let prior_samples = previous.map(|p| p.samples).unwrap_or(0);
-        let (prompt_per_token, completion_per_token) = match previous {
+        let (input_per_token, output_per_token) = match previous {
             Some(p) => {
                 let n = Decimal::from(prior_samples);
                 let weight = n + Decimal::ONE;
                 (
-                    (sat_add(sat_mul(p.prompt_per_token, n), observed)) / weight,
-                    (sat_add(sat_mul(p.completion_per_token, n), observed)) / weight,
+                    (sat_add(sat_mul(p.input_per_token, n), observed)) / weight,
+                    (sat_add(sat_mul(p.output_per_token, n), observed)) / weight,
                 )
             }
-            // One equation cannot separate a prompt rate from a completion
-            // rate, so the learned figure is a single blended rate applied to
-            // both. The configured price keeps its own split, which is why the
-            // drift comparison is made on cost rather than on the two rates.
+            // One equation cannot separate an input rate from an output rate, so
+            // the learned figure is a single blended rate applied to both. The
+            // configured price keeps its own split, which is why the drift
+            // comparison is made on cost rather than on the two rates.
             None => (observed, observed),
         };
+        // Keep the cache-read share we already had, expressed against the new
+        // blended input rate so the relationship survives learning.
+        let cache_read_per_token = previous
+            .map(|p| p.cache_read_ratio())
+            .or_else(|| entry.configured.map(|p| p.cache_read_ratio()))
+            .map(|r| sat_mul(input_per_token, r))
+            .unwrap_or_else(|| sat_mul(input_per_token, default_cache_read_ratio()));
 
         entry.learned = Some(ModelPrice {
-            prompt_per_token,
-            completion_per_token,
-            cached_prompt_discount: discount,
+            input_per_token,
+            output_per_token,
+            cache_read_per_token,
             samples: prior_samples.saturating_add(1),
         });
         entry.observed_prompt_tokens = entry
@@ -348,10 +369,6 @@ impl PriceTable {
             .saturating_add(cached);
     }
 
-    /// Install prices from the [prices] config table (USD per million tokens).
-    /// They are priors: `samples` stays 0 until an observation replaces them.
-    /// Returns how many models were installed; entries with a non-finite or
-    /// negative price are skipped rather than clamped.
     /// Install prices from the [prices] config table (USD per million tokens).
     ///
     /// These are the operator's EXPECTATION and double as the starting point for
@@ -368,25 +385,26 @@ impl PriceTable {
         let mut installed = 0;
         for (provider, models) in prices {
             for (model, p) in models {
-                let (Some(prompt), Some(completion)) = (
-                    per_token_from_million(p.prompt_per_million),
-                    per_token_from_million(p.completion_per_million),
+                let (Some(input), Some(output)) = (
+                    per_token_from_million(p.input),
+                    per_token_from_million(p.output),
                 ) else {
                     continue;
                 };
-                let discount = if p.cached_prompt_discount.is_finite()
-                    && (0.0..=1.0).contains(&p.cached_prompt_discount)
-                {
-                    Decimal::try_from(p.cached_prompt_discount)
-                        .unwrap_or_else(|_| default_cached_discount())
-                } else {
-                    default_cached_discount()
-                };
+                // A cache-read price is optional. When it is absent, or when it
+                // is not a usable number, fall back to the provider-standard
+                // share of input rather than to zero: a free-looking cache read
+                // would under-estimate cost, which is the spending direction.
+                let cache_read = p
+                    .cache_read
+                    .and_then(per_token_from_million)
+                    .filter(|c| *c >= Decimal::ZERO)
+                    .unwrap_or_else(|| sat_mul(input, default_cache_read_ratio()));
                 let entry = self.entries.entry(Self::key(provider, model)).or_default();
                 entry.configured = Some(ModelPrice {
-                    prompt_per_token: prompt,
-                    completion_per_token: completion,
-                    cached_prompt_discount: discount,
+                    input_per_token: input,
+                    output_per_token: output,
+                    cache_read_per_token: cache_read,
                     samples: 0,
                 });
                 installed += 1;
@@ -467,8 +485,8 @@ impl PriceTable {
         if expected <= Decimal::ZERO {
             return None;
         }
-        let weighted = weighted_tokens(&usage, learned.cached_prompt_discount);
-        let observed = sat_mul(learned.prompt_per_token, weighted);
+        let weighted = weighted_tokens(&usage, learned.cache_read_ratio());
+        let observed = sat_mul(learned.input_per_token, weighted);
 
         let ratio = {
             use rust_decimal::prelude::ToPrimitive;
@@ -510,6 +528,12 @@ impl PriceTable {
         });
         out
     }
+}
+
+/// Share of the input price a cache read costs when nothing better is known.
+fn default_cache_read_ratio() -> Decimal {
+    Decimal::try_from(crate::config::default_cache_read_ratio())
+        .unwrap_or_else(|_| Decimal::new(1, 1))
 }
 
 /// Tokens weighted by how much they actually cost.
@@ -797,11 +821,14 @@ mod tests {
     /// Provider used by every price test. Prices are keyed by (provider, model).
     const P: &str = "prov";
 
-    fn price(prompt: i64, completion: i64, discount_scale: u32) -> ModelPrice {
+    /// input and output are USD per million tokens; cache_read_scale is the
+    /// share of input that a cache read costs (2 means a half, 1 a tenth).
+    fn price(input: i64, output: i64, cache_read_scale: u32) -> ModelPrice {
+        let input_per_token = Decimal::new(input, 6);
         ModelPrice {
-            prompt_per_token: Decimal::new(prompt, 6),
-            completion_per_token: Decimal::new(completion, 6),
-            cached_prompt_discount: Decimal::new(1, discount_scale),
+            input_per_token,
+            output_per_token: Decimal::new(output, 6),
+            cache_read_per_token: input_per_token / Decimal::from(10u32.pow(cache_read_scale)),
             samples: 1,
         }
     }
@@ -893,8 +920,8 @@ mod tests {
 
         let learned = table.get(P, "m").unwrap();
         assert_eq!(learned.samples, 1);
-        assert_eq!(learned.prompt_per_token, Decimal::new(5, 5)); // 0.10 / 2000
-        assert_eq!(learned.completion_per_token, Decimal::new(5, 5));
+        assert_eq!(learned.input_per_token, Decimal::new(5, 5)); // 0.10 / 2000
+        assert_eq!(learned.output_per_token, Decimal::new(5, 5));
         // Replaying the same delta through the learned rate returns the same cost.
         let cost = table
             .estimate(P, "m", &usage(1_000, 1_000, 0), Decimal::ONE)
@@ -908,7 +935,7 @@ mod tests {
         // All 1000 prompt tokens were cache reads: weight = 1000 * 0.1 = 100.
         table.observe(P, "m", Decimal::new(1, 2), &usage(1_000, 0, 1_000));
         assert_eq!(
-            table.get(P, "m").unwrap().prompt_per_token,
+            table.get(P, "m").unwrap().input_per_token,
             Decimal::new(1, 4) // 0.01 / 100
         );
     }
@@ -920,7 +947,7 @@ mod tests {
         table.observe(P, "m", Decimal::from(3), &usage(1_000, 0, 0)); // rate 0.003
         let learned = table.get(P, "m").unwrap();
         assert_eq!(learned.samples, 2);
-        assert_eq!(learned.prompt_per_token, Decimal::new(2, 3)); // mean 0.002
+        assert_eq!(learned.input_per_token, Decimal::new(2, 3)); // mean 0.002
         assert_eq!(
             table
                 .estimate(P, "m", &usage(1_000, 0, 0), Decimal::ONE)
@@ -937,7 +964,7 @@ mod tests {
         table.observe(P, "laguna-s-2.1-free", Decimal::ZERO, &usage(500, 100, 0));
         let learned = table.get(P, "laguna-s-2.1-free").unwrap();
         assert_eq!(learned.samples, 1);
-        assert_eq!(learned.prompt_per_token, Decimal::ZERO);
+        assert_eq!(learned.input_per_token, Decimal::ZERO);
         assert_eq!(
             table
                 .estimate(P, "laguna-s-2.1-free", &usage(500, 100, 0), Decimal::ONE)
@@ -971,9 +998,9 @@ mod tests {
         prices.entry(P.to_string()).or_default().insert(
             "m".to_string(),
             ModelPriceConfig {
-                prompt_per_million: 3.0,
-                completion_per_million: 15.0,
-                cached_prompt_discount: 0.1,
+                input: 3.0,
+                output: 15.0,
+                cache_read: None,
             },
         );
 
@@ -992,7 +1019,7 @@ mod tests {
         // The first real observation replaces the prior outright.
         table.observe(P, "m", Decimal::new(5, 2), &usage(1_000, 0, 0));
         assert_eq!(table.get(P, "m").unwrap().samples, 1);
-        assert_eq!(table.get(P, "m").unwrap().prompt_per_token, Decimal::new(5, 5));
+        assert_eq!(table.get(P, "m").unwrap().input_per_token, Decimal::new(5, 5));
     }
 
     #[test]
@@ -1002,17 +1029,17 @@ mod tests {
         models.insert(
             "bad".to_string(),
             ModelPriceConfig {
-                prompt_per_million: f64::NAN,
-                completion_per_million: 1.0,
-                cached_prompt_discount: 0.1,
+                input: f64::NAN,
+                output: 1.0,
+                cache_read: None,
             },
         );
         models.insert(
             "negative".to_string(),
             ModelPriceConfig {
-                prompt_per_million: -1.0,
-                completion_per_million: 1.0,
-                cached_prompt_discount: 0.1,
+                input: -1.0,
+                output: 1.0,
+                cache_read: None,
             },
         );
         let mut table = PriceTable::new();
@@ -1030,8 +1057,8 @@ mod tests {
         let mut restored = PriceTable::new();
         assert_eq!(restored.load_learned(table.learned_rows()), 1);
         assert_eq!(
-            restored.get(P, "m").unwrap().prompt_per_token,
-            table.get(P, "m").unwrap().prompt_per_token
+            restored.get(P, "m").unwrap().input_per_token,
+            table.get(P, "m").unwrap().input_per_token
         );
         assert_eq!(restored.get(P, "m").unwrap().samples, 1);
         // The usage behind the rate comes back too, so drift stays comparable.
@@ -1055,9 +1082,9 @@ mod tests {
         prices.entry(P.to_string()).or_default().insert(
             "m".to_string(),
             ModelPriceConfig {
-                prompt_per_million: 3.0,
-                completion_per_million: 15.0,
-                cached_prompt_discount: 0.1,
+                input: 3.0,
+                output: 15.0,
+                cache_read: None,
             },
         );
 
@@ -1096,9 +1123,9 @@ mod tests {
         prices.entry(P.to_string()).or_default().insert(
             "m".to_string(),
             ModelPriceConfig {
-                prompt_per_million: 3.0,
-                completion_per_million: 15.0,
-                cached_prompt_discount: 0.1,
+                input: 3.0,
+                output: 15.0,
+                cache_read: None,
             },
         );
         let mut table = PriceTable::new();
@@ -1121,7 +1148,7 @@ mod tests {
         // ...while the configured expectation stays put as the reference.
         let entry = table.entry(P, "m").unwrap();
         assert_eq!(
-            entry.configured.unwrap().prompt_per_token,
+            entry.configured.unwrap().input_per_token,
             Decimal::new(3, 6)
         );
     }
@@ -1132,8 +1159,8 @@ mod tests {
         table.observe("cheap", "m", Decimal::from(1), &usage(1_000, 0, 0));
         table.observe("dear", "m", Decimal::from(10), &usage(1_000, 0, 0));
         assert_ne!(
-            table.get("cheap", "m").unwrap().prompt_per_token,
-            table.get("dear", "m").unwrap().prompt_per_token,
+            table.get("cheap", "m").unwrap().input_per_token,
+            table.get("dear", "m").unwrap().input_per_token,
             "the same model name must not share one price across providers"
         );
         assert_eq!(table.known_models(), 2);
@@ -1357,7 +1384,7 @@ mod tests {
         let mut table = PriceTable::new();
         table.observe(P, "m", Decimal::new(1, 2), &usage(2_000, 0, 0)); // 0.000005/token
         assert_eq!(
-            table.get(P, "m").unwrap().prompt_per_token,
+            table.get(P, "m").unwrap().input_per_token,
             Decimal::new(5, 6)
         );
 

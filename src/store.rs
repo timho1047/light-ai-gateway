@@ -158,9 +158,9 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE TABLE IF NOT EXISTS prices (
     provider                  TEXT    NOT NULL,
     model                     TEXT    NOT NULL,
-    prompt_per_token          TEXT    NOT NULL,
-    completion_per_token      TEXT    NOT NULL,
-    cached_prompt_discount    TEXT    NOT NULL,
+    input_per_token           TEXT    NOT NULL,
+    output_per_token          TEXT    NOT NULL,
+    cache_read_per_token      TEXT    NOT NULL,
     samples                   INTEGER NOT NULL,
     observed_prompt_tokens    INTEGER NOT NULL DEFAULT 0,
     observed_completion_tokens INTEGER NOT NULL DEFAULT 0,
@@ -183,7 +183,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_daily_day   ON usage_daily(day);
 /// written under the old key cannot be attributed to a provider, so the account
 /// and gate tables are rebuilt rather than guessed at. Usage history already
 /// carried provider and is preserved.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The version at which account identity changed from id alone to
 /// (provider, id). Only a database older than THIS needs the rebuild; later
@@ -237,6 +237,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
         conn.execute_batch("DROP TABLE IF EXISTS gates; DROP TABLE IF EXISTS accounts;")
             .context("dropping pre-v2 account tables")?;
+    }
+
+    if version < 4 && table_exists(conn, "prices")? {
+        // The price columns were renamed when cache read became a price rather
+        // than a ratio. These rows are observations that cost nothing to
+        // re-learn, so they are rebuilt rather than migrated.
+        tracing::warn!("store: rebuilding the learned price table after a column change");
+        conn.execute_batch("DROP TABLE IF EXISTS prices;")
+            .context("dropping the pre-v4 price table")?;
     }
 
     conn.execute_batch(SCHEMA)
@@ -565,16 +574,16 @@ fn save_prices_tx(tx: &Transaction<'_>, prices: &[crate::meter::PersistedPrice])
     for p in prices {
         tx.execute(
             "INSERT OR REPLACE INTO prices (
-                 provider, model, prompt_per_token, completion_per_token,
-                 cached_prompt_discount, samples, observed_prompt_tokens,
+                 provider, model, input_per_token, output_per_token,
+                 cache_read_per_token, samples, observed_prompt_tokens,
                  observed_completion_tokens, observed_cached_tokens, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 p.provider,
                 p.model,
-                dec_str(p.price.prompt_per_token),
-                dec_str(p.price.completion_per_token),
-                dec_str(p.price.cached_prompt_discount),
+                dec_str(p.price.input_per_token),
+                dec_str(p.price.output_per_token),
+                dec_str(p.price.cache_read_per_token),
                 p.price.samples as i64,
                 p.observed_prompt_tokens as i64,
                 p.observed_completion_tokens as i64,
@@ -613,8 +622,8 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
     type PriceRowTuple = (String, String, String, String, String, i64, i64, i64, i64);
     let rows: Vec<PriceRowTuple> = {
         let mut stmt = conn.prepare(
-            "SELECT provider, model, prompt_per_token, completion_per_token,
-                    cached_prompt_discount, samples, observed_prompt_tokens,
+            "SELECT provider, model, input_per_token, output_per_token,
+                    cache_read_per_token, samples, observed_prompt_tokens,
                     observed_completion_tokens, observed_cached_tokens
              FROM prices ORDER BY provider, model",
         )?;
@@ -635,13 +644,13 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
     };
 
     let mut out = Vec::with_capacity(rows.len());
-    for (provider, model, prompt, completion, discount, samples, p_tok, c_tok, cached_tok) in rows {
+    for (provider, model, input, output, cache_read, samples, p_tok, c_tok, cached_tok) in rows {
         // A row we cannot parse is skipped, never defaulted: a price that
         // silently became zero would make a paid model look free.
-        let (Some(prompt), Some(completion), Some(discount)) = (
-            crate::domain::parse_money(&prompt),
-            crate::domain::parse_money(&completion),
-            crate::domain::parse_money(&discount),
+        let (Some(input), Some(output), Some(cache_read)) = (
+            crate::domain::parse_money(&input),
+            crate::domain::parse_money(&output),
+            crate::domain::parse_money(&cache_read),
         ) else {
             tracing::warn!(provider = %provider, model = %model, "store: unreadable price row; skipping");
             continue;
@@ -650,9 +659,9 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
             provider,
             model,
             price: ModelPrice {
-                prompt_per_token: prompt,
-                completion_per_token: completion,
-                cached_prompt_discount: discount,
+                input_per_token: input,
+                output_per_token: output,
+                cache_read_per_token: cache_read,
                 samples: samples.max(0) as u64,
             },
             observed_prompt_tokens: p_tok.max(0) as u64,
@@ -1371,9 +1380,9 @@ mod tests {
                 provider: "xkiro".to_string(),
                 model: "z-ai/glm-5.3-flash".to_string(),
                 price: crate::meter::ModelPrice {
-                    prompt_per_token: dec("0.0000004"),
-                    completion_per_token: dec("0.0000012"),
-                    cached_prompt_discount: dec("0.1"),
+                    input_per_token: dec("0.0000004"),
+                    output_per_token: dec("0.0000012"),
+                    cache_read_per_token: dec("0.1"),
                     samples: 7,
                 },
                 observed_prompt_tokens: 1_234,
@@ -1384,9 +1393,9 @@ mod tests {
                 provider: "commandcode".to_string(),
                 model: "z-ai/glm-5.3-flash".to_string(),
                 price: crate::meter::ModelPrice {
-                    prompt_per_token: dec("0.0000041"),
-                    completion_per_token: dec("0.0000041"),
-                    cached_prompt_discount: dec("0.1"),
+                    input_per_token: dec("0.0000041"),
+                    output_per_token: dec("0.0000041"),
+                    cache_read_per_token: dec("0.1"),
                     samples: 2,
                 },
                 observed_prompt_tokens: 43,
@@ -1406,7 +1415,7 @@ mod tests {
         assert_eq!(xk.model, "z-ai/glm-5.3-flash");
         assert_eq!(xk.price.samples, 7);
         assert_eq!(
-            xk.price.prompt_per_token,
+            xk.price.input_per_token,
             dec("0.0000004"),
             "Decimal precision must survive"
         );
@@ -1417,7 +1426,7 @@ mod tests {
         let cc = loaded.iter().find(|p| p.provider == "commandcode").unwrap();
         assert_eq!(cc.price.samples, 2);
         assert_ne!(
-            cc.price.prompt_per_token, xk.price.prompt_per_token,
+            cc.price.input_per_token, xk.price.input_per_token,
             "providers must not share a price"
         );
 

@@ -128,11 +128,17 @@ for tests and dry runs and never touches your real keychain.
 The gateway must know what a request costs before it sends it: that estimate is
 what the hard gate compares against the remaining allowance. Two numbers feed it.
 
-**Configured** is what you say a model costs, per provider:
+**Configured** is what you say a model costs, per provider, named the way a
+pricing page names it and in USD per million tokens:
 
     [prices.xkiro."z-ai/glm-5.3-flash"]
-    prompt_per_million = 0.30
-    completion_per_million = 1.20
+    input = 0.30
+    output = 1.20
+    "cache read" = 0.03     # optional; defaults to input / 10
+
+`cache read` is a price, not a ratio, so it reads the same as the other two.
+Leaving it out assumes a tenth of input rather than zero: a cache read that looks
+free would under-estimate cost, and under-estimating is the direction that spends.
 
 **Learned** is what the spend difference between two quota probes says it
 actually costs. Providers apply per-model multipliers, promotions and credit
@@ -141,8 +147,12 @@ billing as soon as there is one. The configured value is kept unchanged.
 
     ai-gw prices
 
-    PROVIDER  MODEL                SOURCE     CONFIGURED($/M)  LEARNED($/M)  DRIFT    SAMPLES
-    xkiro     z-ai/glm-5.3-flash   learned    0.3 / 1.2        0.8776        -15.2%   1
+    PROVIDER  MODEL                SOURCE   CONFIGURED in/out/cache-read  LEARNED($/M)  DRIFT   SAMPLES
+    xkiro     z-ai/glm-5.3-flash   learned  0.3 / 1.2 / 0.03             0.8776        -15.2%  1
+
+A learned rate is a single blended figure -- one equation cannot separate an
+input rate from an output rate -- so it is shown once rather than pretending to
+be a split.
 
 That combination is a monitoring tool, not just a display. If the two agree,
 nothing has changed. If they diverge by 20% or more the row is flagged and a
