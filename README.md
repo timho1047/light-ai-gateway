@@ -7,6 +7,25 @@ Point any OpenAI client at it, keep using your normal model names, and it will
 pick an account for each request, switch when a window fills up, and record what
 everything cost.
 
+**Contents**
+
+- [What it does](#what-it-does)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Credentials](#credentials)
+- [Commands](#commands)
+- [Account recovery](#account-recovery)
+- [Prices](#prices)
+- [The two pots of money](#the-two-pots-of-money)
+- [How an account is chosen](#how-an-account-is-chosen)
+- [Failure handling](#failure-handling)
+- [Metrics](#metrics)
+- [When it does not work](#when-it-does-not-work)
+- [Non-goals](#non-goals)
+- [Development](#development)
+- [License](#license)
+- [Safety notes](#safety-notes)
+
 ## What it does
 
 - **Speaks OpenAI Chat Completions.** One endpoint, your existing SDK, no code change.
@@ -20,9 +39,15 @@ everything cost.
 - **Shows you the numbers.** A terminal board of covered allowance against
   metered balance, with reset countdowns.
 
-Design and rationale: [docs/DESIGN.md](docs/DESIGN.md).
+Design and rationale: [docs/DESIGN.md](docs/DESIGN.md). It is written in
+Chinese; this README is the English reference.
 
 ## Install
+
+Requires Rust **1.88 or newer** -- declared as `rust-version`, so an older
+toolchain is told so plainly instead of failing on a syntax error. The credential
+store binds to macOS Keychain, Windows Credential Manager and the freedesktop
+Secret Service; only macOS needs the signing step below.
 
 The build produces a single self-contained binary: no runtime, no interpreter,
 nothing to install alongside it.
@@ -33,6 +58,15 @@ That builds in release mode and puts ai-gw on your PATH (~/.cargo/bin), which is
 already there if you installed Rust with rustup. Check it:
 
     ai-gw --version
+
+**On macOS, use the wrapper instead:**
+
+    scripts/aigw-install.sh
+
+It runs the same `cargo install` and then signs the result with a stable identity.
+Skip it and the keychain asks for your password once per stored key, on every run,
+forever -- see [Credentials](#credentials). The first time you need
+`scripts/aigw-identity.sh`, which creates the certificate.
 
 Other ways to get the same binary:
 
@@ -156,17 +190,39 @@ for tests and dry runs and never touches your real keychain.
     ai-gw usage --since 7d --group-by provider,model,account
     ai-gw prices [--drift-only]          configured price vs the price learned from real spend
     ai-gw keys add|list|remove|test      provider credentials
+    ai-gw keys migrate [--prune]         fold per-account key items into one
     ai-gw accounts list|probe|disable    account maintenance
-
-### Account recovery
-
-A 401, 403 or 402 disables the account: it leaves the pool until an operator acts.
-A **successful probe re-enables it**, so the fix is to correct the credential and
-run "ai-gw accounts probe". Disabling is per account -- "ai-gw accounts disable X"
-writes only X's row and leaves every other account's quota readings alone.
+    ai-gw accounts enable <id>           put a disabled account back
     ai-gw tail                           recent requests
     ai-gw doctor                         config, credentials, probe reachability
     ai-gw init                           write an example config
+
+## Account recovery
+
+Two different things take an account out of the pool, and they need different
+answers.
+
+**A failure disables it** -- a 401, 403 or 402. The pool stops using it until a
+probe shows it is both reachable and funded:
+
+    ai-gw keys add <provider> <account>    # first, if the credential was the problem
+    ai-gw accounts probe <id>
+
+A probe that comes back with headroom puts the account back on its own. One that
+succeeds but still shows nothing left does not, deliberately: an account that is
+out of money would otherwise re-enter rotation once per poll and fail every time.
+
+**An operator disables it** -- `ai-gw accounts disable <id>`. That is a decision,
+and a probe will not undo it: a probe proves the credential works, not that you
+changed your mind. The way back is explicit:
+
+    ai-gw accounts enable <id>
+
+That sets the account to UNKNOWN rather than ACTIVE, so a probe has to confirm it
+before it takes traffic -- the same rule a restart follows.
+
+Both are per account: `accounts disable X` writes X's row alone and leaves every
+other account's quota readings and reset times untouched.
 
 ## Prices
 
@@ -266,8 +322,11 @@ will spend money without ever telling you. The hard gate below is the guard.
 For each request:
 
 1. **Hard gate.** Only accounts whose covered headroom covers the estimated cost
-   plus a reserve (the p95 of recent request costs) are candidates. This is what
-   stops a burst from overflowing into paid credits.
+   plus a reserve are candidates. The reserve is the larger of the p95 of recent
+   request costs and what that account already has committed in flight, plus a
+   configured margin. That is what stops a burst from overflowing into paid
+   credits: twenty concurrent requests cannot each size the gate as though the
+   other nineteen were not there.
 2. **Sticky first.** If the session is already bound to a candidate, keep it.
    Moving a conversation discards the provider's prompt cache and re-bills the
    whole history at full input price.
@@ -308,6 +367,21 @@ separately, so retries and account switches do not pollute the timings.
 Cache hit rate (cached divided by prompt tokens) is the cost metric to watch: it
 is what account switching destroys.
 
+## When it does not work
+
+Start with `ai-gw doctor`. It parses the config, resolves every credential, probes
+every provider, flags a port other machines can reach, and exits non-zero with a
+count of what is wrong.
+
+| Symptom | Where to look |
+|---|---|
+| `no eligible account` on every request | `ai-gw status` -- every account may be parked, disabled, or under the hard gate. The 429 body names the account with the most room, how much it has left, and the estimate that did not fit |
+| An account stays DISABLED after you fixed the key | a probe only restores an account that also shows headroom, and an operator disable is never undone by one -- see [Account recovery](#account-recovery) |
+| A password prompt on every run (macOS) | two independent causes, both fixable: `ai-gw keys migrate --prune` and `scripts/aigw-install.sh` |
+| A price looks wrong | `ai-gw prices --drift-only`. A learned rate is an observation, not the truth, and a configured price is never overwritten by one |
+| Every request is 429 with a Retry-After of weeks | a covered window is spent and the earliest reset is that far away. `ai-gw status` shows a countdown per gate |
+| The board is empty after moving the database | the ledger path is `server.db_path` in the config. An empty board means "not probed yet", never "no accounts" |
+
 ## Non-goals
 
 Cross-provider fallback, cross-model downgrade, protocol translation, semantic
@@ -317,8 +391,12 @@ the gateway should infer.
 
 ## Development
 
-    cargo test              # unit and integration tests
-    cargo clippy --all-targets
+    cargo test                              # the whole suite, a couple of seconds
+    cargo clippy --all-targets -- -D warnings
+
+Both run in CI on every push, together with a release build. There is no
+tests/ directory: the suite lives beside the code it covers, in each module, and
+the tests are named as the behaviour they assert.
 
 Provider quota adapters live in src/quota. Adding a provider means implementing
 one trait and declaring its base URL, credentials and error vocabulary.
@@ -326,14 +404,21 @@ one trait and declaring its base URL, credentials and error vocabulary.
 pool only after a successful probe, so a provider with no quota source can never
 be selected. Use xkiro, command-code or deepseek.
 
+## License
+
+MIT. See [LICENSE](LICENSE). Use it, modify it, ship it, sell it -- it comes with
+no warranty, and it spends real money when you configure it to.
+
 ## Safety notes
 
 - Binds to loopback by default and holds paid credentials; set a local key if
-  anything else can reach the port.
+  anything else can reach the port. `ai-gw doctor` reports both a missing
+  `local_key` and a non-loopback listen address as problems.
 - Keys come from the environment or a dedicated file, are never logged, and are
   redacted in every debug or display path.
-- Probe hosts are pinned in configuration, so a credential cannot be redirected
-  to an address supplied with a request.
+- Probe hosts are pinned in configuration, and redirects are refused outright, so
+  a credential cannot be sent to an address supplied with a request or named in a
+  Location header.
 - A failed quota probe keeps the previous reading and marks it stale. It never
   resets a reading to zero, which would both overstate availability and let the
   CLI claim a funded account is empty.
