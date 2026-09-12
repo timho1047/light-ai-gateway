@@ -87,7 +87,18 @@ impl Palette {
         }
     }
 
-    /// Headers and the one line of a report that is a total.
+    /// A heading: a table's header row, the title of a section, a total.
+    ///
+    /// Cyan, because the other three colours mean something specific -- green is
+    /// working, yellow is weakening, red is wrong -- and a heading must never be
+    /// read as one of those. Bold as well, so the heading still looks like one
+    /// for a reader who cannot see the colour.
+    pub fn header(self, text: &str) -> String {
+        self.paint("1;36", text)
+    }
+
+    /// Emphasis without colour: a line that must not be mistaken for its
+    /// neighbours, in a report where colour is already spoken for.
     pub fn bold(self, text: &str) -> String {
         self.paint("1", text)
     }
@@ -166,6 +177,7 @@ mod tests {
     #[test]
     fn without_a_palette_the_text_is_returned_unchanged() {
         let p = Palette::off();
+        assert_eq!(p.header("TOTAL"), "TOTAL");
         assert_eq!(p.bold("TOTAL"), "TOTAL");
         assert_eq!(p.red("DISABLED"), "DISABLED");
         assert_eq!(p.dim("covered = ..."), "covered = ...");
@@ -175,6 +187,7 @@ mod tests {
     fn every_style_opens_and_closes() {
         let p = Palette::on();
         for styled in [
+            p.header("x"),
             p.bold("x"),
             p.dim("x"),
             p.red("x"),

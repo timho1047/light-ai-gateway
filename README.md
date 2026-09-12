@@ -206,12 +206,17 @@ are read at: token counts as `921.4K` and `1.0M`, money with one decimal for a
 total and enough decimals for a per-request cost that a one-decimal rule would
 round away.
 
-Colour marks the few readings that need attention -- a state that is not ACTIVE, a
-reading that is STALE or only estimated, a price that has drifted, a request that
-spent metered money -- and nothing else. It never carries information on its own:
-the words say the same thing with the colours off. Colour is off whenever the
-output is not a terminal, so a pipe, a redirect and a log file get exactly the
-bytes they got before:
+Headings -- a table's header row, a section title, the model a price panel belongs
+to -- are bold cyan. Cyan is the one colour with no meaning attached to it, so a
+heading cannot be misread as a state: green is working, yellow is weakening, red
+is wrong. The dimmed lines are legends and fix-up advice, not readings.
+
+Beyond that, colour marks the few readings that need attention -- a state that is
+not ACTIVE, a reading that is STALE or only estimated, a price that has drifted, a
+request that spent metered money -- and nothing else. It never carries information
+on its own: the words say the same thing with the colours off. Colour is off
+whenever the output is not a terminal, so a pipe, a redirect and a log file get
+exactly the bytes they got before:
 
     lgw --color always status     # colour a capture or an editor's run panel
     lgw --color never status      # never colour, whatever the terminal says

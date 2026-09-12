@@ -52,9 +52,10 @@ impl Table {
     /// Render the header, then every row, with each column padded to the width
     /// its widest cell needs. Trailing whitespace is never emitted.
     ///
-    /// The header is bold when the palette allows it, and a cell is measured by
-    /// its *visible* width: one that carries a colour is measured without its
-    /// escape codes, so styling a value can never push the columns apart.
+    /// The header carries the header style when the palette allows it, and a cell
+    /// is measured by its *visible* width: one that carries a colour is measured
+    /// without its escape codes, so styling a value can never push the columns
+    /// apart.
     pub fn render(&self, pal: &Palette) -> String {
         let mut widths: Vec<usize> = self.headers.iter().map(|h| visible_width(h)).collect();
         for row in &self.rows {
@@ -67,10 +68,10 @@ impl Table {
         }
 
         let mut out = String::new();
-        // Bold the finished line rather than each cell: the padding then stays
+        // Style the finished line rather than each cell: the padding then stays
         // out of the escape sequence, and the line is trimmed before it is
         // wrapped.
-        out.push_str(&pal.bold(&self.line(&self.headers, &widths)));
+        out.push_str(&pal.header(&self.line(&self.headers, &widths)));
         out.push('\n');
         for row in &self.rows {
             out.push_str(&self.line(row, &widths));
@@ -225,8 +226,8 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
 
         assert!(
-            lines[0].starts_with("\x1b[1m"),
-            "the header is bold: {out:?}"
+            lines[0].starts_with("\x1b[1;36m"),
+            "the header is a heading, not a table cell: {out:?}"
         );
         let visible_offset = |line: &str, needle: &str| {
             let at = line.find(needle).expect("the needle is on the line");

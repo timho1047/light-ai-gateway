@@ -892,7 +892,7 @@ fn render_price_rows(rows: &[PriceRow], pal: &Palette) -> String {
 
     let mut out = String::new();
     let title = "DRIFT   observed spend against the configured schedule, USD per million tokens";
-    out.push_str(&pal.bold(title));
+    out.push_str(&pal.header(title));
     out.push_str("\n\n");
     let mut table = Table::new(&[
         ("PROVIDER", Align::Left),
@@ -1104,7 +1104,7 @@ fn render_usage(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    out.push_str(&pal.bold(&title));
+    out.push_str(&pal.header(&title));
     out.push_str("\n\n");
 
     // Widths are measured, and the counts are scaled, so a nine-digit token count
@@ -1150,7 +1150,7 @@ fn render_usage(
                 crate::table::tokens(cached),
                 crate::table::money(cost),
             );
-            out.push_str(&pal.bold(&total));
+            out.push_str(&pal.header(&total));
             out.push('\n');
         }
     }
@@ -2324,12 +2324,12 @@ fn print_price_panel(config: &Config, table: &crate::meter::PriceTable, pal: &Pa
     let panels = price_panel(config, table);
     println!(
         "{}",
-        pal.bold("PRICES   rates in effect, USD per million tokens")
+        pal.header("PRICES   rates in effect, USD per million tokens")
     );
     for (label, rows) in &panels {
         println!();
         // The model is a heading: the rows under it are its answer.
-        println!("{}", pal.bold(label));
+        println!("{}", pal.header(label));
         println!("{}", block(rows.iter().map(row_cells).collect()));
     }
     let f = fallback_row();
@@ -3093,8 +3093,8 @@ key = {{ key_file = "{key_file}" }}
             "a row that did not drift is not coloured: {out:?}"
         );
         assert!(
-            out.starts_with("\x1b[1mDRIFT"),
-            "the title is bold: {out:?}"
+            out.starts_with("\x1b[1;36mDRIFT"),
+            "the title is a heading: {out:?}"
         );
     }
 
