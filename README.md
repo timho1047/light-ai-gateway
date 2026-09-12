@@ -95,6 +95,44 @@ Explicit alternatives are still supported when you want them:
 key = { keychain = true }, key = { env = "X" }, key = { key_file = "/run/secrets/x" },
 or an inline literal (discouraged).
 
+### macOS: why it keeps asking for your password
+
+macOS binds a keychain item's access control to the **code signature** of the
+program asking for it. `cargo install` produces an *ad-hoc* signature, whose
+identity is the hash of the code itself, so every rebuild looks like a different
+application to the keychain and an "Always Allow" grant does not survive it.
+
+On top of that, each account is its own keychain item, so a cold start asks once
+per account -- and `status`, `accounts probe` and `doctor` each ask again,
+because each is a new process reading the same items. A test on this checkout
+read every credential in 24 ms once the two were fixed; before, it waited on
+three prompts.
+
+Two things fix it:
+
+    ai-gw keys migrate --prune     # N items -> 1: one authorisation covers all
+
+    scripts/aigw-identity.sh       # once: creates and trusts the certificate
+    scripts/aigw-install.sh        # cargo install, then signs the result
+
+The first is a command; the second makes the grant stick, because the
+access-control entry then names a certificate that does not change when the code
+does. Both are optional -- without them the gateway behaves identically, it just
+keeps asking. `ai-gw keys list` shows which item each key came out of, and says
+so when per-account items are still in use.
+
+Note that a plain `cargo install --path .` replaces the signed binary with an
+ad-hoc one and brings the prompts back; use `scripts/aigw-install.sh` instead.
+Re-signing restores the existing grant, so there is nothing to re-authorise.
+
+If you would rather not use the credential store at all:
+
+    [providers.xkiro.accounts.acc-1]
+    key = { key_file = "~/.light-ai-gateway/keys/xkiro-acc-1" }   # chmod 600
+
+A 0600 file keeps other users and accidental commits out. It does not keep a
+backup or a disk image out, which is the one thing the credential store adds.
+
 ### What this actually protects
 
 - **Protected:** other users on the machine, backups and disk images, accidental

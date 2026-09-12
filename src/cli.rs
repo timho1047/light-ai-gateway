@@ -132,6 +132,16 @@ pub enum KeysCommand {
     Remove { provider: String, account: String },
     /// Check a stored credential by probing the provider with it.
     Test { provider: String, account: String },
+    /// Fold every per-account credential-store item into the single vault item.
+    ///
+    /// On macOS an ad-hoc signed binary is identified by the hash of its code, so
+    /// an "Always Allow" grant cannot survive a rebuild. Fewer items is the only
+    /// durable answer, and this turns N authorisation prompts into one.
+    Migrate {
+        /// Delete the per-account items once the vault is confirmed to hold them.
+        #[arg(long)]
+        prune: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -1392,6 +1402,7 @@ async fn cmd_keys(path: &Path, args: KeysArgs) -> Result<()> {
             stdin,
         } => cmd_keys_add(&config, &creds, &provider, &account, stdin),
         KeysCommand::List => cmd_keys_list(&config, &creds),
+        KeysCommand::Migrate { prune } => cmd_keys_migrate(path, prune),
         KeysCommand::Remove { provider, account } => cmd_keys_remove(&creds, &provider, &account),
         KeysCommand::Test { provider, account } => {
             cmd_keys_test(&config, &creds, &provider, &account).await
@@ -1495,10 +1506,20 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
                 Ok(_) => "ok".to_string(),
                 Err(e) => format!("MISSING ({e})"),
             };
+            // Say which item the key came out of. An install that still keeps one
+            // item per account pays one authorisation prompt per account on
+            // macOS, and "ai-gw keys migrate" is how that stops.
+            let mut source = secret_ref.describe();
+            if matches!(secret_ref, SecretRef::Keychain) {
+                let origin = creds.origin(provider, id);
+                if origin != crate::secrets::CredentialOrigin::Absent {
+                    source = format!("{source} ({})", origin.short());
+                }
+            }
             rows.push(CredentialRow {
                 provider: provider.clone(),
                 account: id.clone(),
-                source: secret_ref.describe(),
+                source,
                 status,
             });
         }
@@ -1508,16 +1529,109 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
 
 fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
     println!("backend: {}", creds.backend_name());
-    println!();
-    println!("{:<16} {:<20} {:<22} STATUS", "PROVIDER", "ACCOUNT", "SOURCE");
-    for row in credential_rows(config, creds) {
+    let rows = credential_rows(config, creds);
+    let per_account = rows
+        .iter()
+        .filter(|r| r.source.contains("per-account"))
+        .count();
+    if creds.is_vaulted() {
         println!(
-            "{:<16} {:<20} {:<22} {}",
+            "vault   : {}",
+            if per_account == 0 {
+                "every key in one credential-store item".to_string()
+            } else {
+                format!(
+                    "{} key(s) still in separate per-account items",
+                    per_account
+                )
+            }
+        );
+    }
+    println!();
+    println!("{:<16} {:<20} {:<32} STATUS", "PROVIDER", "ACCOUNT", "SOURCE");
+    for row in &rows {
+        println!(
+            "{:<16} {:<20} {:<32} {}",
             row.provider, row.account, row.source, row.status
         );
     }
     println!();
+    if per_account > 0 {
+        println!(
+            "On macOS every separate item is a separate authorisation prompt for this binary."
+        );
+        println!("Fold them into one item with: ai-gw keys migrate --prune");
+        println!();
+    }
     println!("Register one with: ai-gw keys add <provider> <account>");
+    Ok(())
+}
+
+/// Every configured credential that is expected to be in the credential store.
+///
+/// Only these can be migrated: the OS credential store has no portable way to
+/// enumerate its items, so a key belonging to an account no longer in the config
+/// is invisible here. That is harmless -- the per-account fallback still reads
+/// it -- but it will not be folded into the vault.
+fn keychain_pairs(config: &Config) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for (provider, p) in &config.providers {
+        for (id, a) in &p.accounts {
+            if matches!(a.key, None | Some(SecretRef::Keychain)) {
+                pairs.push((provider.clone(), id.clone()));
+            }
+        }
+    }
+    if matches!(config.server.local_key, Some(SecretRef::Keychain)) {
+        pairs.push((
+            crate::secrets::LOCAL_KEY_PROVIDER.to_string(),
+            crate::secrets::LOCAL_KEY_ACCOUNT.to_string(),
+        ));
+    }
+    pairs
+}
+
+/// Fold every per-account credential-store item into the single vault item.
+///
+/// Why it exists: macOS identifies an ad-hoc signed binary by the hash of its
+/// code, so "Always Allow" never survives a rebuild, and the only durable fix is
+/// to have fewer items to authorise. This moves N items into one, and --prune
+/// removes the old ones once the vault is confirmed to hold their contents.
+fn cmd_keys_migrate(path: &Path, prune: bool) -> Result<()> {
+    let config = load_config(path)?;
+    let creds = credential_store();
+
+    if !creds.is_vaulted() {
+        println!(
+            "the {} backend keeps no vault; there is nothing to migrate",
+            creds.backend_name()
+        );
+        return Ok(());
+    }
+
+    let pairs = keychain_pairs(&config);
+    if pairs.is_empty() {
+        println!(
+            "no account in {} uses the OS credential store; nothing to migrate",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let report = creds.migrate(&pairs, prune)?;
+    println!(
+        "merged {} key(s) into the vault; {} already there, {} with nothing stored",
+        report.merged, report.already, report.missing
+    );
+    if prune {
+        println!("removed {} per-account item(s)", report.pruned);
+    } else if report.merged > 0 {
+        println!();
+        println!("The old items are still there. Run the same command with --prune once");
+        println!("'ai-gw doctor' resolves every account, and they will be deleted.");
+    }
+    println!();
+    println!("Backend: {}", creds.backend_name());
     Ok(())
 }
 
