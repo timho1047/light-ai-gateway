@@ -24,7 +24,13 @@ pub enum QuotaAdapter {
     CommandCode,
     /// GET /user/balance on api.deepseek.com.
     Deepseek,
-    /// No probe available: local ledger only.
+    /// No probe available.
+    ///
+    /// Warned about in validate() and counted as a problem by doctor: an
+    /// account whose provider has no quota source never leaves
+    /// AccountState::Unknown, and only a successful probe can clear that, so it
+    /// can never be selected. Accepting the setting silently produced a
+    /// permanently idle account and a doctor line describing it as fine.
     None,
 }
 
@@ -33,7 +39,7 @@ pub enum QuotaAdapter {
 /// Deserialized by hand rather than via an untagged enum: this type is used as
 /// a plain struct field, and serde cannot combine untagged enums with the map
 /// deserializer that fields like this produce.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SecretRef {
     /// Read from an environment variable at startup.
     Env { env: String },
@@ -44,6 +50,24 @@ pub enum SecretRef {
     Keychain,
     /// Inline literal. Supported but discouraged.
     Literal(String),
+}
+
+/// Never print the secret.
+///
+/// The derived Debug printed Literal in full, so any future log line, error
+/// context or panic message that happened to carry a SecretRef would have
+/// written an API key into the terminal and into whatever collected the
+/// output. ApiKey already had this guarantee; SecretRef did not, and it is the
+/// one that can hold the key before it becomes an ApiKey.
+impl std::fmt::Debug for SecretRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretRef::Env { env } => write!(f, "Env({env})"),
+            SecretRef::File { key_file } => write!(f, "File({key_file})"),
+            SecretRef::Keychain => f.write_str("Keychain"),
+            SecretRef::Literal(_) => f.write_str("Literal(***)"),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for SecretRef {
@@ -546,6 +570,23 @@ impl Config {
         if self.policy.max_retries > 8 {
             bail!("policy.max_retries must be <= 8, got {}", self.policy.max_retries);
         }
+        // Every unknown in this file is resolved in the direction that cannot
+        // spend money. A negative or non-finite margin silently shrinks the
+        // reserve that keeps a burst out of paid credit, and the gate turns an
+        // unconvertible value into zero -- removing, without a word, exactly the
+        // protection the operator thought they had configured.
+        if !self.policy.hard_margin.is_finite() || self.policy.hard_margin < 0.0 {
+            bail!(
+                "policy.hard_margin must be a finite value >= 0.0, got {}",
+                self.policy.hard_margin
+            );
+        }
+        if !self.policy.drift_threshold.is_finite() || self.policy.drift_threshold < 0.0 {
+            bail!(
+                "policy.drift_threshold must be a finite value >= 0.0, got {}",
+                self.policy.drift_threshold
+            );
+        }
 
         if self.providers.is_empty() {
             bail!("no providers configured");
@@ -555,12 +596,57 @@ impl Config {
             if p.base_url.trim().is_empty() {
                 bail!("provider {name}: base_url must not be empty");
             }
+            // An account only leaves AccountState::Unknown after a successful
+            // probe, so a provider with no quota source can never be selected.
+            // This used to pass validation silently and doctor described the
+            // account as "local ledger only", which reads like a supported mode.
+            // It is not reported as a hard error only because the same setting
+            // is a convenient fixture in tests that drive the pool directly.
+            if matches!(p.adapter, QuotaAdapter::None) {
+                tracing::warn!(
+                    provider = %name,
+                    "adapter = \"none\" cannot serve traffic: an account is admitted to the \
+                     pool only after a successful quota probe, and with no probe source \
+                     there is nothing to admit it. This account will stay UNKNOWN forever. \
+                     Use one of: xkiro, command-code, deepseek, or remove the provider."
+                );
+            }
             // Credential-store entries are keyed by "provider/account". A slash
             // inside either half would let two different accounts resolve to the
             // same stored secret, so it is rejected at the boundary rather than
             // discovered later as a mysteriously shared key.
             if name.contains('/') {
                 bail!("provider name {name:?} must not contain a slash");
+            }
+            // A malformed URL otherwise survives every check here and only
+            // fails at request time, on the traffic path, for every client --
+            // while doctor, which probes through probe_base_url or a different
+            // string, can still report everything fine. The price table and the
+            // probe path are both validated at startup; this one was not.
+            for (field, url) in [
+                ("base_url", Some(p.base_url.as_str())),
+                ("probe_base_url", p.probe_base_url.as_deref()),
+            ] {
+                let Some(url) = url else { continue };
+                let parsed = reqwest::Url::parse(url).map_err(|e| {
+                    anyhow!("provider {name}: {field} {url:?} is not an absolute URL: {e}")
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    bail!("provider {name}: {field} {url:?} must use http or https");
+                }
+                if parsed.host_str().is_none() {
+                    bail!("provider {name}: {field} {url:?} names no host");
+                }
+            }
+            for multiplier in [p.credit_multiplier].into_iter().chain(
+                p.accounts.values().map(|a| a.credit_multiplier),
+            ) {
+                let Some(m) = multiplier else { continue };
+                if !m.is_finite() || m <= 0.0 {
+                    bail!(
+                        "provider {name}: credit_multiplier must be finite and > 0, got {m}"
+                    );
+                }
             }
             if p.accounts.is_empty() {
                 bail!("provider {name}: no accounts configured");
@@ -1422,5 +1508,65 @@ base_url = "https://api.xkiro.com/v1"
         let k = ApiKey::new("sk-super-secret");
         assert!(!format!("{k:?}").contains("super"));
         assert!(!format!("{k}").contains("super"));
+    }
+
+    /// A SecretRef holds the key BEFORE it becomes an ApiKey, so it must redact
+    /// too. The derived Debug printed an inline literal in full, and any error
+    /// context or log line carrying one would have written it to the terminal.
+    #[test]
+    fn debug_never_prints_an_inline_secret() {
+        let r = SecretRef::Literal("sk-super-secret".to_string());
+        assert!(!format!("{r:?}").contains("super"), "got {r:?}");
+        assert_eq!(format!("{r:?}"), "Literal(***)");
+        // The non-secret forms still say what they are.
+        assert!(format!("{:?}", SecretRef::Env { env: "X".into() }).contains('X'));
+        assert!(format!("{:?}", SecretRef::Keychain).contains("Keychain"));
+    }
+
+    /// A hostname without a scheme is the classic copy-paste error, and the URL
+    /// was only checked for emptiness, so every request failed at runtime while
+    /// doctor could still report everything fine.
+    #[test]
+    fn a_base_url_without_a_scheme_is_refused_at_startup() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().base_url = "api.example.com/v1".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("absolute URL"), "got: {err}");
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().base_url = "ftp://example.com".into();
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().base_url = "https://example.com/v1".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// A margin that cannot be a margin is refused rather than silently turned
+    /// into zero (or, worse, left negative) inside the hard gate.
+    #[test]
+    fn a_margin_that_would_weaken_the_gate_is_refused() {
+        for bad in [-5.0, f64::NAN, f64::INFINITY] {
+            let mut cfg = cfg_with_two_providers();
+            cfg.policy.hard_margin = bad;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("hard_margin"), "got: {err}");
+        }
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.hard_margin = 0.5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// Same direction, one level down: a multiplier of zero would make every
+    /// model look free to the gate.
+    #[test]
+    fn a_credit_multiplier_that_is_not_positive_is_refused() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().credit_multiplier = Some(0.0);
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().credit_multiplier = Some(f64::NAN);
+        assert!(cfg.validate().is_err());
     }
 }

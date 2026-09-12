@@ -22,12 +22,15 @@
 //!   wallet           -> Wallet        (Metered: real money)
 //!   free_tokens      -> FreeTokens    (Covered daily token allowance)
 
-use super::{get_body, json_money, json_u64, ProbeError, ProbeOutcome, QuotaProbe};
+use super::{
+    get_body, json_money, json_u64, sat_add, sat_sub, ProbeError, ProbeOutcome, QuotaProbe,
+};
 use crate::accounts::gate;
 use crate::domain::{Account, Gate, GateKind};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
+use time::OffsetDateTime;
 
 /// Path on the pinned probe host.
 pub(crate) const USAGE_PATH: &str = "/v1/usage";
@@ -105,28 +108,76 @@ pub(crate) fn outcome_from_body(body: &str) -> Result<ProbeOutcome, ProbeError> 
 }
 
 fn window_gate(window: &Value) -> Option<Gate> {
-    let window_sec = json_u64(window.get("window_sec")?)?;
+    // No window_sec at all leaves nothing to classify the window by; one that
+    // is present but unparsable is reported below rather than dropped mutely.
+    let raw = window.get("window_sec")?;
+    let Some(window_sec) = json_u64(raw) else {
+        tracing::warn!(
+            "xkiro /v1/usage: window_sec is not a number; dropping that window rather than guessing its kind"
+        );
+        return None;
+    };
     let kind = match window_sec {
         FIVE_HOUR_SECS => GateKind::FiveHour,
         WEEKLY_SECS => GateKind::Weekly,
         // An unrecognised window is not guessed at: there is no gate kind for
-        // "some other window", and inventing one would corrupt the router.
-        _ => return None,
+        // "some other window", and inventing one would corrupt the router. It is
+        // dropped loudly instead of silently: if the provider changes its window
+        // lengths, the quota would otherwise just stop existing for this account
+        // and the router would happily keep spending it.
+        other => {
+            tracing::warn!(
+                window_sec = other,
+                "xkiro /v1/usage: unrecognised window_sec; dropping that window rather than guessing its kind"
+            );
+            return None;
+        }
     };
 
     let spent = window.get("spent_usd").and_then(json_money);
     let cap = window.get("cap_usd").and_then(json_money);
     let remaining = window.get("remaining_usd").and_then(json_money);
 
-    let cap = cap.or_else(|| Some(spent? + remaining?))?;
-    let used = spent.or_else(|| remaining.map(|r| (cap - r).max(Decimal::ZERO)))?;
+    // Both derivations are saturating: these amounts are provider-supplied and
+    // rust_decimal's operators panic on overflow (a cap_usd of "-7e28" next to a
+    // remaining_usd of "7e28" builds a difference no Decimal can hold).
+    let cap = cap.or_else(|| Some(sat_add(spent?, remaining?)))?;
+    let used = spent.or_else(|| remaining.map(|r| sat_sub(cap, r).max(Decimal::ZERO)))?;
 
     let resets_at = window
         .get("resets_in_sec")
         .and_then(json_u64)
-        .map(|secs| crate::domain::now() + time::Duration::seconds(secs as i64));
+        .and_then(reset_after_secs);
 
     Some(gate(kind, cap, used, resets_at))
+}
+
+/// `now() + secs`, or None when that is not representable.
+///
+/// resets_in_sec is untrusted and effectively unbounded: u64::MAX turns into a
+/// negative i64, and any value past year 9999 overflows the addition. time's
+/// `OffsetDateTime + Duration` panics on both, which would take down whatever
+/// task owns the probe (the startup probe_all pass, or the poller) over one bad
+/// field. An unrepresentable reset is left absent -- we do not know when the
+/// window turns over, and inventing a time would be worse than saying so.
+fn reset_after_secs(secs: u64) -> Option<OffsetDateTime> {
+    let Ok(secs) = i64::try_from(secs) else {
+        tracing::warn!(
+            resets_in_sec = secs,
+            "xkiro /v1/usage: resets_in_sec does not fit a time::Duration; the reset time is left unknown"
+        );
+        return None;
+    };
+    match crate::domain::now().checked_add(time::Duration::seconds(secs)) {
+        Some(resets_at) => Some(resets_at),
+        None => {
+            tracing::warn!(
+                resets_in_sec = secs,
+                "xkiro /v1/usage: resets_in_sec is out of range; the reset time is left unknown"
+            );
+            None
+        }
+    }
 }
 
 fn free_tokens_gate(free: &Map<String, Value>) -> Option<Gate> {
@@ -180,7 +231,7 @@ impl QuotaProbe for XkiroProbe {
 mod tests {
     use super::*;
     use crate::domain::{parse_money, GateClass, GateKind};
-    use crate::quota::testutil::{strict_client, test_account, Reply, TestServer};
+    use crate::quota::testutil::{capture_warnings, strict_client, test_account, Reply, TestServer};
 
     /// Recorded /v1/usage response: both windows, free tokens and a wallet.
     const USAGE_BODY: &str = r#"{
@@ -276,6 +327,96 @@ mod tests {
             parse_money("20").unwrap()
         );
         assert!(gate_of(&outcome, GateKind::Weekly).resets_at.is_none());
+    }
+
+    /// A window the provider invents (say it starts reporting a 3h window) must
+    /// be reported instead of silently vanishing: a dropped window reads as "no
+    /// limit here", and the known windows must keep parsing as before.
+    #[tokio::test]
+    async fn xkiro_an_unknown_window_is_reported_and_leaves_the_known_windows_alone() {
+        let body = r#"{
+          "windows": [
+            { "window_sec": 10800, "spent_usd": "9", "cap_usd": "9" },
+            { "window_sec": 18000, "spent_usd": "1", "cap_usd": "10" }
+          ]
+        }"#;
+        let (warnings, outcome) = capture_warnings(async { outcome_from_body(body) }).await;
+        let outcome = outcome.expect("the known window must still parse");
+
+        assert_eq!(outcome.gates.len(), 1, "the unknown window is dropped, not guessed");
+        assert_eq!(
+            gate_of(&outcome, GateKind::FiveHour).cap,
+            parse_money("10").unwrap()
+        );
+        assert!(
+            warnings.iter().any(|line| line.contains("unrecognised window_sec")),
+            "an unknown window must be reported, got {warnings:?}"
+        );
+
+        // A window_sec that is not a number at all is the same story.
+        let body = r#"{
+          "windows": [
+            { "window_sec": "often", "spent_usd": "1", "cap_usd": "2" },
+            { "window_sec": 604800, "spent_usd": "1", "cap_usd": "20" }
+          ]
+        }"#;
+        let (warnings, outcome) = capture_warnings(async { outcome_from_body(body) }).await;
+        let outcome = outcome.expect("the weekly window must still parse");
+        assert_eq!(outcome.gates.len(), 1);
+        assert!(
+            warnings.iter().any(|line| line.contains("window_sec is not a number")),
+            "an unparsable window_sec must be reported, got {warnings:?}"
+        );
+    }
+
+    /// resets_in_sec is untrusted: u64::MAX turns into a negative i64 and the
+    /// largest i64 lands past year 9999, and both used to panic inside the Add.
+    /// One bad field must not kill the task that owns the probe, and an unknown
+    /// reset must stay unknown rather than be invented.
+    #[test]
+    fn xkiro_an_unrepresentable_reset_is_left_unknown_instead_of_panicking() {
+        let body = r#"{
+          "windows": [
+            { "window_sec": 18000, "spent_usd": "1", "cap_usd": "10",
+              "resets_in_sec": 18446744073709551615 },
+            { "window_sec": 604800, "spent_usd": "1", "cap_usd": "10",
+              "resets_in_sec": 9223372036854775807 }
+          ]
+        }"#;
+        let outcome = outcome_from_body(body).expect("must parse");
+
+        assert!(gate_of(&outcome, GateKind::FiveHour).resets_at.is_none());
+        assert!(gate_of(&outcome, GateKind::Weekly).resets_at.is_none());
+
+        // A representable value still becomes a real reset time.
+        let body = r#"{ "windows": [ { "window_sec": 18000, "spent_usd": "1",
+                                       "cap_usd": "10", "resets_in_sec": 60 } ] }"#;
+        let outcome = outcome_from_body(body).expect("must parse");
+        let reset = gate_of(&outcome, GateKind::FiveHour)
+            .resets_at
+            .expect("60s is representable");
+        assert!(reset > crate::domain::now());
+    }
+
+    /// Amounts are provider-supplied Decimal strings and can be arbitrarily
+    /// large: 7e28 is under Decimal::MAX (7.92e28) but 7e28 + 7e28 is not, so the
+    /// old `spent + remaining` panicked. `cap - remaining` overflows the same way
+    /// when the two ends of the range are combined.
+    #[test]
+    fn xkiro_extreme_amounts_saturate_instead_of_panicking() {
+        let body = r#"{ "windows": [ { "window_sec": 18000, "spent_usd": "7e28",
+                                       "remaining_usd": "7e28" } ] }"#;
+        let outcome = outcome_from_body(body).expect("must parse");
+        assert_eq!(gate_of(&outcome, GateKind::FiveHour).cap, Decimal::MAX);
+
+        let body = r#"{ "windows": [ { "window_sec": 18000, "cap_usd": "-7e28",
+                                       "remaining_usd": "7e28" } ] }"#;
+        let outcome = outcome_from_body(body).expect("must parse");
+        assert_eq!(
+            gate_of(&outcome, GateKind::FiveHour).used,
+            Decimal::ZERO,
+            "a saturated difference must still clamp at zero used"
+        );
     }
 
     #[test]

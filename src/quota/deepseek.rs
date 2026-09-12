@@ -18,7 +18,7 @@
 //! per currency entry and the amounts are never summed across currencies -- CNY
 //! and USD are not the same number.
 
-use super::{get_body, json_money, ProbeError, ProbeOutcome, QuotaProbe};
+use super::{get_body, json_money, sat_add, ProbeError, ProbeOutcome, QuotaProbe};
 use crate::accounts::gate;
 use crate::domain::{Account, GateKind};
 use async_trait::async_trait;
@@ -109,7 +109,12 @@ fn balance(info: &Map<String, Value>) -> Option<Decimal> {
     }
     let granted = info.get("granted_balance").and_then(json_money);
     let topped_up = info.get("topped_up_balance").and_then(json_money);
-    Some(granted? + topped_up?)
+    // Both parts are provider-supplied and the sum can overflow a Decimal
+    // (two balances of "7e28"); rust_decimal's `+` panics there, which would
+    // kill the probe task rather than report one account. Saturating keeps the
+    // reading alive and errs towards "plenty of money left" only in a range no
+    // real balance reaches.
+    Some(sat_add(granted?, topped_up?))
 }
 
 #[async_trait]
@@ -208,6 +213,18 @@ mod tests {
         }"#;
         let outcome = outcome_from_body(body).expect("payload must parse");
         assert_eq!(outcome.gates[0].cap, parse_money("110.00").unwrap());
+    }
+
+    /// granted_balance and topped_up_balance are provider-supplied, and their sum
+    /// can overflow a Decimal (two balances of 7e28 do): rust_decimal's `+`
+    /// panics there, which would kill the probing task instead of reporting one
+    /// account. Saturation keeps the reading alive at the top of the range.
+    #[test]
+    fn deepseek_extreme_partitions_saturate_instead_of_panicking() {
+        let body = r#"{ "balance_infos": [ { "currency": "USD",
+                       "granted_balance": "7e28", "topped_up_balance": "7e28" } ] }"#;
+        let outcome = outcome_from_body(body).expect("must parse");
+        assert_eq!(outcome.gates[0].cap, Decimal::MAX);
     }
 
     #[test]

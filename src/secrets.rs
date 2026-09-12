@@ -185,6 +185,21 @@ pub struct CredentialStore {
 }
 
 impl CredentialStore {
+    /// The backend this process should use, from the environment.
+    ///
+    /// AI_GW_CREDENTIAL_BACKEND=memory forces an ephemeral store, so dry runs and
+    /// CI never touch the operator's real keychain. EVERY caller has to come
+    /// through here. When only doctor and keys honoured the setting, "serve"
+    /// read the real keychain anyway -- so the documented promise was false
+    /// exactly where it mattered, and a dry run that believed it was isolated
+    /// still raised authorisation prompts.
+    pub fn from_env() -> Self {
+        match std::env::var("AI_GW_CREDENTIAL_BACKEND").as_deref() {
+            Ok("memory") => Self::memory(),
+            _ => Self::keychain(),
+        }
+    }
+
     /// The real store, backed by the OS credential store.
     pub fn keychain() -> Self {
         CredentialStore {

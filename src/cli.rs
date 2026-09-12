@@ -22,14 +22,12 @@
 //! touching the network. Only status --refresh, accounts probe and doctor reach
 //! out to providers.
 
-use crate::accounts::Pool;
 use crate::config::{Config, QuotaAdapter, SecretRef};
 use crate::secrets::CredentialStore;
 use crate::domain::{
     Account, AccountOverview, AccountState, Confidence, Gate, GateClass, GateKind, GroupBy,
     RequestStatus, RequestSummary, UsageRow,
 };
-use crate::error::UpstreamErrorClass;
 use crate::quota::probe_for;
 use crate::router::Gateway;
 use crate::store;
@@ -171,6 +169,11 @@ pub enum AccountsCommand {
     /// Take an account out of the pool until an operator re-enables it.
     Disable {
         /// Account id to disable.
+        account: String,
+    },
+    /// Put a disabled account back in the pool, after a probe proves it works.
+    Enable {
+        /// Account id to enable.
         account: String,
     },
 }
@@ -751,17 +754,22 @@ fn parse_since(spec: &str, now: OffsetDateTime) -> Result<OffsetDateTime> {
 
 /// Parse "7d" / "24h" / "90m" / "45s" / "2w" into a duration.
 fn parse_relative(spec: &str) -> Option<time::Duration> {
-    let (digits, unit) = spec.split_at(spec.len().checked_sub(1)?);
+    // Split on the last CHARACTER, not the last byte: split_at panics when the
+    // index lands inside a multi-byte character, so "--since 1天" crashed the
+    // whole CLI with a char-boundary panic instead of the tidy parse error five
+    // lines up. A Chinese or accented unit is an easy thing for a human to type.
+    let (index, unit) = spec.char_indices().next_back()?;
+    let digits = &spec[..index];
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let n: i64 = digits.parse().ok()?;
     let secs = match unit {
-        "s" => n,
-        "m" => n.checked_mul(60)?,
-        "h" => n.checked_mul(3_600)?,
-        "d" => n.checked_mul(86_400)?,
-        "w" => n.checked_mul(604_800)?,
+        's' => n,
+        'm' => n.checked_mul(60)?,
+        'h' => n.checked_mul(3_600)?,
+        'd' => n.checked_mul(86_400)?,
+        'w' => n.checked_mul(604_800)?,
         _ => return None,
     };
     Some(time::Duration::seconds(secs))
@@ -986,6 +994,7 @@ async fn cmd_accounts(path: &Path, args: AccountsArgs) -> Result<()> {
         AccountsCommand::List => cmd_status(path, false).await,
         AccountsCommand::Probe { account } => cmd_accounts_probe(path, account).await,
         AccountsCommand::Disable { account } => cmd_accounts_disable(path, &account),
+        AccountsCommand::Enable { account } => cmd_accounts_enable(path, &account),
     }
 }
 
@@ -1031,37 +1040,64 @@ fn provider_of(config: &Config, account_id: &str) -> Result<String> {
     }
 }
 
+/// Whether a listen address is confined to this machine.
+///
+/// The address is a string in the config, so this has to be a textual check:
+/// anything that does not name the loopback interface is treated as reachable
+/// by others, which is the safe direction.
+fn listens_on_loopback(listen: &str) -> bool {
+    let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
+}
+
 fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
     let config = load_config(path)?;
     let provider = provider_of(&config, account_id)?;
     // Deliberately unresolved: disabling an account must work even when its
     // credential is missing, which is exactly when you want to disable it.
+    // Target the canonical identity: the same account id can exist under
+    // several providers, and disabling the wrong one would silently take a
+    // healthy account out of the pool.
+    let qualified = crate::domain::qualified_id(&provider, account_id);
     let accounts = config.build_accounts_unresolved()?;
-    let pool = Pool::new(accounts, &config.policy);
+    let mut account = accounts
+        .into_iter()
+        .find(|a| a.qualified() == qualified)
+        .with_context(|| format!("account {qualified} is not in the configuration"))?;
+
+    let db = config.db_path();
+
+    // Overlay what the ledger already knows before writing anything back.
+    //
+    // This command used to save a full pool snapshot built from configuration
+    // alone: those accounts carry no gates and state Unknown, so the upsert
+    // deleted the gate rows of EVERY account in the file and reset their state
+    // and reset times. Disabling one account quietly erased the quota readings
+    // of all the others -- hours of probing, and on Command Code the difference
+    // between routing on real numbers and routing blind. It also created a
+    // fresh empty ledger on a machine that had none.
+    if let Ok(conn) = store::open_readonly(&db)
+        && let Ok(rows) = store::load_accounts(&conn)
+        && let Some(row) = rows
+            .into_iter()
+            .find(|r| crate::domain::qualified_id(&r.provider, &r.account_id) == qualified)
+    {
+        account.gates = row.gates;
+        account.available_at = row.available_at;
+        account.window_started_at = row.window_started_at;
+    }
 
     // There is no dedicated "operator disabled" transition in the frozen pool
     // API; an account that can never be billed again is exactly the Disabled
     // state that insufficient credit produces, so it is used here and the
     // reason is rewritten to say what really happened.
-    // Target the canonical identity: the same account id can exist under
-    // several providers, and disabling the wrong one would silently take a
-    // healthy account out of the pool.
-    let qualified = crate::domain::qualified_id(&provider, account_id);
-    pool.note_error(
-        &qualified,
-        UpstreamErrorClass::InsufficientCredit,
-        None,
-        None,
-    );
-    let mut snapshot = pool.snapshot();
-    let Some(account) = snapshot.iter_mut().find(|a| a.qualified() == qualified) else {
-        bail!("account {qualified} disappeared while disabling it");
-    };
-    account.last_error = Some("disabled by operator (ai-gw accounts disable)".to_string());
+    account.state = AccountState::Disabled;
+    account.last_error = Some(crate::accounts::OPERATOR_DISABLED.to_string());
 
-    let db = config.db_path();
     let handle = store::StoreHandle::spawn(&db)?;
-    handle.save_accounts(&snapshot);
+    // One account, one row. Never a snapshot.
+    handle.save_account(&account);
     handle.flush_blocking()?;
 
     println!("{provider}/{account_id}: DISABLED (persisted to {})", db.display());
@@ -1076,15 +1112,9 @@ fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
 // doctor
 // ---------------------------------------------------------------------------
 
-/// Which credential backend to use.
-///
-/// AI_GW_CREDENTIAL_BACKEND=memory forces an ephemeral store, so tests, dry runs
-/// and CI never read or write the operator's real OS keychain.
+/// Which credential backend to use. See CredentialStore::from_env.
 fn credential_store() -> CredentialStore {
-    match std::env::var("AI_GW_CREDENTIAL_BACKEND").as_deref() {
-        Ok("memory") => CredentialStore::memory(),
-        _ => CredentialStore::keychain(),
-    }
+    CredentialStore::from_env()
 }
 
 async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
@@ -1138,6 +1168,13 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     );
 
     println!("credentials :");
+    // Resolve every credential ONCE and reuse the result below.
+    //
+    // The account list used to be built twice -- once here to report, once in
+    // the probe section -- so every key was read twice. On macOS each read of an
+    // item the app is not already trusted for is another authorisation prompt,
+    // which made "ai-gw doctor" ask twice per account for a read-only check.
+    let (usable, unusable) = config.build_accounts_lenient(&creds)?;
     for (provider, p) in &config.providers {
         if p.accounts.is_empty() {
             println!("  {provider}: no accounts configured");
@@ -1146,15 +1183,20 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
         for (id, a) in &p.accounts {
             let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
             let source = secret_ref.describe();
-            match secret_ref.resolve(&creds, provider, id) {
-                // The key itself is never printed; ApiKey redacts Debug/Display
-                // and this path never formats it at all.
-                Ok(_) => println!("  {provider}/{id}: ok ({source})"),
-                Err(e) => {
-                    println!("  {provider}/{id}: MISSING ({source}) - {e:#}");
-                    problems += 1;
-                }
+            // The key itself is never printed; ApiKey redacts Debug/Display and
+            // this path never formats it at all.
+            let qualified = crate::domain::qualified_id(provider, id);
+            if usable.iter().any(|acct| acct.qualified() == qualified) {
+                println!("  {provider}/{id}: ok ({source})");
+                continue;
             }
+            let reason = unusable
+                .iter()
+                .find(|acct| acct.qualified() == qualified)
+                .and_then(|acct| acct.last_error.clone())
+                .unwrap_or_else(|| "could not be resolved".to_string());
+            println!("  {provider}/{id}: MISSING ({source}) - {reason}");
+            problems += 1;
         }
     }
 
@@ -1172,18 +1214,27 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     }
 
     // Doctor is deliberately strict: it exists to report problems.
-    match config.build_accounts(&creds) {
-        Err(e) => {
-            println!("  skipped: {e:#}");
-            println!("  (fix the missing credentials above, then re-run doctor)");
-        }
-        Ok(built) => {
-            for account in &built {
+    // The accounts were already built above, so this reuses them rather than
+    // reading every credential a second time.
+    if usable.is_empty() {
+        println!("  skipped: no account has a usable credential");
+        println!("  (fix the missing credentials above, then re-run doctor)");
+    } else {
+        {
+            for account in &usable {
                 let label = format!("{}/{}", account.provider, account.id);
                 match targets.get(&account.provider) {
                     None => println!("  {label}: no probe target configured"),
                     Some((QuotaAdapter::None, _)) => {
-                        println!("  {label}: local ledger only (adapter = none)")
+                        // There is no supported "local ledger only" mode: an
+                        // account that is never probed never leaves Unknown, and
+                        // Unknown is not selectable. Saying "local ledger only"
+                        // made a dead account look like a configured one.
+                        println!(
+                            "  {label}: UNUSABLE - adapter = none has no quota source, so this \
+                             account can never leave the UNKNOWN state"
+                        );
+                        problems += 1;
                     }
                     Some((adapter, base)) => match probe_for(*adapter, base) {
                         None => println!("  {label}: no adapter for {adapter:?}"),
@@ -1200,6 +1251,27 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
                 }
             }
         }
+    }
+
+    // Two settings whose absence is invisible until it costs money or leaks
+    // quota. Neither was checked anywhere: the proxy opened its port silently
+    // and doctor reported "no problems found".
+    if config.server.local_key.is_none() {
+        println!(
+            "local auth  : MISSING - anything that can reach {} can spend the pooled quota.",
+            config.server.listen
+        );
+        println!("              fix: ai-gw keys add local gateway, then set local_key");
+        problems += 1;
+    } else {
+        println!("local auth  : configured");
+    }
+    if !listens_on_loopback(&config.server.listen) {
+        println!(
+            "listen      : {} is not a loopback address; this process holds paid credentials",
+            config.server.listen
+        );
+        problems += 1;
     }
 
     if problems == 0 {
@@ -1226,6 +1298,27 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+    // 0600 from the moment it exists. The template carries no secret, but it is
+    // the file people then put credentials-adjacent settings in, and a config
+    // written world-readable is world-readable for the rest of its life.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        use std::io::Write as _;
+        file.write_all(crate::config::sample_toml().as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        // --force over an existing file keeps that file's mode, so make it
+        // explicit rather than inheriting whatever the old file had.
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
     std::fs::write(path, crate::config::sample_toml())
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote example config to {}", path.display());
@@ -1233,6 +1326,57 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+
+/// Put a disabled account back in the pool.
+///
+/// The state becomes Unknown rather than Active on purpose: the next probe has
+/// to confirm the account can actually serve before it takes traffic, which is
+/// the same rule a restart follows. "accounts enable" means "try again", not
+/// "trust me" -- and it is the only thing that can undo an operator's disable,
+/// because a successful probe restores the credential, not the decision.
+fn cmd_accounts_enable(path: &Path, account_id: &str) -> Result<()> {
+    let config = load_config(path)?;
+    let provider = provider_of(&config, account_id)?;
+    let qualified = crate::domain::qualified_id(&provider, account_id);
+    let db = config.db_path();
+
+    let accounts = config.build_accounts_unresolved()?;
+    let mut account = accounts
+        .into_iter()
+        .find(|a| a.qualified() == qualified)
+        .with_context(|| format!("account {qualified} is not in the configuration"))?;
+
+    if let Ok(conn) = store::open_readonly(&db)
+        && let Ok(rows) = store::load_accounts(&conn)
+        && let Some(row) = rows
+            .into_iter()
+            .find(|r| crate::domain::qualified_id(&r.provider, &r.account_id) == qualified)
+    {
+        if row.state != AccountState::Disabled {
+            bail!(
+                "{qualified} is {}, not DISABLED; there is nothing to enable",
+                row.state.label()
+            );
+        }
+        account.gates = row.gates;
+        account.available_at = row.available_at;
+        account.window_started_at = row.window_started_at;
+        account.last_probe_at = None;
+    }
+
+    account.state = AccountState::Unknown;
+    account.last_error = None;
+
+    let handle = store::StoreHandle::spawn(&db)?;
+    handle.save_account(&account);
+    handle.flush_blocking()?;
+
+    println!("{provider}/{account_id}: ENABLED (probed before it serves again)");
+    println!(
+        "note: restart ai-gw serve for this to take effect there, or run          'ai-gw accounts probe' to confirm it now"
+    );
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // keys
@@ -2558,5 +2702,36 @@ key = "sk-b2"
         assert!(err.contains("ambiguous"), "got: {err}");
         let err = provider_of(&config, "nope").unwrap_err().to_string();
         assert!(err.contains("no account"), "got: {err}");
+    }
+
+    /// A multi-byte unit is a parse error, not a panic.
+    ///
+    /// The parser split at spec.len() - 1, a BYTE index, so "--since 1天" aborted
+    /// the process with "byte index 3 is not a char boundary" instead of the tidy
+    /// message the function already had. A Chinese unit is an easy thing to type.
+    #[test]
+    fn a_non_ascii_since_unit_is_refused_instead_of_panicking() {
+        assert!(parse_relative("1天").is_none());
+        assert!(parse_relative("7天前").is_none());
+        assert!(parse_relative("é").is_none());
+        assert!(parse_relative("").is_none());
+        // And the ASCII spellings still work.
+        assert_eq!(parse_relative("7d"), Some(time::Duration::days(7)));
+        assert_eq!(parse_relative("90m"), Some(time::Duration::minutes(90)));
+    }
+
+    /// Only a loopback address counts as local.
+    ///
+    /// The proxy holds paid credentials and doctor said nothing about an address
+    /// the rest of the network could reach.
+    #[test]
+    fn only_loopback_addresses_are_treated_as_local() {
+        assert!(listens_on_loopback("127.0.0.1:8787"));
+        assert!(listens_on_loopback("localhost:8787"));
+        assert!(listens_on_loopback("[::1]:8787"));
+        assert!(listens_on_loopback("127.0.0.53:8787"));
+        assert!(!listens_on_loopback("0.0.0.0:8787"));
+        assert!(!listens_on_loopback("[::]:8787"));
+        assert!(!listens_on_loopback("192.168.1.10:8787"));
     }
 }

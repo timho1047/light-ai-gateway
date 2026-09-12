@@ -45,6 +45,19 @@ pub struct SseResult {
     pub error: Option<String>,
 }
 
+impl SseResult {
+    /// Whether the stream ended with a terminal marker.
+    ///
+    /// A missing marker means the stream was cut short -- the client
+    /// disconnected, or the upstream died mid-answer -- and proxy.rs needs to
+    /// see that to flag the request instead of recording a truncated stream as
+    /// a complete one. The field stays public so existing construction is
+    /// unchanged.
+    pub fn saw_done(&self) -> bool {
+        self.saw_done
+    }
+}
+
 /// Incremental SSE meter. Feed it raw lines exactly as received.
 #[derive(Debug, Default)]
 pub struct SseMeter {
@@ -104,14 +117,11 @@ impl SseMeter {
         }
 
         let is_first_content = self.inner.content_chunks == 0;
-        if let Some(text) = content_text(&value)
-            && !text.is_empty() {
-                self.inner.content_chunks += 1;
-                self.content_chars = self
-                    .content_chars
-                    .saturating_add(text.chars().count() as u64);
-                obs.first_content = is_first_content;
-            }
+        if let Some(len) = content_len(&value) {
+            self.inner.content_chunks += 1;
+            self.content_chars = self.content_chars.saturating_add(len);
+            obs.first_content = is_first_content;
+        }
 
         if stream_finished(&value) {
             self.inner.saw_done = true;
@@ -143,7 +153,10 @@ impl SseMeter {
         cur.completion_tokens = cur.completion_tokens.max(u.completion_tokens);
         cur.cached_tokens = cur.cached_tokens.max(u.cached_tokens);
         cur.reasoning_tokens = cur.reasoning_tokens.max(u.reasoning_tokens);
-        cur.measured = true;
+        // OR, not assignment: an all-zero frame is demoted to unmeasured (see
+        // usage_from_json), and it must neither erase a real reading that
+        // arrived earlier in the stream nor suppress one that follows it.
+        cur.measured = cur.measured || u.measured;
     }
 }
 
@@ -249,14 +262,11 @@ impl StreamMeter {
                             }
                             // Keep the content-length hint for the local
                             // estimate when no usage frame was present.
-                            if let Some(text) = content_text(&value)
-                                && !text.is_empty() {
-                                    self.sse.inner.content_chunks += 1;
-                                    self.sse.content_chars = self
-                                        .sse
-                                        .content_chars
-                                        .saturating_add(text.chars().count() as u64);
-                                }
+                            if let Some(len) = content_len(&value) {
+                                self.sse.inner.content_chunks += 1;
+                                self.sse.content_chars =
+                                    self.sse.content_chars.saturating_add(len);
+                            }
                             self.sse.inner.saw_done = true;
                         }
                 }
@@ -355,6 +365,22 @@ pub fn set_model(body: &mut serde_json::Value, model: &str) -> Option<String> {
 /// "message.usage" (the Anthropic message_start event). Returns None when no
 /// recognised token field is present, so an unrelated object can never be
 /// reported as a real zero-token measurement.
+///
+/// Three cache dialects are accepted because all three are live on this
+/// gateway: OpenAI's prompt_tokens_details.cached_tokens, Anthropic's
+/// cache_read_input_tokens, and DeepSeek's prompt_cache_hit_tokens /
+/// prompt_cache_miss_tokens. Before the DeepSeek pair was read here, every
+/// DeepSeek request metered cached = 0: the cache-hit ratio was structurally
+/// zero and the prompt tokens it discounts were billed at the full uncached
+/// rate, which the pricing panel then reported as price drift.
+///
+/// A frame whose recognised counters are ALL zero comes back with
+/// measured = false. Providers emit those as pacing/keepalive noise, and
+/// taking one as a reading would hand the hard gate cost = 0 and push a 0 into
+/// the pool's recent-cost reserve -- DESIGN section 6's zero-accounting failure
+/// mode, which is what makes the whole local-ledger scheme fail. A genuinely
+/// tiny request still carries at least one non-zero counter, so only the
+/// all-zero frame is demoted.
 pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
     let u = v
         .get("usage")
@@ -362,11 +388,14 @@ pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
         .or_else(|| v.get("message").and_then(|m| m.get("usage")))
         .filter(|x| x.is_object())?;
 
-    let mut usage = TokenUsage {
-        measured: true,
-        ..Default::default()
-    };
+    let mut usage = TokenUsage::default();
     let mut any = false;
+
+    // DeepSeek splits the prompt into cache hits and misses instead of using
+    // prompt_tokens_details. Both are read so a frame carrying only that pair
+    // still yields a prompt count rather than a zero.
+    let cache_hit = u.get("prompt_cache_hit_tokens").and_then(Value::as_u64);
+    let cache_miss = u.get("prompt_cache_miss_tokens").and_then(Value::as_u64);
 
     // OpenAI names first; Anthropic names as the fallback.
     if let Some(n) = u.get("prompt_tokens").and_then(Value::as_u64) {
@@ -374,6 +403,9 @@ pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
         any = true;
     } else if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
         usage.prompt_tokens = n;
+        any = true;
+    } else if cache_hit.is_some() || cache_miss.is_some() {
+        usage.prompt_tokens = cache_hit.unwrap_or(0).saturating_add(cache_miss.unwrap_or(0));
         any = true;
     }
 
@@ -395,64 +427,150 @@ pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
     } else if let Some(n) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
         usage.cached_tokens = n;
         any = true;
+    } else if let Some(n) = cache_hit {
+        // DeepSeek's hit count IS the cached portion of prompt_tokens, the same
+        // quantity OpenAI nests under prompt_tokens_details.
+        usage.cached_tokens = n;
+        any = true;
     }
 
+    // Reasoning is nested under completion_tokens_details by OpenAI and
+    // DeepSeek, and reported flat by some OpenAI-compatible providers.
     if let Some(n) = u
         .get("completion_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
         .and_then(Value::as_u64)
+        .or_else(|| u.get("reasoning_tokens").and_then(Value::as_u64))
     {
         usage.reasoning_tokens = n;
         any = true;
     }
 
-    if any { Some(usage) } else { None }
+    if !any {
+        return None;
+    }
+    usage.measured = usage.prompt_tokens > 0
+        || usage.completion_tokens > 0
+        || usage.cached_tokens > 0
+        || usage.reasoning_tokens > 0;
+    Some(usage)
 }
 
-/// Visible content carried by one frame, if any.
+/// Number of visible content characters carried by one frame, if any.
 ///
-/// Role-only deltas, empty deltas and tool-call deltas deliberately return
-/// None: TTFT is measured to the first actual content token.
-fn content_text(v: &Value) -> Option<&str> {
-    // Anthropic: content_block_delta / content_block_start.
+/// Role-only deltas, empty deltas and structural frames deliberately return
+/// None: TTFT is measured to the first actual content token, so a frame that
+/// carries no token must not stamp it.
+///
+/// Tool-call deltas ARE content. A stream that answers with a tool call carries
+/// no delta.content at all -- the payload arrives as
+/// delta.tool_calls[].function.name and then as arguments increments, or in the
+/// Anthropic dialect as a tool_use content_block plus input_json_delta
+/// fragments -- so reading only content left every tool-calling request with a
+/// NULL TTFT and, when the upstream sent no usage frame, a completion estimate
+/// of content_chars / 4 = 0. That is the under-estimating direction: the hard
+/// gate then prices a tool payload of several hundred tokens as free.
+fn content_len(v: &Value) -> Option<u64> {
+    // Anthropic: content_block_delta / content_block_start, and the tool-use
+    // arguments that arrive as input_json_delta fragments.
     if let Some(t) = v.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
-        return Some(t);
+        return non_empty_len(t);
+    }
+    if let Some(t) = v
+        .get("delta")
+        .and_then(|d| d.get("partial_json"))
+        .and_then(Value::as_str)
+    {
+        return non_empty_len(t);
     }
     if let Some(t) = v
         .get("content_block")
         .and_then(|b| b.get("text"))
         .and_then(Value::as_str)
     {
-        return Some(t);
+        return non_empty_len(t);
+    }
+    // Anthropic tool call: the opening block carries the function name, and a
+    // tool call with no arguments has no delta frame after it at all.
+    if let Some(n) = v
+        .get("content_block")
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .and_then(|b| b.get("name"))
+        .and_then(Value::as_str)
+        .and_then(non_empty_len)
+    {
+        return Some(n);
     }
     // OpenAI: choices[].delta.content (or the non-streaming message.content).
     let choices = v.get("choices")?.as_array()?;
     for c in choices {
         if let Some(t) = c.get("delta").and_then(|d| d.get("content"))
-            && let Some(s) = text_of(t) {
-                return Some(s);
+            && let Some(n) = text_len(t) {
+                return Some(n);
             }
+        if let Some(n) = tool_calls_len_of(c.get("delta")) {
+            return Some(n);
+        }
         if let Some(t) = c.get("message").and_then(|m| m.get("content"))
-            && let Some(s) = text_of(t) {
-                return Some(s);
+            && let Some(n) = text_len(t) {
+                return Some(n);
             }
+        if let Some(n) = tool_calls_len_of(c.get("message")) {
+            return Some(n);
+        }
         if let Some(t) = c.get("text")
-            && let Some(s) = text_of(t) {
-                return Some(s);
+            && let Some(n) = text_len(t) {
+                return Some(n);
             }
     }
     None
 }
 
-/// Content may be a bare string or an array of typed parts.
-fn text_of(v: &Value) -> Option<&str> {
+/// Content characters in the tool_calls array of a delta or a message.
+fn tool_calls_len_of(container: Option<&Value>) -> Option<u64> {
+    tool_calls_len(container?.get("tool_calls")?)
+}
+
+/// Content characters in a tool_calls array.
+///
+/// The function NAME counts alongside the arguments: it is generated output the
+/// provider bills for, and it is what arrives on the first tool-call frame,
+/// where arguments is still the empty string -- the frame that should define
+/// TTFT. A provider that resends the name with every argument chunk over-counts
+/// slightly, which is the safe direction for a completion estimate.
+fn tool_calls_len(tool_calls: &Value) -> Option<u64> {
+    let mut chars = 0u64;
+    for call in tool_calls.as_array()? {
+        let function = call.get("function");
+        for part in [
+            function.and_then(|f| f.get("name")),
+            function.and_then(|f| f.get("arguments")),
+        ] {
+            if let Some(s) = part.and_then(Value::as_str) {
+                chars = chars.saturating_add(s.chars().count() as u64);
+            }
+        }
+    }
+    (chars > 0).then_some(chars)
+}
+
+/// Content characters in a content field, which may be a bare string or an
+/// array of typed parts.
+fn text_len(v: &Value) -> Option<u64> {
     match v {
-        Value::String(s) => Some(s.as_str()),
+        Value::String(s) => non_empty_len(s),
         Value::Array(parts) => parts
             .iter()
-            .find_map(|p| p.get("text").and_then(Value::as_str)),
+            .find_map(|p| p.get("text").and_then(Value::as_str))
+            .and_then(non_empty_len),
         _ => None,
     }
+}
+
+/// Character count of a non-empty string; None for the empty string.
+fn non_empty_len(s: &str) -> Option<u64> {
+    let n = s.chars().count() as u64;
+    (n > 0).then_some(n)
 }
 
 /// True when the frame signals the end of generation.
@@ -530,6 +648,75 @@ mod tests {
         assert_eq!(m.content_chars(), 11);
     }
 
+    /// A tool-calling stream carries no delta.content at all, so before this the
+    /// first tool-call frame did not stamp TTFT and a stream that lost its usage
+    /// frame estimated completion from 0 characters -- pricing a real tool
+    /// payload as free, the under-estimating direction.
+    #[test]
+    fn tool_call_deltas_start_ttft_and_count_their_characters() {
+        let mut m = SseMeter::new();
+        // The first tool-call frame names the function; arguments are still empty.
+        let first = m.feed_line(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}"#,
+        );
+        assert!(
+            first.first_content,
+            "the tool call is the first generated content"
+        );
+        assert_eq!(m.content_chars(), 11, "the 11 characters of get_weather");
+
+        let args = m.feed_line(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}"#,
+        );
+        assert!(!args.first_content, "only the first content frame reports it");
+
+        // An empty array and a structural frame are not content.
+        let empty = m.feed_line(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[]},"finish_reason":null}]}"#,
+        );
+        assert!(!empty.first_content);
+
+        let r = m.finish();
+        // 11 (name) + 16 ({"city":"Paris"}) characters.
+        assert_eq!(r.content_chunks, 2);
+        assert_eq!(m.content_chars(), 27);
+
+        // The non-streaming shape benefits the same way: a tool-call body with
+        // no usage frame must not read as zero content characters either.
+        let mut json = StreamMeter::json();
+        json.push(
+            br#"{"id":"x","choices":[{"index":0,"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        let r = json.finish();
+        assert!(!r.usage.measured);
+        assert_eq!(json.content_chars(), 27);
+    }
+
+    /// The same hole in the Anthropic dialect: a tool_use block announces the
+    /// function on content_block_start and streams its arguments as
+    /// input_json_delta fragments, and neither is delta.text.
+    #[test]
+    fn anthropic_tool_use_frames_count_as_content() {
+        let mut m = SseMeter::new();
+        let open = m.feed_line(
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+        );
+        assert!(open.first_content, "the tool_use block is generated content");
+        assert_eq!(m.content_chars(), 11, "the 11 characters of get_weather");
+
+        m.feed_line(
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+        );
+        assert_eq!(m.content_chars(), 19, "plus the 8-character city fragment");
+
+        // An empty fragment is not content.
+        let empty = m.feed_line(
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+        );
+        assert!(!empty.first_content);
+        assert_eq!(m.finish().content_chunks, 2);
+    }
+
     /// Regression, seen against a live provider: HTTP 200 with the failure
     /// reported inside the stream. The bytes must still be relayed, but the
     /// request must not be counted as a success.
@@ -556,6 +743,34 @@ mod tests {
         let obs = m.feed_line("data: [DONE]");
         assert!(obs.done);
         assert!(m.finish().saw_done);
+    }
+
+    /// The proxy marks a stream truncated when it never saw a terminal marker,
+    /// and this accessor is what it reads. Both ways a stream can end must be
+    /// visible through it, and a stream cut off mid-answer must stay false.
+    #[test]
+    fn saw_done_is_readable_through_an_accessor() {
+        let mut cut = SseMeter::new();
+        cut.feed_line(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        );
+        assert!(
+            !cut.finish().saw_done(),
+            "a stream cut off mid-answer never saw a terminal marker"
+        );
+
+        let mut done = SseMeter::new();
+        done.feed_line("data: [DONE]");
+        assert!(done.finish().saw_done());
+
+        let mut finished = SseMeter::new();
+        finished.feed_line(
+            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        );
+        assert!(
+            finished.finish().saw_done(),
+            "finish_reason also ends the stream"
+        );
     }
 
     #[test]
@@ -635,6 +850,84 @@ mod tests {
         assert_eq!(r.usage.completion_tokens, 15, "message_delta carries the output count");
         assert_eq!(r.usage.cached_tokens, 10);
         assert!(r.usage.measured);
+    }
+
+    /// DeepSeek -- one of the providers this gateway routes -- reports prompt
+    /// cache hits as prompt_cache_hit_tokens instead of the OpenAI
+    /// prompt_tokens_details.cached_tokens. Reading only the OpenAI field made
+    /// every DeepSeek request meter cached = 0, so the cache-hit metric was
+    /// structurally zero and the discounted tokens were billed at the full
+    /// uncached rate.
+    #[test]
+    fn deepseek_prompt_cache_hit_tokens_are_metered_as_cached() {
+        let mut m = SseMeter::new();
+        let obs = m.feed_line(
+            r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":64,"prompt_cache_miss_tokens":36,"completion_tokens_details":{"reasoning_tokens":8}}}"#,
+        );
+        let usage = obs.usage.expect("a DeepSeek usage frame must be parsed");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(
+            usage.cached_tokens, 64,
+            "prompt_cache_hit_tokens is the cached part of the prompt"
+        );
+        assert_eq!(usage.reasoning_tokens, 8);
+        assert_eq!(usage.cache_hit_ratio(), Some(0.64));
+        assert!(usage.measured);
+
+        // A frame carrying only the hit/miss pair still yields a prompt count,
+        // and a flat reasoning_tokens field is accepted too.
+        let mut bare = SseMeter::new();
+        let obs = bare.feed_line(
+            r#"data: {"usage":{"prompt_cache_hit_tokens":64,"prompt_cache_miss_tokens":36,"reasoning_tokens":8}}"#,
+        );
+        let usage = obs.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.cached_tokens, 64);
+        assert_eq!(usage.reasoning_tokens, 8);
+    }
+
+    /// Providers emit all-zero usage frames as pacing/keepalive noise. Taking
+    /// one as a measurement hands the hard gate cost = 0 and pushes a 0 into the
+    /// pool's recent-cost reserve, which pulls the safety margin down -- exactly
+    /// the zero-accounting failure mode DESIGN section 6 exists to prevent.
+    #[test]
+    fn an_all_zero_usage_frame_is_not_a_measurement() {
+        let mut m = SseMeter::new();
+        let obs = m.feed_line(
+            r#"data: {"id":"c1","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"prompt_cache_hit_tokens":0,"completion_tokens_details":{"reasoning_tokens":0}}}"#,
+        );
+        let usage = obs
+            .usage
+            .expect("the frame is still recognised as a usage frame");
+        assert!(!usage.measured, "an all-zero frame measured nothing");
+        assert!(
+            !m.finish().usage.measured,
+            "and the stream must stay unmeasured so the conservative estimate takes over"
+        );
+
+        // A genuinely tiny request carries at least one non-zero counter and
+        // must still count, or every short answer would be estimated instead.
+        let mut tiny = SseMeter::new();
+        tiny.feed_line(r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}"#);
+        assert!(tiny.finish().usage.measured);
+
+        // An all-zero frame must not erase a real reading that preceded it.
+        let mut mixed = SseMeter::new();
+        mixed.feed_line(r#"data: {"usage":{"prompt_tokens":11,"completion_tokens":7}}"#);
+        mixed.feed_line(r#"data: {"usage":{"prompt_tokens":0,"completion_tokens":0}}"#);
+        let r = mixed.finish();
+        assert!(r.usage.measured);
+        assert_eq!(r.usage.prompt_tokens, 11);
+        assert_eq!(r.usage.completion_tokens, 7);
+
+        // ...nor suppress one that follows it.
+        let mut late = SseMeter::new();
+        late.feed_line(r#"data: {"usage":{"prompt_tokens":0,"completion_tokens":0}}"#);
+        late.feed_line(r#"data: {"usage":{"prompt_tokens":11,"completion_tokens":7}}"#);
+        let r = late.finish();
+        assert!(r.usage.measured);
+        assert_eq!(r.usage.prompt_tokens, 11);
     }
 
     #[test]

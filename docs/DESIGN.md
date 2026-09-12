@@ -282,6 +282,26 @@ SQLite（`rusqlite` bundled + WAL + `busy_timeout`，单写者 actor 批量提�
 - **Anthropic**：响应头 `anthropic-ratelimit-unified-*`（`-5h-utilization` / `-7d-utilization` / `-reset` / `-representative-claim` / `-overage-*`），5 个并行 bucket，额度**按成本加权**；`GET /api/oauth/usage`（自带 429，≥5min）；多账号用 `claude setup-token`。
 - **Codex**：`x-codex-primary/secondary-used-percent`、`-window-minutes`、`-reset-at`；**gpt-5.4+ 只在 WebSocket 握手响应里**。
 
+## 附录 C：v6 修订（代码评审后的对齐记录）
+
+本轮按一次完整评审修正了「设计写了、实现没做」以及若干静默失效，要点与依据：
+
+| 项 | 原状 | 现状 |
+|---|---|---|
+| **在途成本预留**（§4） | `inflight.committed` 只写不读，`reserve` 无生产调用者 —— 闸门只看到「已完成请求的 p95」 | 预留移入 `Pool::select` 同一把锁内提交；`safety_reserve` 按账号取 `max(p95, 本账号在途)`；`settle` 只释放本次的预估而非清零 |
+| **Disabled 出口** | 401/402 后账号永久出局：`apply_probe` 只复活 Unknown/Parked，重启从盘上恢复 Disabled，无 CLI 可解 | 探测成功即复活（探测成功是凭据可用的唯一证据） |
+| **重试换号** | 5xx/超时/传输失败不改账号状态，确定性排序把重试送回同一账号 | `select` 接收「本次已试过的账号」，优先未试过的；单号池仍保留有界重试 |
+| **drift_threshold** | 死配置 | 探测值与本地账的偏离超过阈值时告警（校正本身是探测整体覆盖 gate） |
+| **probe_before_switch** | 死配置（`ensure_fresh` 无调用者） | 换号前对目标账号探测一次 |
+| **ttft_timeout_secs / idle_timeout_secs** | 死配置 | 前者管「等到响应头」，后者管响应头之后的静默间隔；静默超时结束流并记为 Error |
+| **FreeTokens** | settle 把美元计进 token 计数的门 | 金额循环排除 FreeTokens，计量单位不再混用 |
+| **reap** | 一个窗口到点就清空所有窗口 | 只清真正滚动的窗口；`available_at` 只代表它当时停用的那一个 |
+| **measured=false** | 估算 token 进入价格自学习的分母 | 只累计真实测量 |
+| **credit_multiplier** | 对「已学到的价格」重复施加 | 只作用于 configured 价格（learned 已是账号计费单位） |
+| **留存（§10）** | 无任何删除 | 启动时清理超过 30 天的 attempts；`requests` 保留，因为 `ai-gw usage` 直接聚合它，删掉会让长期报表静默变小 |
+| **adapter = "none"** | 校验放行，doctor 显示为「local ledger only」 | 校验期告警 + doctor 计为问题：无探测源的账号永远出不了 Unknown |
+| **Command Code monthlyCredits** | 当 cap 用（used = 周期花费） | 它是**剩余余额**：cap = period_spend + monthlyCredits，used = period_spend。依据 opencodex e6354c2/4e07fed 的 limit = used + remaining 与其夹具 |
+
 ## 附录 B：参考来源
 
 - [Command Code Provider API](https://commandcode.ai/docs/provider)、[Usage Limits](https://commandcode.ai/docs/resources/usage-limits)、[Pricing & Limits](https://commandcode.ai/docs/resources/pricing-limits)、[Usage Exceeded](https://commandcode.ai/docs/troubleshooting/errors/usage_exceeded)

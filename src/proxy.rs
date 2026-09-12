@@ -49,6 +49,65 @@ use time::OffsetDateTime;
 /// rotating accounts, not by stalling the client for an hour.
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Gives an attempt's reservation back if the request never reaches settle.
+///
+/// select() commits the estimate the moment it picks an account, and only
+/// settle() returns it. Everything between that choice and the response -- the
+/// pre-switch probe, the wait for headers -- can be interrupted by the client
+/// hanging up, which drops this future and runs no cleanup of ours. The
+/// commitment then stayed on the books for the life of the process, and the
+/// in-flight term in the hard gate kept shrinking every account's headroom
+/// until nothing was eligible and only a restart could clear it.
+struct AttemptLease<'a> {
+    backend: &'a dyn ProxyBackend,
+    plan: AttemptPlan,
+    armed: bool,
+}
+
+impl<'a> AttemptLease<'a> {
+    fn new(backend: &'a dyn ProxyBackend, plan: &AttemptPlan) -> Self {
+        Self {
+            backend,
+            plan: plan.clone(),
+            armed: true,
+        }
+    }
+
+    /// The attempt reached a path that settles it itself.
+    fn settled(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AttemptLease<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.backend.release(&self.plan);
+        }
+    }
+}
+
+/// How long to wait before the next attempt.
+///
+/// A Retry-After the upstream gave us wins. Otherwise a retryable failure still
+/// waits: retrying instantly turns one transient blip into a thundering herd
+/// against the next account, and for a transport failure there is nothing to
+/// gain by being the fastest to ask again.
+fn backoff_for(
+    class: UpstreamErrorClass,
+    attempt_no: u32,
+    retry_after: Option<Duration>,
+) -> Duration {
+    if let Some(delay) = retry_after {
+        return delay.min(MAX_BACKOFF);
+    }
+    if !(class.retry_other_account() || class.retry_same_account()) {
+        return Duration::ZERO;
+    }
+    let shift = attempt_no.saturating_sub(1).min(4);
+    Duration::from_millis(250u64 << shift).min(MAX_BACKOFF)
+}
+
 /// The slice of gateway behaviour the HTTP layer needs.
 ///
 /// This seam exists so the router can be driven end-to-end in tests without a
@@ -66,6 +125,7 @@ pub trait ProxyBackend: Send + Sync + 'static {
         est_cost: Decimal,
         request_id: &str,
         attempt_no: u32,
+        exclude: &[String],
     ) -> std::result::Result<(ResolvedRoute, AttemptPlan), PlanError>;
 
     /// Pick an account for a request that has no model of its own, such as the
@@ -80,6 +140,27 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     /// Look up an account by canonical provider/id identity.
     fn account(&self, qualified_id: &str) -> Option<Account>;
+
+    /// Give back an attempt's reservation without recording it.
+    ///
+    /// Called by AttemptLease when a request never reaches settle. A no-op by
+    /// default so a test backend that commits nothing needs nothing.
+    fn release(&self, _plan: &AttemptPlan) {}
+
+    /// Refresh an account's quota reading immediately before switching to it.
+    ///
+    /// A boxed future rather than an async-trait method so the default can be a
+    /// no-op and test backends need no implementation. The real gateway honours
+    /// policy.probe_before_switch; without this call that setting was parsed and
+    /// then never read, so a switch could land on an account that had already
+    /// filled up since the last poll.
+    fn ensure_fresh<'a>(
+        &'a self,
+        _provider: &'a str,
+        _account_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 
     fn retry_after_for(&self, provider: &str) -> Option<Duration>;
 
@@ -152,9 +233,16 @@ impl ProxyBackend for GatewayBackend {
         est_cost: Decimal,
         request_id: &str,
         attempt_no: u32,
+        exclude: &[String],
     ) -> std::result::Result<(ResolvedRoute, AttemptPlan), PlanError> {
-        self.gateway
-            .plan(client_model, session_key, est_cost, request_id, attempt_no)
+        self.gateway.plan(
+            client_model,
+            session_key,
+            est_cost,
+            request_id,
+            attempt_no,
+            exclude,
+        )
     }
 
     fn pick_account(
@@ -164,13 +252,34 @@ impl ProxyBackend for GatewayBackend {
         request_id: &str,
         attempt_no: u32,
     ) -> std::result::Result<AttemptPlan, PlanError> {
-        self.gateway
-            .pool
-            .select(provider, "", None, est_cost, request_id, attempt_no)
+        let plan =
+            self.gateway
+                .pool
+                .select(provider, "", None, est_cost, request_id, attempt_no, &[])?;
+        // A model-list passthrough spends no tokens, so it gives the reservation
+        // straight back. Leaving it committed burned one concurrency slot per
+        // call against the account's own concurrency_limit, and after N calls
+        // that account could never be chosen again.
+        self.gateway.pool.settle(&plan, Decimal::ZERO, false);
+        Ok(plan)
     }
 
     fn account(&self, qualified_id: &str) -> Option<Account> {
         self.gateway.pool.account(qualified_id)
+    }
+
+    fn ensure_fresh<'a>(
+        &'a self,
+        provider: &'a str,
+        account_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.gateway.ensure_fresh(provider, account_id).await;
+        })
+    }
+
+    fn release(&self, plan: &AttemptPlan) {
+        self.gateway.pool.settle(plan, Decimal::ZERO, false);
     }
 
     fn retry_after_for(&self, provider: &str) -> Option<Duration> {
@@ -256,9 +365,22 @@ pub fn build_router(gateway: Arc<Gateway>) -> axum::Router {
 pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
     let max_body_bytes = backend.config().policy.max_body_bytes;
     let auth = match &backend.config().server.local_key {
-        None => LocalAuth::Open,
+        None => {
+            // Serving without a local key means anything that can reach the port
+            // can spend this account's quota. The configuration template calls
+            // the key "strongly recommended", and then nothing said a word when
+            // it was missing -- the operator's only evidence was a template they
+            // had already closed.
+            tracing::warn!(
+                listen = %backend.config().server.listen,
+                "server.local_key is not configured: anything able to reach this address \
+                 can spend the pooled quota. Set one with 'ai-gw keys add local gateway', \
+                 then local_key = {{ keychain = true }}"
+            );
+            LocalAuth::Open
+        }
         Some(secret) => match secret.resolve(
-            &crate::secrets::CredentialStore::keychain(),
+            &crate::secrets::CredentialStore::from_env(),
             crate::secrets::LOCAL_KEY_PROVIDER,
             crate::secrets::LOCAL_KEY_ACCOUNT,
         ) {
@@ -408,13 +530,30 @@ async fn chat_completions(
         }
 
     let max_attempts = state.backend.config().policy.max_retries.max(1);
-    let connect_timeout = Duration::from_secs(
-        state.backend.config().policy.connect_timeout_secs.max(1),
+    // How long we wait for the upstream to START answering.
+    //
+    // This used to be connect_timeout_secs, which is a TCP-connect budget. A
+    // non-streaming request only receives its headers after the upstream has
+    // generated the entire completion, so any legitimate non-streaming request
+    // slower than ten seconds was cancelled, marked unbilled, and retried --
+    // possibly paying for the same completion twice.
+    let header_timeout = Duration::from_secs(
+        state
+            .backend
+            .config()
+            .policy
+            .ttft_timeout_secs
+            .max(1),
     );
 
     let mut attempt_no: u32 = 1;
     let mut last_failure: Option<Failure> = None;
     let mut last_plan: Option<AttemptPlan> = None;
+    // Accounts this request has already attempted. Passed to the pool so the
+    // next attempt reaches a DIFFERENT account instead of spending the whole
+    // retry budget on the one that just failed.
+    let mut tried: Vec<String> = Vec::new();
+    let mut previous_account: Option<String> = None;
 
     while attempt_no <= max_attempts {
         let plan = match state.backend.plan(
@@ -423,14 +562,53 @@ async fn chat_completions(
             est_cost,
             &request_id,
             attempt_no,
+            &tried,
         ) {
             Ok((_route, plan)) => plan,
             Err(err) => return plan_error_response(&err, state.backend.as_ref()),
         };
+        // Switching accounts is worth one extra round trip: it happens only
+        // after the previous account has already failed, so the client is
+        // waiting anyway, and it stops a switch from landing on an account whose
+        // window filled up since the last poll.
+        let qualified = plan.qualified_account();
+        if let Some(previous) = previous_account.as_deref()
+            && previous != qualified
+        {
+            state
+                .backend
+                .ensure_fresh(&plan.provider, &plan.account_id)
+                .await;
+        }
+        previous_account = Some(qualified.clone());
+        // Recorded before the attempt, not after: whatever the outcome, this
+        // account has now been used by this request.
+        tried.push(qualified);
         last_plan = Some(plan.clone());
+        // Any exit from this iteration that does not settle -- an early return,
+        // or the client hanging up while we wait -- gives the reservation back
+        // through this lease.
+        let mut lease = AttemptLease::new(state.backend.as_ref(), &plan);
 
         let Some(account) = state.backend.account(&plan.qualified_account()) else {
             tracing::error!(account = %plan.account_id, "the planned account vanished from the pool");
+            // Release the reservation that select() just committed. Returning
+            // without recording the attempt left an estimate committed against
+            // an account that nothing would ever settle, and the in-flight term
+            // in the hard gate would keep counting it for the life of the
+            // process -- shrinking the headroom every later request sees.
+            lease.settled();
+            record_attempt_failure(
+                state.backend.as_ref(),
+                &plan,
+                UpstreamErrorClass::Other,
+                None,
+                Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+                None,
+                now(),
+                attempt_no,
+                &request_id,
+            );
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -455,7 +633,7 @@ async fn chat_completions(
 
         // Phase 1: nothing has reached the client yet, so every failure below
         // is still retryable.
-        let response = match tokio::time::timeout(connect_timeout, request.send()).await {
+        let response = match tokio::time::timeout(header_timeout, request.send()).await {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
                 let timed_out = e.is_timeout();
@@ -465,6 +643,7 @@ async fn chat_completions(
                     ..Default::default()
                 }
                 .classify();
+                lease.settled();
                 record_attempt_failure(
                     state.backend.as_ref(),
                     &plan,
@@ -483,14 +662,20 @@ async fn chat_completions(
                     retry_after: None,
                 });
                 let retryable = should_retry(class, attempt_no, max_attempts);
+                let delay = backoff_for(class, attempt_no, None);
                 attempt_no += 1;
                 if !retryable {
                     break;
                 }
+                // A transport failure or a timeout backs off as well: retrying
+                // instantly turns one blip into a thundering herd, and there is
+                // nothing to gain by being the fastest to ask a dead host again.
+                tokio::time::sleep(delay).await;
                 continue;
             }
             Err(_) => {
                 let class = UpstreamErrorClass::Timeout;
+                lease.settled();
                 record_attempt_failure(
                     state.backend.as_ref(),
                     &plan,
@@ -507,15 +692,20 @@ async fn chat_completions(
                     kind: class,
                     message: format!(
                         "the upstream did not respond within {}s",
-                        connect_timeout.as_secs()
+                        header_timeout.as_secs()
                     ),
                     retry_after: None,
                 });
                 let retryable = should_retry(class, attempt_no, max_attempts);
+                let delay = backoff_for(class, attempt_no, None);
                 attempt_no += 1;
                 if !retryable {
                     break;
                 }
+                // A transport failure or a timeout backs off as well: retrying
+                // instantly turns one blip into a thundering herd, and there is
+                // nothing to gain by being the fastest to ask a dead host again.
+                tokio::time::sleep(delay).await;
                 continue;
             }
         };
@@ -533,9 +723,12 @@ async fn chat_completions(
             // xKiro reuses one 429 code for both pacing and exhaustion. Our own
             // ledger is the only independent evidence, and error.rs says a
             // probe-confirmed empty window outranks the header.
+            // Canonical provider/id: account() looks up a qualified identity,
+            // and passing the bare id meant this never matched anything, so the
+            // probe-confirmed "the window is spent" branch was unreachable.
             let window_exhausted_hint = state
                 .backend
-                .account(&plan.account_id)
+                .account(&plan.qualified_account())
                 .map(|acct| {
                     acct.covered_gates()
                         .any(|g| g.cap > Decimal::ZERO && g.remaining() <= Decimal::ZERO)
@@ -553,6 +746,7 @@ async fn chat_completions(
             }
             .classify();
 
+            lease.settled();
             record_attempt_failure(
                 state.backend.as_ref(),
                 &plan,
@@ -588,17 +782,12 @@ async fn chat_completions(
             });
 
             let retryable = should_retry(class, attempt_no, max_attempts);
+            let delay = backoff_for(class, attempt_no, retry_after);
             attempt_no += 1;
             if !retryable {
                 break;
             }
-            if matches!(
-                class,
-                UpstreamErrorClass::RateLimitBurst | UpstreamErrorClass::Overloaded
-            )
-                && let Some(delay) = retry_after {
-                    tokio::time::sleep(delay.min(MAX_BACKOFF)).await;
-                }
+            tokio::time::sleep(delay).await;
             continue;
         }
 
@@ -617,6 +806,12 @@ async fn chat_completions(
         } else {
             MeterMode::Json
         };
+        // Judged from the response, not from the client's "stream": true. A
+        // client that asks for SSE and gets a plain JSON 200 back was being
+        // marked as a truncated stream for missing a terminator that a JSON
+        // body never had.
+        let is_sse = content_type.contains("text/event-stream");
+        lease.settled();
         let finalizer = Finalizer {
             backend: state.backend.clone(),
             plan,
@@ -635,6 +830,8 @@ async fn chat_completions(
             MeterMode::Sse => StreamMeter::sse(),
             MeterMode::Json => StreamMeter::json(),
         };
+        let idle_timeout =
+            Duration::from_secs(state.backend.config().policy.idle_timeout_secs.max(1));
         let relay = RelayStream {
             inner: Box::pin(response.bytes_stream()),
             meter,
@@ -642,6 +839,9 @@ async fn chat_completions(
             first_content_at: None,
             bytes_sent: 0,
             finalizer: Some(finalizer),
+            is_sse,
+            idle_timeout,
+            idle: Box::pin(tokio::time::sleep(idle_timeout)),
         };
         let mut builder = Response::builder().status(status);
         if !content_type.is_empty() {
@@ -680,7 +880,11 @@ async fn chat_completions(
                         credit_multiplier: account.credit_multiplier,
                         coverage: plan.coverage,
                         status: RequestStatus::Error,
-                        retries: attempt_no.saturating_sub(1),
+                        // attempt_no is already one past the last attempt: every
+                        // failure path increments it before deciding whether to
+                        // retry. Reporting it directly counted the first attempt
+                        // as a retry.
+                        retries: attempt_no.saturating_sub(2),
                         provider_request_id: None,
                     });
                 }
@@ -1041,6 +1245,12 @@ struct RelayStream {
     first_content_at: Option<Instant>,
     bytes_sent: u64,
     finalizer: Option<Finalizer>,
+    /// Whether this body is an SSE stream, whose terminator is meaningful.
+    is_sse: bool,
+    /// A silence longer than this ends the stream: policy.idle_timeout_secs.
+    idle_timeout: Duration,
+    /// Fires once the upstream has been silent for idle_timeout.
+    idle: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl RelayStream {
@@ -1054,6 +1264,17 @@ impl RelayStream {
         // HTTP status was 200 and the bytes were relayed intact. Recording it
         // as a success inflates request counts and hides a failing provider.
         let status = if result.error.is_some() {
+            RequestStatus::Error
+        } else if matches!(status, RequestStatus::Ok) && self.is_sse && !result.saw_done() {
+            // An SSE body that ended without its terminator was cut short --
+            // by the idle timeout below, or by an upstream that closed early.
+            // Calling that a success hides a broken response and inflates the
+            // request count.
+            tracing::warn!(
+                request_id = %f.request_id,
+                bytes = self.bytes_sent,
+                "the SSE stream ended without its [DONE] terminator"
+            );
             RequestStatus::Error
         } else {
             status
@@ -1143,13 +1364,33 @@ impl Stream for RelayStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.inner.as_mut().poll_next(cx) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // A stalled upstream ends the stream. policy.idle_timeout_secs
+                // used to be parsed and never read, so a provider that simply
+                // stopped sending held the client, the connection and the
+                // account's concurrency slot for as long as it liked. Ending the
+                // body is the honest signal for SSE: the client sees no
+                // terminator and the ledger records an error.
+                if std::future::Future::poll(this.idle.as_mut(), cx).is_ready() {
+                    tracing::warn!(
+                        bytes = this.bytes_sent,
+                        idle_secs = this.idle_timeout.as_secs(),
+                        "upstream went silent; ending the relayed stream"
+                    );
+                    this.complete(RequestStatus::Error);
+                    return Poll::Ready(None);
+                }
+                Poll::Pending
+            }
             Poll::Ready(Some(Ok(chunk))) => {
                 let first = this.meter.push(&chunk);
                 if first && this.first_content_at.is_none() {
                     this.first_content_at = Some(Instant::now());
                 }
                 this.bytes_sent = this.bytes_sent.saturating_add(chunk.len() as u64);
+                this.idle
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle_timeout);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -1352,6 +1593,7 @@ mod tests {
             est_cost: Decimal,
             request_id: &str,
             attempt_no: u32,
+            exclude: &[String],
         ) -> std::result::Result<(ResolvedRoute, AttemptPlan), PlanError> {
             let route = self
                 .config
@@ -1364,10 +1606,15 @@ mod tests {
                 est_cost,
                 request_id,
                 attempt_no,
+                exclude,
             )?;
-            // The real Gateway::plan reserves; mirror that here.
-            self.pool.reserve(&plan, est_cost);
             Ok((route, plan))
+        }
+
+        fn release(&self, plan: &AttemptPlan) {
+            // The test backend commits reservations through the same pool, so it
+            // has to give them back the same way.
+            self.pool.settle(plan, Decimal::ZERO, false);
         }
 
         fn pick_account(
@@ -1377,8 +1624,12 @@ mod tests {
             request_id: &str,
             attempt_no: u32,
         ) -> std::result::Result<AttemptPlan, PlanError> {
-            self.pool
-                .select(provider, "", None, est_cost, request_id, attempt_no)
+            let plan =
+                self.pool
+                    .select(provider, "", None, est_cost, request_id, attempt_no, &[])?;
+            // Released immediately: see the production impl above.
+            self.pool.settle(&plan, Decimal::ZERO, false);
+            Ok(plan)
         }
 
         fn account(&self, account_id: &str) -> Option<Account> {
@@ -1610,6 +1861,16 @@ key = "sk-a2"
             vec!["Bearer sk-a1".to_string()],
             "the passthrough must authenticate as an eligible account"
         );
+        // Picking an account commits a reservation; a model list spends no
+        // tokens, so it must give it straight back. While it did not, every call
+        // burned one concurrency slot against the account's own
+        // concurrency_limit -- and, with that limit set, the account became
+        // permanently unselectable after N listings.
+        assert_eq!(
+            fake.pool.inflight_count("mock/a1"),
+            0,
+            "a passthrough must not hold a reservation"
+        );
     }
 
     #[tokio::test]
@@ -1786,7 +2047,7 @@ key = "sk-a2"
         let fake = fake_backend("http://127.0.0.1:1");
         let plan = fake
             .pool
-            .select("mock", "mock/model", None, Decimal::ZERO, "req-1", 1)
+            .select("mock", "mock/model", None, Decimal::ZERO, "req-1", 1, &[])
             .unwrap();
         let payload: &'static [u8] =
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
@@ -1812,6 +2073,9 @@ key = "sk-a2"
             first_content_at: None,
             bytes_sent: 0,
             finalizer: Some(finalizer),
+            is_sse: true,
+            idle_timeout: Duration::from_secs(120),
+            idle: Box::pin(tokio::time::sleep(Duration::from_secs(120))),
         };
 
         use futures_util::StreamExt;

@@ -130,6 +130,14 @@ pub struct AttemptPlan {
     /// 0 is the default tier; higher values are configured time windows.
     pub tier: u32,
     pub attempt_no: u32,
+    /// What this attempt committed against its account's hard gate when it was
+    /// planned. Released on settle, and read by the next request's reserve.
+    ///
+    /// This is what makes the in-flight term in DESIGN section 4 a real number
+    /// instead of a decoration: without it, twenty concurrent requests each
+    /// size the gate as if they were alone and can commit twenty times the
+    /// headroom the account actually has.
+    pub estimated_cost: Decimal,
 }
 
 impl AttemptPlan {
@@ -186,13 +194,77 @@ fn find<'a>(accounts: &'a [Account], qualified: &str) -> Option<&'a Account> {
     accounts.iter().find(|a| a.qualified() == qualified)
 }
 
+/// Bind a session to an account, keeping the eviction order in step.
+fn bind_sticky(inner: &mut PoolInner, key: &str, qualified: &str) {
+    let PoolInner {
+        sticky,
+        sticky_order,
+        ..
+    } = inner;
+    if sticky.insert(key.to_string(), qualified.to_string()).is_some() {
+        // Refresh recency: this session is live, so it evicts last.
+        if let Some(pos) = sticky_order.iter().position(|k| k == key) {
+            sticky_order.remove(pos);
+        }
+    }
+    sticky_order.push_back(key.to_string());
+
+    while sticky.len() > MAX_STICKY_SESSIONS {
+        match sticky_order.pop_front() {
+            Some(oldest) => {
+                sticky.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Drop one account's session bindings and keep the eviction order consistent.
+///
+/// The match is on the canonical provider/id. Comparing against the bare id
+/// never matched anything, so a parked or disabled account kept every session
+/// bound to it and every one of those sessions had to fail before rebinding.
+fn forget_sticky(inner: &mut PoolInner, qualified: &str) {
+    let PoolInner {
+        sticky,
+        sticky_order,
+        ..
+    } = inner;
+    sticky.retain(|_, v| v != qualified);
+    sticky_order.retain(|k| sticky.contains_key(k));
+}
+
+/// Why an account was taken out of the pool by the operator.
+///
+/// Recorded in the account's own error text so the reason survives a restart,
+/// and read back by apply_probe: a successful probe proves the CREDENTIAL works
+/// again, which is not the same thing as the operator changing their mind.
+/// The only way back is the operator saying so, with "accounts enable".
+pub const OPERATOR_DISABLED: &str = "disabled by operator (ai-gw accounts disable)";
+
+/// The window an account's rpm_limit is measured over.
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many session bindings are remembered at once.
+///
+/// Session keys come straight from client-controlled headers, so an unbounded
+/// map is an unbounded allocation driven by whoever can reach the port. At 4096
+/// bindings the worst case is a few hundred kilobytes, and evicting the oldest
+/// only costs a prompt-cache miss for a session nobody has used in a long while.
+const MAX_STICKY_SESSIONS: usize = 4096;
+
 struct PoolInner {
     accounts: Vec<Account>,
     /// session key -> canonical provider/id of the bound account.
     sticky: HashMap<String, String>,
+    /// Session keys in eviction order, oldest first. Kept beside the map so the
+    /// map cannot grow without bound; see MAX_STICKY_SESSIONS.
+    sticky_order: std::collections::VecDeque<String>,
     inflight: HashMap<AccountId, Inflight>,
     /// Recent completed request costs, used to size the safety reserve.
     recent_costs: std::collections::VecDeque<Decimal>,
+    /// When each rate-limited account last started a request, for rpm_limit.
+    rpm_window: HashMap<AccountId, std::collections::VecDeque<Instant>>,
 }
 
 /// The pool. All methods are synchronous and short; state is guarded by a
@@ -212,8 +284,10 @@ impl Pool {
             inner: Mutex::new(PoolInner {
                 accounts,
                 sticky: HashMap::new(),
+                sticky_order: std::collections::VecDeque::new(),
                 inflight: HashMap::new(),
                 recent_costs: std::collections::VecDeque::new(),
+                rpm_window: HashMap::new(),
             }),
             soft_threshold: policy.soft_threshold,
             allow_metered: policy.allow_metered,
@@ -236,6 +310,31 @@ impl Pool {
         }
     }
 
+    /// Requests currently committed against an account.
+    ///
+    /// Test-only: the in-flight counter is what the hard gate and the pacing
+    /// limits read, and a reservation that never comes back is invisible
+    /// except as an account that quietly stops accepting work.
+    #[cfg(test)]
+    pub fn inflight_count(&self, qualified: &str) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .inflight
+            .get(qualified)
+            .map(|e| e.count)
+            .unwrap_or(0)
+    }
+
+    /// Number of sessions currently bound to an account.
+    ///
+    /// Test-only: the map is an implementation detail, and an unbounded one was
+    /// exactly the defect.
+    #[cfg(test)]
+    fn tracked_sessions(&self) -> usize {
+        self.inner.lock().unwrap().sticky.len()
+    }
+
     pub fn idle_for(&self) -> Duration {
         self.last_activity
             .lock()
@@ -243,16 +342,36 @@ impl Pool {
             .unwrap_or_default()
     }
 
-    /// Safety reserve: the p95 of recently completed request costs, so that
-    /// requests already on the wire cannot push an account into overflow.
-    fn safety_reserve(&self, inner: &PoolInner) -> Decimal {
+    /// Safety reserve for ONE account: the larger of what recent completed
+    /// requests cost (p95) and what is actually committed on this account right
+    /// now, plus the operator's fixed margin.
+    ///
+    /// The in-flight term is per account on purpose. A burst aimed at a single
+    /// account is the case that overflows a window, and a pool-wide p95 cannot
+    /// see it: every request in the burst would otherwise size its own reserve
+    /// as though the other nineteen were not there.
+    fn safety_reserve(&self, p95: Decimal, qualified: &str, inner: &PoolInner) -> Decimal {
+        let inflight = inner
+            .inflight
+            .get(qualified)
+            .map(|e| e.committed)
+            .unwrap_or(Decimal::ZERO);
+        p95.max(inflight) + self.hard_margin
+    }
+
+    /// p95 of recently completed request costs.
+    ///
+    /// Depends on no particular account, so select computes it once instead of
+    /// re-sorting the window for every candidate -- which it did, inside the
+    /// pool lock, on the hot path.
+    fn recent_p95(inner: &PoolInner) -> Decimal {
         if inner.recent_costs.is_empty() {
-            return self.hard_margin;
+            return Decimal::ZERO;
         }
         let mut v: Vec<Decimal> = inner.recent_costs.iter().copied().collect();
         v.sort();
         let idx = ((v.len() as f64 * 0.95) as usize).min(v.len() - 1);
-        v[idx] + self.hard_margin
+        v[idx]
     }
 
     /// Headroom on covered gates only, in gate units.
@@ -339,6 +458,44 @@ impl Pool {
         GateDecision::Reject(RejectReason::MeteredNotAllowed)
     }
 
+    /// Accounts held back by their own pacing limits.
+    ///
+    /// rpm_limit and concurrency_limit were parsed, stored in the database and
+    /// then never read: setting either one changed nothing at all. They are
+    /// pacing, not quota, so a held-back account is simply not a candidate --
+    /// it is not parked and it does not fail the request.
+    fn pacing_blocks(inner: &mut PoolInner, at: Instant) -> std::collections::HashSet<String> {
+        let PoolInner {
+            accounts,
+            inflight,
+            rpm_window,
+            ..
+        } = inner;
+        let mut blocked = std::collections::HashSet::new();
+        for acct in accounts.iter() {
+            let qualified = acct.qualified();
+            if let Some(limit) = acct.concurrency_limit
+                && inflight.get(&qualified).is_some_and(|e| e.count >= limit)
+            {
+                blocked.insert(qualified.clone());
+            }
+            if let Some(limit) = acct.rpm_limit {
+                let window = rpm_window.entry(qualified.clone()).or_default();
+                // A rolling minute, which is how every provider states it.
+                while window
+                    .front()
+                    .is_some_and(|t| at.duration_since(*t) >= RATE_WINDOW)
+                {
+                    window.pop_front();
+                }
+                if window.len() >= limit as usize {
+                    blocked.insert(qualified);
+                }
+            }
+        }
+        blocked
+    }
+
     /// Move a parked account back to active once its window has reset.
     fn reap(&self, inner: &mut PoolInner, at: OffsetDateTime) {
         for acct in inner.accounts.iter_mut() {
@@ -348,9 +505,36 @@ impl Pool {
                         acct.state = AccountState::Active;
                         acct.available_at = None;
                         acct.window_started_at = None;
-                        // Window rolled over: its allowance is whole again.
+                        // Reset ONLY the windows that have actually rolled over.
+                        //
+                        // Zeroing every window because one of them came due was
+                        // a systematic under-count: a 5-hour reset wiped the
+                        // 7-day and monthly usage that was still very much live,
+                        // and the account then looked empty for up to a poll
+                        // interval -- long enough to spend past a cap the
+                        // provider still enforces.
+                        //
+                        // available_at speaks for exactly one window: the one
+                        // that was spent when the account was parked. A window
+                        // with a reset time still in the future has NOT rolled
+                        // over and keeps its usage. A window with no reset time
+                        // at all is cleared only when it is the spent one, so an
+                        // unknown-but-live weekly reading is not thrown away on
+                        // the strength of a 5-hour timer.
                         for g in acct.gates.iter_mut() {
-                            if g.kind.is_window() {
+                            if !g.kind.is_window() {
+                                continue;
+                            }
+                            // A window is known to have rolled over only when
+                            // the provider said when it resets AND that time has
+                            // passed. An unknown reset time is not evidence:
+                            // note_error marks EVERY window spent when an account
+                            // is parked, so a saturated window with no reset time
+                            // may simply be collateral damage, and clearing it
+                            // erased usage the provider still enforces. Leaving it
+                            // costs at most one poll interval before the next
+                            // probe replaces the whole reading.
+                            if g.resets_at.is_some_and(|r| r <= at) {
                                 g.used = Decimal::ZERO;
                                 g.resets_at = None;
                                 g.stale = false;
@@ -366,6 +550,11 @@ impl Pool {
     /// remains acceptable it wins regardless of utilisation, because moving a
     /// session discards the upstream prompt cache and re-bills the whole
     /// conversation at full input price.
+    // Seven arguments, and each one is a different question: which provider and
+    // model, which session, what it costs, which request and attempt this is, and
+    // which accounts are already spent for it. Bundling them into a struct would
+    // move the same list one line up without making anything clearer.
+    #[allow(clippy::too_many_arguments)]
     pub fn select(
         &self,
         provider: &str,
@@ -374,11 +563,17 @@ impl Pool {
         est_cost: Decimal,
         request_id: &str,
         attempt_no: u32,
+        // Accounts this request has already tried, as canonical provider/id.
+        // They are not banned, only deprioritised, so a single-account pool
+        // keeps its bounded retry while a multi-account pool finally reaches the
+        // healthy account instead of spending every attempt on the fault.
+        exclude: &[String],
     ) -> Result<AttemptPlan, PlanError> {
         let at = now();
         let mut inner = self.inner.lock().unwrap();
-        let reserve = self.safety_reserve(&inner);
         self.reap(&mut inner, at);
+        let blocked = Self::pacing_blocks(&mut inner, Instant::now());
+        let p95 = Self::recent_p95(&inner);
 
         struct Cand {
             /// Bare account id, as it appears in configuration.
@@ -389,6 +584,8 @@ impl Pool {
             util: f64,
             remaining: Decimal,
             draining: bool,
+            /// Already attempted for this very request.
+            tried: bool,
         }
 
         let provider_known = inner.accounts.iter().any(|a| a.provider == provider);
@@ -402,6 +599,9 @@ impl Pool {
         // The account that came closest and why it still failed. Reported back
         // through PlanError so the 429 can name the number that did not fit.
         let mut best: Option<(String, Decimal, RejectReason)> = None;
+        // The largest reserve any account was asked to keep clear, so a refusal
+        // can carry the arithmetic that produced it.
+        let mut gate_reserve = self.hard_margin;
 
         for acct in inner.accounts.iter() {
             if acct.provider != provider {
@@ -424,25 +624,38 @@ impl Pool {
                     _ => w,
                 });
             }
+            let qualified = acct.qualified();
+            // Pacing limits are the operator's own words about this account;
+            // they are not a quota verdict, so the account is simply skipped.
+            if blocked.contains(&qualified) {
+                continue;
+            }
+            let tried = exclude.contains(&qualified);
+            // Sized per account, so the commitments already in flight on THIS
+            // account are part of what this request must fit inside.
+            let reserve = self.safety_reserve(p95, &qualified, &inner);
+            gate_reserve = gate_reserve.max(reserve);
             match self.evaluate(acct, est_cost, reserve) {
                 GateDecision::Covered => {
                     covered_cands.push(Cand {
                         id: acct.id.clone(),
-                        qualified: acct.qualified(),
+                        qualified,
                         decision: GateDecision::Covered,
                         util: acct.peak_covered_utilization().unwrap_or(0.0),
                         remaining: acct.min_covered_remaining().unwrap_or(Decimal::MAX),
                         draining: acct.state == AccountState::Draining,
+                        tried,
                     });
                 }
                 GateDecision::Metered => {
                     metered_cands.push(Cand {
                         id: acct.id.clone(),
-                        qualified: acct.qualified(),
+                        qualified,
                         decision: GateDecision::Metered,
                         util: 0.0,
                         remaining: self.metered_headroom(acct).unwrap_or(Decimal::MAX),
                         draining: acct.state == AccountState::Draining,
+                        tried,
                     });
                 }
                 GateDecision::Reject(reason) => {
@@ -461,37 +674,69 @@ impl Pool {
         // Sticky affinity first: keeping a live session on its account is worth
         // more than any utilisation ordering.
         if let Some(key) = session_key
-            && let Some(bound) = inner.sticky.get(key) {
-                let bound_cand = covered_cands
-                    .iter()
-                    .find(|c| &c.qualified == bound)
-                    .or_else(|| metered_cands.iter().find(|c| &c.qualified == bound));
-                if let Some(cand) = bound_cand {
-                    let coverage = match cand.decision {
-                        GateDecision::Covered => GateClass::Covered,
-                        GateDecision::Metered => GateClass::Metered,
-                        GateDecision::Reject(_) => {
-                            unreachable!("candidate lists only hold acceptable accounts")
-                        }
-                    };
-                    return Ok(AttemptPlan {
-                        request_id: request_id.to_string(),
-                        account_id: cand.id.clone(),
-                        provider: provider.to_string(),
-                        model: model.to_string(),
-                        session_key: session_key.map(str::to_string),
-                        coverage,
-                        // The pool knows nothing about price windows; the router
-                        // overwrites this once it has resolved the schedule.
-                        tier: 0,
-                        attempt_no,
-                    });
+            && let Some(bound) = inner.sticky.get(key).cloned()
+        {
+            let mut bound_untried: Option<&Cand> = None;
+            let mut bound_tried: Option<&Cand> = None;
+            let mut any_untried = false;
+            for cand in covered_cands.iter().chain(metered_cands.iter()) {
+                if !cand.tried {
+                    any_untried = true;
                 }
-                // Bound account no longer acceptable: fall through and rebind.
+                if cand.qualified != bound {
+                    continue;
+                }
+                if cand.tried {
+                    bound_tried = Some(cand);
+                } else {
+                    bound_untried = Some(cand);
+                }
             }
+            // Keep the session where its prompt cache lives -- unless that
+            // account is the one this very request already failed on AND
+            // something else is still untried. Sticking there would spend the
+            // entire retry budget on the same fault.
+            //
+            // The old "fresh.or(already_tried)" short-circuited before the
+            // untried preference ever ran, so every session-bound retry went
+            // back to the account that had just failed.
+            let sticky_choice = match (bound_untried, any_untried) {
+                (Some(cand), _) => Some(cand),
+                (None, true) => None,
+                (None, false) => bound_tried,
+            };
+            if let Some(cand) = sticky_choice {
+                let coverage = match cand.decision {
+                    GateDecision::Covered => GateClass::Covered,
+                    GateDecision::Metered => GateClass::Metered,
+                    GateDecision::Reject(_) => {
+                        unreachable!("candidate lists only hold acceptable accounts")
+                    }
+                };
+                let plan = AttemptPlan {
+                    request_id: request_id.to_string(),
+                    account_id: cand.id.clone(),
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    session_key: session_key.map(str::to_string),
+                    coverage,
+                    // The pool knows nothing about price windows; the router
+                    // overwrites this once it has resolved the schedule.
+                    tier: 0,
+                    attempt_no,
+                    estimated_cost: est_cost,
+                };
+                self.commit(&mut inner, &plan);
+                return Ok(plan);
+            }
+            // Bound account no longer acceptable: fall through and rebind.
+        }
 
-        // Prefer covered over metered, always.
-        let (mut pool, coverage) = if !covered_cands.is_empty() {
+        // Prefer covered over metered, always. Within the chosen class, prefer
+        // accounts this request has not already tried: retrying the account that
+        // just answered 503 spends the whole budget on the same fault and never
+        // reaches the healthy account sitting next to it.
+        let (pool, coverage) = if !covered_cands.is_empty() {
             (covered_cands, GateClass::Covered)
         } else if !metered_cands.is_empty() {
             (metered_cands, GateClass::Metered)
@@ -507,56 +752,70 @@ impl Pool {
             return Err(PlanError::NoEligibleAccount {
                 provider: provider.to_string(),
                 retry_after,
-                needed: est_cost + reserve,
+                needed: est_cost + gate_reserve,
                 best_account: best.as_ref().map(|(a, _, _)| a.clone()),
                 best_headroom: best.as_ref().map(|(_, h, _)| *h),
                 reason: best.as_ref().map(|(_, _, r)| *r),
             });
         };
 
+        // Fresh accounts first; if every candidate has already been tried, keep
+        // the full list so a single-account pool still gets its bounded retry.
+        let eligible: Vec<&Cand> = {
+            let untried: Vec<&Cand> = pool.iter().filter(|c| !c.tried).collect();
+            if untried.is_empty() {
+                pool.iter().collect()
+            } else {
+                untried
+            }
+        };
+
         // Prefer accounts below the soft threshold; a draining account is one
         // that has already crossed it.
-        let below: Vec<&Cand> = pool
+        let below: Vec<&Cand> = eligible
             .iter()
+            .copied()
             .filter(|c| !c.draining && c.util < self.soft_threshold)
             .collect();
 
-        let chosen: &Cand = if let Some(first) = below.first() {
+        let chosen: &Cand = if below.is_empty() {
+            // Every account is at or above the soft threshold. Rather than
+            // refusing, fall back to the least-utilised one: switching at 80%
+            // is a preference, and a self-imposed preference must not become a
+            // hard outage while headroom genuinely remains.
+            eligible
+                .iter()
+                .copied()
+                .min_by(|a, b| {
+                    a.util
+                        .partial_cmp(&b.util)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.qualified.cmp(&b.qualified))
+                })
+                .unwrap_or(eligible[0])
+        } else {
             // CONSUME-FIRST: the most utilised still-eligible account, so the
-            // pool burns down one account at a time and switches rarely.
+            // pool burns down one account at a time and switches rarely. Every
+            // switch costs a prompt-cache miss.
             below
                 .iter()
+                .copied()
                 .max_by(|a, b| {
                     a.util
                         .partial_cmp(&b.util)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| b.remaining.cmp(&a.remaining))
                 })
-                .copied()
-                .unwrap_or(first)
-        } else {
-            // Every account is at or above the soft threshold. Rather than
-            // refusing, fall back to the least-utilised one: switching at 80%
-            // is a preference, and a self-imposed preference must not become a
-            // hard outage while headroom genuinely remains.
-            pool.sort_by(|a, b| {
-                a.util
-                    .partial_cmp(&b.util)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.qualified.cmp(&b.qualified))
-            });
-            &pool[0]
+                .unwrap_or(below[0])
         };
 
         if let Some(key) = session_key {
             // Sticky binds to the canonical identity, so two providers using the
             // same account id can never bind to each other.
-            inner
-                .sticky
-                .insert(key.to_string(), chosen.qualified.clone());
+            bind_sticky(&mut inner, key, &chosen.qualified);
         }
 
-        Ok(AttemptPlan {
+        let plan = AttemptPlan {
             request_id: request_id.to_string(),
             account_id: chosen.id.clone(),
             provider: provider.to_string(),
@@ -565,12 +824,22 @@ impl Pool {
             coverage,
             tier: 0,
             attempt_no,
-        })
+            estimated_cost: est_cost,
+        };
+        // Committed under the very lock that chose the account, so a burst
+        // cannot all read the same headroom before any of it is recorded.
+        self.commit(&mut inner, &plan);
+        Ok(plan)
     }
 
-    /// Commit estimated cost against an account before the request goes out.
-    pub fn reserve(&self, plan: &AttemptPlan, est_cost: Decimal) {
-        let mut inner = self.inner.lock().unwrap();
+    /// Commit an attempt's estimated cost against its account.
+    ///
+    /// Called by select() while it still holds the lock, deliberately. Reserving
+    /// in a separate call let two concurrent requests both read the same
+    /// headroom before either of them recorded its commitment, which is exactly
+    /// how a burst overflows a window. There is no longer a public reserve step
+    /// for a caller to forget.
+    fn commit(&self, inner: &mut PoolInner, plan: &AttemptPlan) {
         let qualified = plan.qualified_account();
         let e = inner
             .inflight
@@ -579,12 +848,22 @@ impl Pool {
                 committed: Decimal::ZERO,
                 count: 0,
             });
-        e.committed += est_cost;
+        e.committed += plan.estimated_cost;
         e.count += 1;
         if let Some(acct) = find_mut(&mut inner.accounts, &qualified)
-            && acct.window_started_at.is_none() {
-                acct.window_started_at = Some(now());
-            }
+            && acct.window_started_at.is_none()
+        {
+            acct.window_started_at = Some(now());
+        }
+        // Give the rpm window something to count.
+        let rpm_limited = find(&inner.accounts, &qualified).is_some_and(|a| a.rpm_limit.is_some());
+        if rpm_limited {
+            inner
+                .rpm_window
+                .entry(qualified)
+                .or_default()
+                .push_back(Instant::now());
+        }
     }
 
     /// Reconcile a reservation with actual usage and update the ledger.
@@ -596,11 +875,13 @@ impl Pool {
         let qualified = plan.qualified_account();
 
         if let Some(e) = inner.inflight.get_mut(&qualified) {
-            // Release the reservation; the real number replaces it below.
+            // Release exactly this attempt's reservation. Clearing the whole
+            // account instead made every other concurrent request invisible to
+            // the gate the moment the first of them finished.
             if e.count > 0 {
                 e.count -= 1;
             }
-            e.committed = Decimal::ZERO;
+            e.committed = (e.committed - plan.estimated_cost).max(Decimal::ZERO);
         }
 
         if !billed {
@@ -616,7 +897,14 @@ impl Pool {
                 if left <= Decimal::ZERO {
                     break;
                 }
-                if g.kind.class() != GateClass::Covered || g.cap <= Decimal::ZERO {
+                // FreeTokens is covered by class but its cap is a TOKEN count,
+                // not money. Charging dollars into it corrupted a token counter
+                // and, once the money windows were exhausted, swallowed the cost
+                // before the metered gates below could be debited at all.
+                if g.kind.class() != GateClass::Covered
+                    || g.kind == GateKind::FreeTokens
+                    || g.cap <= Decimal::ZERO
+                {
                     continue;
                 }
                 let head = g.remaining();
@@ -730,8 +1018,8 @@ impl Pool {
 
         // A dying account must not keep stranding sessions on it.
         if matches!(acct.state, AccountState::Parked | AccountState::Disabled) {
-            let dead = acct.id.clone();
-            inner.sticky.retain(|_, v| v != &dead);
+            let dead = acct.qualified();
+            forget_sticky(&mut inner, &dead);
         }
     }
 
@@ -746,6 +1034,12 @@ impl Pool {
         if gates.is_empty() {
             return;
         }
+        // Read the reason BEFORE clearing it: it is the only record of who
+        // disabled this account.
+        let disabled_by_operator = acct
+            .last_error
+            .as_deref()
+            .is_some_and(|reason| reason == OPERATOR_DISABLED);
         acct.gates = gates;
         acct.last_probe_at = Some(at);
         acct.last_error = None;
@@ -754,17 +1048,36 @@ impl Pool {
             acct.state = AccountState::Active;
         }
 
+        let has_room = acct
+            .covered_gates()
+            .any(|g| g.kind != GateKind::FreeTokens && g.remaining() > Decimal::ZERO);
+        let has_metered = acct.metered_gates().any(|g| g.remaining() > Decimal::ZERO);
+        let usable = has_room || (allow_metered && has_metered);
+
         // An account parked because its window was spent comes back once the
         // probe shows headroom again.
-        if acct.state == AccountState::Parked {
-            let has_room = acct
-                .covered_gates()
-                .any(|g| g.kind != GateKind::FreeTokens && g.remaining() > Decimal::ZERO);
-            let has_metered = acct.metered_gates().any(|g| g.remaining() > Decimal::ZERO);
-            if has_room || (allow_metered && has_metered) {
-                acct.state = AccountState::Active;
-                acct.available_at = None;
-            }
+        if acct.state == AccountState::Parked && usable {
+            acct.state = AccountState::Active;
+            acct.available_at = None;
+        }
+
+        // Disabled had no exit at all: nothing else in the codebase leaves it, a
+        // restart restores it from disk, and no CLI command clears it, so one
+        // transient 401 removed the account for good. The operator's only escape
+        // was deleting the ledger -- the thing DESIGN section 10 forbids.
+        //
+        // The exit is deliberately narrower than "the probe answered": that would
+        // put an account disabled for insufficient credit back into rotation once
+        // per poll, where it would fail with 402 again every time. Coming back
+        // requires the probe to show it can actually pay.
+        if acct.state == AccountState::Disabled && usable && !disabled_by_operator {
+            acct.state = AccountState::Active;
+            acct.available_at = None;
+        }
+        if disabled_by_operator {
+            // Put the reason back: the probe does not get to overwrite why the
+            // operator took this account out.
+            acct.last_error = Some(OPERATOR_DISABLED.to_string());
         }
 
         // Reflect the soft threshold against freshly probed numbers.
@@ -876,6 +1189,11 @@ impl Pool {
                 a.gates = r.gates;
                 a.available_at = r.available_at;
                 a.window_started_at = r.window_started_at;
+                // The reason travels with the state. Dropping it here lost the
+                // board's explanation of why an account is out, and it lost the
+                // record that an operator -- not a failure -- put it there, so
+                // the next successful probe quietly put it back in the pool.
+                a.last_error = r.last_error;
                 a.state = match r.state {
                     AccountState::Active | AccountState::Draining => AccountState::Unknown,
                     other => other,
@@ -992,11 +1310,11 @@ mod tests {
         );
 
         // Selection is scoped to the requested provider.
-        let xk = p.select("xkiro", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let xk = p.select("xkiro", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(xk.account_id, "acc-1");
         assert_eq!(xk.qualified_account(), "xkiro/acc-1");
         let cc = p
-            .select("commandcode", "m", None, Decimal::ONE, "r", 1)
+            .select("commandcode", "m", None, Decimal::ONE, "r", 1, &[])
             .unwrap();
         assert_eq!(cc.qualified_account(), "commandcode/acc-1");
 
@@ -1029,7 +1347,7 @@ mod tests {
         );
 
         let err = p
-            .select("xkiro", "m", None, Decimal::from(40), "r", 1)
+            .select("xkiro", "m", None, Decimal::from(40), "r", 1, &[])
             .expect_err("an estimate above the headroom must be refused");
         let msg = err.to_string();
 
@@ -1048,7 +1366,7 @@ mod tests {
             &policy(),
         );
         let err = p
-            .select("xkiro", "m", None, Decimal::ONE, "r", 1)
+            .select("xkiro", "m", None, Decimal::ONE, "r", 1, &[])
             .expect_err("an account with no gates cannot serve");
         let msg = err.to_string();
         assert!(msg.starts_with("no eligible account for provider xkiro"), "{msg}");
@@ -1128,7 +1446,7 @@ mod tests {
 
         // Consume-first picks the MOST utilised account, and now only the paid
         // windows count: 60/100 beats 10/100 regardless of the free bucket.
-        let plan = p.select("xkiro", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let plan = p.select("xkiro", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(plan.qualified_account(), "xkiro/no-free");
     }
 
@@ -1147,12 +1465,12 @@ mod tests {
             &policy(),
         );
         let first = p
-            .select("xkiro", "m", Some("sess"), Decimal::ONE, "r", 1)
+            .select("xkiro", "m", Some("sess"), Decimal::ONE, "r", 1, &[])
             .unwrap();
         assert_eq!(first.qualified_account(), "xkiro/acc-1");
         // Same session key, different provider: must not follow the binding.
         let other = p
-            .select("commandcode", "m", Some("sess"), Decimal::ONE, "r", 1)
+            .select("commandcode", "m", Some("sess"), Decimal::ONE, "r", 1, &[])
             .unwrap();
         assert_eq!(other.qualified_account(), "commandcode/acc-1");
     }
@@ -1163,7 +1481,7 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Unknown)],
             &policy(),
         );
-        assert!(p.select("p", "m", None, Decimal::ONE, "r", 1).is_err());
+        assert!(p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).is_err());
     }
 
     #[test]
@@ -1173,9 +1491,9 @@ mod tests {
             &policy(),
         );
         // 2.0 of cost against 1.0 of headroom must be refused...
-        assert!(p.select("p", "m", None, Decimal::from(2), "r", 1).is_err());
+        assert!(p.select("p", "m", None, Decimal::from(2), "r", 1, &[]).is_err());
         // ...while a cost that exactly fits is still affordable.
-        assert!(p.select("p", "m", None, Decimal::from(1), "r", 1).is_ok());
+        assert!(p.select("p", "m", None, Decimal::from(1), "r", 1, &[]).is_ok());
     }
 
     #[test]
@@ -1187,7 +1505,7 @@ mod tests {
             ],
             &policy(),
         );
-        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(
             plan.account_id, "high",
             "consume-first should drain one account at a time"
@@ -1211,7 +1529,7 @@ mod tests {
             &policy(),
         );
         let err = p
-            .select("p", "m", None, Decimal::ONE, "r", 1)
+            .select("p", "m", None, Decimal::ONE, "r", 1, &[])
             .expect_err("a spent window must not be selected");
         match err {
             PlanError::NoEligibleAccount { retry_after, .. } => {
@@ -1234,7 +1552,7 @@ mod tests {
             ],
             &policy(),
         );
-        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(
             plan.account_id, "a",
             "the soft threshold must not become a hard outage while headroom remains"
@@ -1250,12 +1568,12 @@ mod tests {
             ],
             &policy(),
         );
-        let first = p.select("p", "m", Some("sess"), Decimal::ONE, "r", 1).unwrap();
+        let first = p.select("p", "m", Some("sess"), Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(first.account_id, "a");
         // Account a is now the busiest, but the session must not move: moving
         // it would discard the prompt cache.
         let second = p
-            .select("p", "m", Some("sess"), Decimal::ONE, "r2", 1)
+            .select("p", "m", Some("sess"), Decimal::ONE, "r2", 1, &[])
             .unwrap();
         assert_eq!(second.account_id, "a");
     }
@@ -1273,7 +1591,7 @@ mod tests {
             &policy(),
         );
         assert!(p
-            .select("deepseek", "m", None, Decimal::ONE, "r", 1)
+            .select("deepseek", "m", None, Decimal::ONE, "r", 1, &[])
             .is_err());
     }
 
@@ -1291,7 +1609,7 @@ mod tests {
             &pol,
         );
         let plan = p
-            .select("deepseek", "m", None, Decimal::ONE, "r", 1)
+            .select("deepseek", "m", None, Decimal::ONE, "r", 1, &[])
             .unwrap();
         assert_eq!(plan.coverage, GateClass::Metered);
     }
@@ -1312,7 +1630,7 @@ mod tests {
             ],
             &pol,
         );
-        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(plan.account_id, "cc");
         assert_eq!(plan.coverage, GateClass::Covered);
     }
@@ -1323,8 +1641,7 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
             &policy(),
         );
-        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
-        p.reserve(&plan, Decimal::from(2));
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         p.settle(&plan, Decimal::from(5), true);
         let a = p.account("p/a").unwrap();
         assert_eq!(a.gates[0].used, Decimal::from(5));
@@ -1336,7 +1653,7 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
             &policy(),
         );
-        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         p.settle(&plan, Decimal::from(85), true);
         assert_eq!(p.account("p/a").unwrap().state, AccountState::Draining);
     }
@@ -1347,11 +1664,11 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
             &policy(),
         );
-        let _ = p.select("p", "m", Some("s"), Decimal::ONE, "r", 1).unwrap();
+        let _ = p.select("p", "m", Some("s"), Decimal::ONE, "r", 1, &[]).unwrap();
         p.note_error("p/a", UpstreamErrorClass::QuotaExhausted, None, None);
         let a = p.account("p/a").unwrap();
         assert_eq!(a.state, AccountState::Parked);
-        assert!(p.select("p", "m", Some("s"), Decimal::ONE, "r2", 1).is_err());
+        assert!(p.select("p", "m", Some("s"), Decimal::ONE, "r2", 1, &[]).is_err());
     }
 
     #[test]
@@ -1420,10 +1737,20 @@ mod tests {
     #[test]
     fn parked_account_returns_after_its_reset() {
         let past = now() - time::Duration::seconds(60);
-        let mut a = acct("a", "p", vec![cover(100, 100)], AccountState::Parked);
+        let mut a = acct(
+            "a",
+            "p",
+            vec![gate(
+                GateKind::FiveHour,
+                Decimal::from(100),
+                Decimal::from(100),
+                Some(past),
+            )],
+            AccountState::Parked,
+        );
         a.available_at = Some(past);
         let p = Pool::new(vec![a], &policy());
-        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         assert_eq!(plan.account_id, "a");
         let a = p.account("p/a").unwrap();
         assert_eq!(a.state, AccountState::Active);
@@ -1431,6 +1758,467 @@ mod tests {
             a.gates[0].used,
             Decimal::ZERO,
             "a rolled window starts whole again"
+        );
+    }
+
+    // ------------------------------------------------- fixes for the review
+
+    /// One transient 401 used to remove an account for good.
+    ///
+    /// Disabled had no exit at all: apply_probe revived only Unknown and Parked,
+    /// a restart restored Disabled from disk, and no CLI command could clear it.
+    /// Fixing the credential and probing again changed nothing, so the operator's
+    /// only escape was deleting the ledger -- the exact thing DESIGN section 10
+    /// says makes the gateway re-spend quota it already consumed.
+    #[test]
+    fn a_successful_probe_brings_a_disabled_account_back() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 0)], AccountState::Disabled)],
+            &policy(),
+        );
+        assert!(
+            p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).is_err(),
+            "a disabled account must not serve"
+        );
+
+        p.apply_probe("p/a", vec![cover(100, 0)], now());
+
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Active);
+        assert!(
+            p.select("p", "m", None, Decimal::ONE, "r", 2, &[]).is_ok(),
+            "a probe that succeeds is proof the account works again"
+        );
+    }
+
+    /// The gate has to see the requests already on the wire.
+    ///
+    /// The in-flight commitment was written and never read, and the reserve step
+    /// had no production caller, so concurrent requests each sized the gate as if
+    /// they were alone and could together commit many times the real headroom.
+    #[test]
+    fn requests_in_flight_shrink_what_the_next_one_may_commit() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(10, 0)], AccountState::Active)],
+            &policy(),
+        );
+        let first = p
+            .select("p", "m", None, Decimal::from(4), "r1", 1, &[])
+            .unwrap();
+        let second = p
+            .select("p", "m", None, Decimal::from(4), "r2", 1, &[])
+            .unwrap();
+        assert!(
+            p.select("p", "m", None, Decimal::from(4), "r3", 1, &[]).is_err(),
+            "8 of 10 already committed, so another 4 cannot fit"
+        );
+
+        p.settle(&first, Decimal::from(4), true);
+        p.settle(&second, Decimal::from(4), true);
+        assert_eq!(p.account("p/a").unwrap().gates[0].used, Decimal::from(8));
+        assert!(
+            p.select("p", "m", None, Decimal::from(4), "r4", 1, &[]).is_err(),
+            "and the money is spent now, not merely reserved"
+        );
+    }
+
+    /// A retry must actually reach a different account.
+    ///
+    /// attempt_no was threaded all the way into select() and then only stored, so
+    /// a 503 that does not change account state sent every retry straight back to
+    /// the account that had just failed.
+    #[test]
+    fn a_retry_prefers_an_account_this_request_has_not_tried() {
+        let p = Pool::new(
+            vec![
+                acct("a1", "p", vec![cover(100, 0)], AccountState::Active),
+                acct("a2", "p", vec![cover(100, 0)], AccountState::Active),
+            ],
+            &policy(),
+        );
+        let first = p
+            .select("p", "m", None, Decimal::ONE, "r", 1, &[])
+            .unwrap();
+        let second = p
+            .select(
+                "p",
+                "m",
+                None,
+                Decimal::ONE,
+                "r",
+                2,
+                &[first.qualified_account()],
+            )
+            .unwrap();
+        assert_ne!(
+            first.account_id, second.account_id,
+            "the healthy account must be reached, not skipped"
+        );
+    }
+
+    /// ... while a one-account pool keeps its bounded retry.
+    #[test]
+    fn a_retry_falls_back_to_the_only_account_when_there_is_no_alternative() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
+            &policy(),
+        );
+        let first = p
+            .select("p", "m", None, Decimal::ONE, "r", 1, &[])
+            .unwrap();
+        let second = p
+            .select(
+                "p",
+                "m",
+                None,
+                Decimal::ONE,
+                "r",
+                2,
+                &[first.qualified_account()],
+            )
+            .unwrap();
+        assert_eq!(first.account_id, second.account_id);
+    }
+
+    /// An unknown reset time is not evidence that a window rolled over.
+    ///
+    /// note_error marks EVERY window spent when an account is parked, so a
+    /// saturated window with no reset time may be collateral. Clearing it
+    /// claimed allowance the provider still enforces; leaving it costs one poll
+    /// interval before the next probe replaces the whole reading.
+    #[test]
+    fn reaping_leaves_a_saturated_window_whose_reset_time_is_unknown() {
+        let past = now() - time::Duration::seconds(60);
+        let mut a = acct(
+            "a",
+            "p",
+            vec![
+                gate(
+                    GateKind::FiveHour,
+                    Decimal::from(100),
+                    Decimal::from(100),
+                    Some(past),
+                ),
+                gate(
+                    GateKind::Weekly,
+                    Decimal::from(100),
+                    Decimal::from(100),
+                    None,
+                ),
+            ],
+            AccountState::Parked,
+        );
+        a.available_at = Some(past);
+        let p = Pool::new(vec![a], &policy());
+        let _ = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]);
+
+        let a = p.account("p/a").unwrap();
+        let weekly = a
+            .gates
+            .iter()
+            .find(|g| g.kind == GateKind::Weekly)
+            .unwrap();
+        assert_eq!(
+            weekly.used,
+            Decimal::from(100),
+            "an unknown reset time must not be read as 'it rolled over'"
+        );
+    }
+
+    /// A 5-hour reset must not wipe the weekly window that contains it.
+    #[test]
+    fn reaping_one_window_leaves_the_others_alone() {
+        let past = now() - time::Duration::seconds(60);
+        let soon = now() + time::Duration::seconds(3_600);
+        let mut a = acct(
+            "a",
+            "p",
+            vec![
+                gate(
+                    GateKind::FiveHour,
+                    Decimal::from(100),
+                    Decimal::from(100),
+                    Some(past),
+                ),
+                gate(
+                    GateKind::Weekly,
+                    Decimal::from(100),
+                    Decimal::from(95),
+                    Some(soon),
+                ),
+            ],
+            AccountState::Parked,
+        );
+        a.available_at = Some(past);
+        let p = Pool::new(vec![a], &policy());
+        let _ = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]);
+
+        let a = p.account("p/a").unwrap();
+        let used = |kind: GateKind| {
+            a.gates
+                .iter()
+                .find(|g| g.kind == kind)
+                .map(|g| g.used)
+                .unwrap()
+        };
+        assert_eq!(used(GateKind::FiveHour), Decimal::ZERO);
+        assert_eq!(
+            used(GateKind::Weekly),
+            Decimal::from(95),
+            "the weekly window has not reset, so its usage is still real"
+        );
+    }
+
+    /// A token allowance is not a money gate.
+    ///
+    /// FreeTokens is covered by class but its cap counts tokens. Charging a
+    /// dollar figure into it corrupted the counter, and once the money windows
+    /// were exhausted it absorbed the whole cost before the metered gate -- the
+    /// one that actually pays -- could be debited.
+    #[test]
+    fn a_free_token_allowance_is_never_charged_in_money() {
+        let p = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![
+                    gate(
+                        GateKind::FiveHour,
+                        Decimal::from(1),
+                        Decimal::from(1),
+                        None,
+                    ),
+                    gate(
+                        GateKind::FreeTokens,
+                        Decimal::from(10_000),
+                        Decimal::from(1_200),
+                        None,
+                    ),
+                    wallet(5, 0),
+                ],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        let plan = AttemptPlan {
+            request_id: "r".into(),
+            account_id: "a".into(),
+            provider: "p".into(),
+            model: "m".into(),
+            session_key: None,
+            coverage: GateClass::Covered,
+            tier: 0,
+            attempt_no: 1,
+            estimated_cost: Decimal::ZERO,
+        };
+        p.settle(&plan, Decimal::from(3), true);
+
+        let a = p.account("p/a").unwrap();
+        let used = |kind: GateKind| {
+            a.gates
+                .iter()
+                .find(|g| g.kind == kind)
+                .map(|g| g.used)
+                .unwrap()
+        };
+        assert_eq!(
+            used(GateKind::FreeTokens),
+            Decimal::from(1_200),
+            "a dollar charge must never land in a token counter"
+        );
+        assert_eq!(
+            used(GateKind::Wallet),
+            Decimal::from(3),
+            "the metered gate pays once the covered money is gone"
+        );
+    }
+
+    /// ... but an account that is out of money stays out.
+    ///
+    /// Reviving on the mere fact that the probe answered would put a
+    /// credit-exhausted account back into rotation once per poll, failing with
+    /// 402 every time. A 200 on a balance endpoint does not mean there is money.
+    #[test]
+    fn a_probe_with_no_headroom_leaves_a_disabled_account_alone() {
+        let p = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![cover(100, 100), wallet(0, 0)],
+                AccountState::Disabled,
+            )],
+            &policy(),
+        );
+        p.apply_probe("p/a", vec![cover(100, 100), wallet(0, 0)], now());
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Disabled);
+    }
+
+    /// rpm_limit and concurrency_limit were parsed, stored and then never read,
+    /// so setting either one changed nothing at all.
+    #[test]
+    fn an_account_at_its_concurrency_limit_is_skipped_until_a_request_finishes() {
+        let mut a = acct("a", "p", vec![cover(100, 0)], AccountState::Active);
+        a.concurrency_limit = Some(1);
+        let p = Pool::new(vec![a], &policy());
+
+        let first = p
+            .select("p", "m", None, Decimal::ZERO, "r1", 1, &[])
+            .unwrap();
+        assert!(
+            p.select("p", "m", None, Decimal::ZERO, "r2", 1, &[]).is_err(),
+            "the account is already serving one request"
+        );
+
+        p.settle(&first, Decimal::ZERO, false);
+        assert!(
+            p.select("p", "m", None, Decimal::ZERO, "r3", 1, &[]).is_ok(),
+            "and it frees up when that request finishes"
+        );
+    }
+
+    #[test]
+    fn an_account_at_its_rpm_limit_is_skipped_for_the_rest_of_the_window() {
+        let mut a = acct("a", "p", vec![cover(100, 0)], AccountState::Active);
+        a.rpm_limit = Some(2);
+        let p = Pool::new(vec![a], &policy());
+
+        for i in 0..2 {
+            let plan = p
+                .select("p", "m", None, Decimal::ZERO, &format!("r{i}"), 1, &[])
+                .unwrap();
+            p.settle(&plan, Decimal::ZERO, false);
+        }
+        assert!(
+            p.select("p", "m", None, Decimal::ZERO, "r3", 1, &[]).is_err(),
+            "two requests inside the window is the limit"
+        );
+    }
+
+    /// A sticky session's retry must reach the other account.
+    ///
+    /// The sticky branch used to short-circuit before the untried preference
+    /// ever ran, so a session-bound request spent its whole retry budget on the
+    /// account that had just failed -- the exact case the exclusion exists for,
+    /// and the common case, because most clients send a session key.
+    #[test]
+    fn a_sticky_session_retries_on_a_different_account() {
+        let p = Pool::new(
+            vec![
+                acct("a1", "p", vec![cover(100, 0)], AccountState::Active),
+                acct("a2", "p", vec![cover(100, 0)], AccountState::Active),
+            ],
+            &policy(),
+        );
+        let first = p
+            .select("p", "m", Some("sess"), Decimal::ONE, "r", 1, &[])
+            .unwrap();
+        let second = p
+            .select(
+                "p",
+                "m",
+                Some("sess"),
+                Decimal::ONE,
+                "r",
+                2,
+                &[first.qualified_account()],
+            )
+            .unwrap();
+        assert_ne!(
+            first.account_id, second.account_id,
+            "the retry must not go back to the account that just failed"
+        );
+    }
+
+    /// The reason a state was set has to survive a restart.
+    ///
+    /// restore() assigned gates, availability and state but never last_error, so
+    /// "disabled by operator" was dropped on the way in -- which also broke the
+    /// board's explanation of why an account is out, and let the next successful
+    /// probe put the account back in the pool.
+    #[test]
+    fn restoring_an_account_keeps_the_reason_it_was_disabled() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 0)], AccountState::Unknown)],
+            &policy(),
+        );
+        p.restore(vec![crate::domain::AccountOverview {
+            account_id: "a".into(),
+            provider: "p".into(),
+            label: "a".into(),
+            currency: "USD".into(),
+            state: AccountState::Disabled,
+            gates: vec![cover(100, 0)],
+            available_at: None,
+            window_started_at: None,
+            last_error: Some(OPERATOR_DISABLED.to_string()),
+        }]);
+
+        p.apply_probe("p/a", vec![cover(100, 0)], now());
+
+        let a = p.account("p/a").unwrap();
+        assert_eq!(a.state, AccountState::Disabled);
+        assert_eq!(a.last_error.as_deref(), Some(OPERATOR_DISABLED));
+    }
+
+    /// A probe restores the credential, not the operator's decision.
+    #[test]
+    fn a_successful_probe_does_not_undo_an_operator_disable() {
+        let mut a = acct("a", "p", vec![cover(100, 0)], AccountState::Disabled);
+        a.last_error = Some(OPERATOR_DISABLED.to_string());
+        let p = Pool::new(vec![a], &policy());
+
+        p.apply_probe("p/a", vec![cover(100, 0)], now());
+
+        let a = p.account("p/a").unwrap();
+        assert_eq!(
+            a.state,
+            AccountState::Disabled,
+            "only an operator can put this account back"
+        );
+        assert_eq!(a.last_error.as_deref(), Some(OPERATOR_DISABLED));
+    }
+
+    /// Session keys come straight from client headers, so the map is bounded.
+    #[test]
+    fn session_bindings_are_bounded() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
+            &policy(),
+        );
+        // Zero estimated cost: this test is about the binding map, and the
+        // in-flight gate would otherwise fill the account's headroom first.
+        for i in 0..(MAX_STICKY_SESSIONS + 64) {
+            let key = format!("s{i}");
+            p.select("p", "m", Some(&key), Decimal::ZERO, "r", 1, &[])
+                .unwrap();
+        }
+        assert!(
+            p.tracked_sessions() <= MAX_STICKY_SESSIONS,
+            "got {} bindings",
+            p.tracked_sessions()
+        );
+    }
+
+    /// A dying account must release the sessions bound to it.
+    ///
+    /// The pruning compared the BARE id against bindings stored as provider/id,
+    /// so it never matched: every session stayed bound to a parked account and
+    /// had to fail once before rebinding.
+    #[test]
+    fn a_parked_account_releases_its_sessions() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
+            &policy(),
+        );
+        p.select("p", "m", Some("sess"), Decimal::ONE, "r", 1, &[])
+            .unwrap();
+        assert_eq!(p.tracked_sessions(), 1);
+
+        p.note_error("p/a", UpstreamErrorClass::QuotaExhausted, None, None);
+
+        assert_eq!(
+            p.tracked_sessions(),
+            0,
+            "the binding must be dropped so the session can rebind"
         );
     }
 }

@@ -72,6 +72,20 @@ label = "xkiro primary"
 [providers.xkiro.accounts.acc-2]
 label = "xkiro secondary"
 
+# Optional per-account settings. They can also be set on the provider and
+# inherited by its accounts.
+#
+# credit_multiplier scales a configured price into whatever unit this account is
+# billed in, so the allowance and the estimate are compared in the same unit.
+# It applies to CONFIGURED prices only: a price learned from real spend is
+# already in billing units and is never scaled again. Default 1.0.
+#   credit_multiplier = 1.0
+#
+# Pacing limits. A held-back account is skipped for the next request, not
+# disabled, so a limit can never take the pool down on its own.
+#   rpm_limit = 60            # requests per rolling minute
+#   concurrency_limit = 4     # requests in flight at once
+
 [providers.commandcode]
 # Traffic goes to /provider/v1; quota probes live on the bare host. The probe
 # host is pinned here so credentials never follow a client-supplied URL.

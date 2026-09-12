@@ -119,6 +119,13 @@ for tests and dry runs and never touches your real keychain.
     ai-gw prices [--drift-only]          configured price vs the price learned from real spend
     ai-gw keys add|list|remove|test      provider credentials
     ai-gw accounts list|probe|disable    account maintenance
+
+### Account recovery
+
+A 401, 403 or 402 disables the account: it leaves the pool until an operator acts.
+A **successful probe re-enables it**, so the fix is to correct the credential and
+run "ai-gw accounts probe". Disabling is per account -- "ai-gw accounts disable X"
+writes only X's row and leaves every other account's quota readings alone.
     ai-gw tail                           recent requests
     ai-gw doctor                         config, credentials, probe reachability
     ai-gw init                           write an example config
@@ -247,7 +254,7 @@ A 429 means several different things and each needs a different response:
 | 429 with a long Retry-After, or a quota-shaped code | window exhausted | park the account, move on |
 | 402 / insufficient_quota | out of money | disable the account, alert; never retry |
 | 401 / 403 | bad credentials | disable the account |
-| 529 / 5xx | upstream trouble | bounded retry, then another account |
+| 529 / 5xx | upstream trouble | bounded retry on a **different** account |
 | 400 / 404 | bad request | never retried |
 
 An account switch is only possible **before the first byte reaches the client**.
@@ -277,6 +284,9 @@ the gateway should infer.
 
 Provider quota adapters live in src/quota. Adding a provider means implementing
 one trait and declaring its base URL, credentials and error vocabulary.
+`adapter = "none"` is deliberately not supported: an account is admitted to the
+pool only after a successful probe, so a provider with no quota source can never
+be selected. Use xkiro, command-code or deepseek.
 
 ## Safety notes
 

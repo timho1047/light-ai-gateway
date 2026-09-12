@@ -157,6 +157,29 @@ impl PriceEntry {
         self.learned.as_ref().or(self.configured.as_ref())
     }
 
+    /// Cost of a usage sample under the account's credit multiplier.
+    ///
+    /// The multiplier converts a USD price into the account's billing unit
+    /// (DESIGN section 3: `spent_local += price(model, tokens) x
+    /// credit_multiplier`), so it applies to the CONFIGURED price only. A
+    /// learned price was recovered as "provider spend delta / weighted tokens";
+    /// that spend is already in billing units, so multiplying it again squares
+    /// the factor: a 4x multiplier -- the kind DESIGN section 3 lists for
+    /// Command Code's models -- over-estimates 16x, which is merely early,
+    /// while a multiplier below 1 under-estimates by the same factor, and
+    /// under-estimating is the direction that lets spend slip through into
+    /// metered.
+    ///
+    /// Callers that only want a share of spend, such as the router splitting an
+    /// interval across tiers, pass Decimal::ONE and are unaffected either way.
+    pub fn cost(&self, usage: &TokenUsage, multiplier: Decimal) -> Option<Decimal> {
+        match (self.learned.as_ref(), self.configured.as_ref()) {
+            (Some(learned), _) => Some(learned.base_cost(usage)),
+            (None, Some(configured)) => Some(configured.cost(usage, multiplier)),
+            (None, None) => None,
+        }
+    }
+
     pub fn source(&self) -> Option<PriceSource> {
         if self.learned.is_some() {
             Some(PriceSource::Learned)
@@ -311,6 +334,10 @@ impl PriceTable {
     ///
     /// Bias: never returns zero for an unknown model. Zero would let a request
     /// through the hard gate for free.
+    ///
+    /// The multiplier is applied by `PriceEntry::cost`: to a configured price,
+    /// which is quoted in USD, but not to a learned one, which is already in the
+    /// account's billing unit.
     pub fn estimate(
         &self,
         provider: &str,
@@ -319,8 +346,9 @@ impl PriceTable {
         usage: &TokenUsage,
         multiplier: Decimal,
     ) -> Option<Decimal> {
-        self.effective(provider, model, tier)
-            .map(|price| price.cost(usage, multiplier))
+        self.entries
+            .get(&Self::key(provider, model, tier))
+            .and_then(|entry| entry.cost(usage, multiplier))
     }
 
     /// Learn from an observed spend delta.
@@ -332,12 +360,16 @@ impl PriceTable {
     /// robust than a hand-maintained table.
     ///
     /// One equation cannot identify two unknowns, so the learned rate is a
-    /// single BLENDED rate in USD per weighted token, applied to both prompt and
-    /// completion tokens. Cached prompt tokens are weighted by the previous
-    /// observation's discount (0.1 by default), which is correct as long as the
-    /// cached/uncached mix stays stable between probes. Repeated observations
-    /// are averaged with `samples` as the weight, so one noisy interval cannot
-    /// throw away a good rate. A config-seeded prior (samples == 0) is replaced
+    /// single BLENDED rate in the account's billing unit per weighted token,
+    /// applied to both prompt and completion tokens. Cached prompt tokens are
+    /// weighted by the previous observation's discount (0.1 by default), which
+    /// is correct as long as the cached/uncached mix stays stable between
+    /// probes. Repeated observations are averaged by the token VOLUME behind
+    /// them, so a single heavy interval dominates a string of tiny ones.
+    /// Weighting by sample COUNT did the opposite: ten 0.25 USD/M intervals over
+    /// 1,000 tokens each plus one 900 USD/M interval over a million tokens
+    /// learned about 82 USD/M, when 99.99% of the spend came from the
+    /// million-token interval. A config-seeded prior (samples == 0) is replaced
     /// outright by the first real observation.
     ///
     /// Callers must only pass real billing deltas: an interval with no traffic
@@ -402,20 +434,35 @@ impl PriceTable {
         }
 
         let prior_samples = previous.map(|p| p.samples).unwrap_or(0);
+        // The weight of a rate is the token volume it was derived from, not the
+        // number of times it was observed. `observed_*` accumulates exactly the
+        // usage of every accepted observation, so it is that volume. A learned
+        // rate with no recorded volume -- a price installed by `set`, say -- has
+        // nothing to weigh, so the first observation replaces it rather than
+        // being averaged with it.
+        let previous_weight = weighted_tokens(&entry.observed_usage(), ratio);
         let (input_per_token, output_per_token) = match previous {
-            Some(p) => {
-                let n = Decimal::from(prior_samples);
-                let weight = n + Decimal::ONE;
+            Some(p) if previous_weight > Decimal::ZERO => {
+                // Volume-weighted mean: (rate_a x volume_a + rate_b x volume_b)
+                // / (volume_a + volume_b). Each term is in spend units, so the
+                // result stays in billing units per token.
+                let weight = sat_add(previous_weight, weighted);
                 (
-                    (sat_add(sat_mul(p.input_per_token, n), observed)) / weight,
-                    (sat_add(sat_mul(p.output_per_token, n), observed)) / weight,
+                    sat_add(
+                        sat_mul(p.input_per_token, previous_weight),
+                        sat_mul(observed, weighted),
+                    ) / weight,
+                    sat_add(
+                        sat_mul(p.output_per_token, previous_weight),
+                        sat_mul(observed, weighted),
+                    ) / weight,
                 )
             }
             // One equation cannot separate an input rate from an output rate, so
             // the learned figure is a single blended rate applied to both. The
             // configured price keeps its own split, which is why the drift
             // comparison is made on cost rather than on the two rates.
-            None => (observed, observed),
+            _ => (observed, observed),
         };
         // Keep the cache-read share we already had, expressed against the new
         // blended input rate so the relationship survives learning.
@@ -981,6 +1028,25 @@ mod tests {
         }
     }
 
+    /// A table whose only price is the configured one, so a test exercises the
+    /// USD -> billing-unit conversion rather than a learned rate.
+    fn seeded(input: f64, output: f64) -> PriceTable {
+        use crate::config::ModelPriceConfig;
+        let mut cfg: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        cfg.entry(P.to_string()).or_default().insert(
+            "m".to_string(),
+            ModelPriceConfig {
+                input,
+                output,
+                cache_read: None,
+                schedules: Vec::new(),
+            },
+        );
+        let mut table = PriceTable::new();
+        table.seed_from_config(&cfg);
+        table
+    }
+
     #[test]
     fn cached_prompt_token_costs_less_than_an_uncached_one() {
         let mut table = PriceTable::new();
@@ -1012,19 +1078,56 @@ mod tests {
         assert_eq!(cost, Decimal::new(15, 3)); // 1000 * 0.000015
     }
 
+    /// A configured price is quoted in USD, so it is the one the multiplier
+    /// converts into the account's billing unit.
     #[test]
-    fn credit_multiplier_is_applied_to_the_whole_cost() {
-        let mut table = PriceTable::new();
-        table.set(P, "m", 0, price(3, 15, 1));
+    fn a_configured_price_is_converted_to_billing_units_by_the_multiplier() {
+        let table = seeded(3.0, 15.0);
         let u = usage(1_000, 1_000, 0);
 
         let one = table.estimate(P, "m", 0, &u, Decimal::ONE).unwrap();
+        assert_eq!(one, Decimal::new(18, 3)); // 1000 x 3/M + 1000 x 15/M
         let four = table.estimate(P, "m", 0, &u, Decimal::from(4)).unwrap();
         assert_eq!(four, one * Decimal::from(4));
 
-        // A zero or negative multiplier must not make a request look free.
+        // A zero or negative multiplier must not make a request look free: the
+        // hard gate would then admit everything.
         assert_eq!(table.estimate(P, "m", 0, &u, Decimal::ZERO).unwrap(), one);
         assert_eq!(table.estimate(P, "m", 0, &u, Decimal::NEGATIVE_ONE).unwrap(), one);
+    }
+
+    /// DESIGN section 3 charges price(model, tokens) x credit_multiplier, and
+    /// observe recovers that price from provider-reported spend -- spend that has
+    /// ALREADY been multiplied. Applying the multiplier to the learned price
+    /// again squares it: a factor above 1 only makes the gate early, but a factor
+    /// below 1 under-estimates by the same amount and lets spend slip through
+    /// into metered.
+    #[test]
+    fn the_credit_multiplier_scales_a_configured_price_but_not_a_learned_one() {
+        let mut table = seeded(3.0, 15.0);
+        let u = usage(1_000, 1_000, 0);
+
+        let configured = table.estimate(P, "m", 0, &u, Decimal::ONE).unwrap();
+        assert_eq!(
+            table.estimate(P, "m", 0, &u, Decimal::from(2)).unwrap(),
+            configured * Decimal::from(2),
+            "a configured USD price is converted by the multiplier"
+        );
+
+        // 0.10 of provider-reported spend over 2,000 tokens learns 0.00005 per
+        // token, i.e. 50 USD/M in the account's own unit.
+        table.observe(P, "m", 0, Decimal::new(1, 1), &usage(2_000, 0, 0));
+        let learned = *table.get(P, "m", 0).unwrap();
+        assert_eq!(learned.input_per_token, Decimal::new(5, 5));
+
+        let once = table.estimate(P, "m", 0, &u, Decimal::ONE).unwrap();
+        assert_eq!(once, learned.base_cost(&u), "learned rate x tokens, nothing else");
+        assert_eq!(once, Decimal::new(1, 1), "2000 tokens x 0.00005 = 0.10");
+        assert_eq!(
+            table.estimate(P, "m", 0, &u, Decimal::from(2)).unwrap(),
+            once,
+            "the multiplier is already inside the learned rate and must not be applied twice"
+        );
     }
 
     #[test]
@@ -1094,6 +1197,33 @@ mod tests {
                 .estimate(P, "m", 0, &usage(1_000, 0, 0), Decimal::ONE)
                 .unwrap(),
             Decimal::new(4, 3)
+        );
+    }
+
+    /// Averaging a price by sample COUNT lets ten tiny intervals outvote the one
+    /// interval that carried the spend. Real cost is dominated by volume, so the
+    /// learned rate has to be weighted by the token volume behind each
+    /// observation: ten 0.25 USD/M intervals over 1,000 tokens each ($0.00025
+    /// apiece) plus one 900 USD/M interval over a million tokens ($900) is a
+    /// rate near 891 USD/M, not the 82 USD/M a per-observation mean reports.
+    #[test]
+    fn a_heavy_interval_outweighs_many_small_ones_when_learning_a_price() {
+        let mut table = PriceTable::new();
+        for _ in 0..10 {
+            // 0.00025 over 1,000 tokens = 0.25 USD/M.
+            table.observe(P, "m", 0, Decimal::new(25, 5), &usage(1_000, 0, 0));
+        }
+        // 900 USD over 1,000,000 tokens = 900 USD/M, and 99.99% of the spend.
+        table.observe(P, "m", 0, Decimal::from(900), &usage(1_000_000, 0, 0));
+
+        let learned = table.get(P, "m", 0).unwrap();
+        assert_eq!(learned.samples, 11, "samples still counts observations");
+        // (0.25/M x 10k tokens + 900/M x 1M tokens) / 1.01M tokens = 891.1 USD/M.
+        assert!(
+            learned.input_per_token > Decimal::new(800, 6)
+                && learned.input_per_token < Decimal::new(950, 6),
+            "the heavy interval must dominate, got {} USD/M (the per-count mean is 82 USD/M)",
+            learned.input_per_token * Decimal::from(1_000_000u64)
         );
     }
 
@@ -1762,9 +1892,17 @@ mod tests {
         );
 
         let cost = table
-            .estimate(P, "m", 0, &usage(1_000, 1_000, 1_000), Decimal::from(2))
+            .estimate(P, "m", 0, &usage(1_000, 1_000, 1_000), Decimal::ONE)
             .unwrap();
-        // (0 uncached + 1000 cached * 0.1 + 1000 completion) * 5e-6 * 2 = 0.011
-        assert_eq!(cost, Decimal::new(11, 3));
+        // (0 uncached + 1000 cached * 0.1 + 1000 completion) * 5e-6 = 0.0055
+        assert_eq!(cost, Decimal::new(55, 4));
+        // A learned rate already carries the account's billing unit, so a
+        // multiplier does not change it -- see the multiplier test above.
+        assert_eq!(
+            table
+                .estimate(P, "m", 0, &usage(1_000, 1_000, 1_000), Decimal::from(2))
+                .unwrap(),
+            cost
+        );
     }
 }

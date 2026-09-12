@@ -305,14 +305,50 @@ pub enum WriteMsg {
     Request(Box<RequestRecord>),
     Attempt(Box<AttemptRecord>),
     Accounts(Vec<Account>),
+    /// Upsert exactly ONE account and its gates.
+    ///
+    /// Separate from Accounts because a full snapshot is destructive: it
+    /// upserts every configured account and deletes the gate rows of any whose
+    /// in-memory copy has none. "accounts disable X" built its snapshot without
+    /// reading the ledger, so disabling one account wiped the quota readings of
+    /// every other account in the pool.
+    Account(Box<Account>),
     /// Barrier used by flush_blocking and by tests: acknowledge only after
-    /// every message queued before this one has been committed.
-    Flush(std::sync::mpsc::Sender<()>),
+    /// every message queued before this one has been committed. The
+    /// acknowledgement carries the first write error, if any.
+    Flush(std::sync::mpsc::Sender<std::result::Result<(), String>>),
+}
+
+/// How long per-request detail is kept. The daily rollup is permanent.
+pub const DETAIL_RETENTION_DAYS: i64 = 30;
+
+/// Delete per-attempt telemetry older than the retention window.
+///
+/// Only the attempts table is pruned, and the reason is worth writing down:
+/// "ai-gw usage" aggregates the LIVE requests table, not usage_daily (the daily
+/// rollup is keyed by provider and day, so it cannot answer the model and
+/// account groupings the command offers). Deleting request rows would therefore
+/// make a 90-day report quietly return less than the truth, and a number that
+/// shrinks without saying so is worse than a table that grows. Requests are kept
+/// until there is a per-dimension rollup for them to fall back on.
+///
+/// Attempts are pure telemetry -- one row per upstream try -- and are where the
+/// growth actually comes from once retries and rotations are in play.
+pub fn prune_detail(conn: &Connection, at: OffsetDateTime) -> Result<u64> {
+    let cutoff = e2i(at - time::Duration::days(DETAIL_RETENTION_DAYS));
+    let attempts = conn.execute(
+        "DELETE FROM attempts WHERE request_id IN (SELECT id FROM requests WHERE ts < ?1)",
+        params![cutoff],
+    )? as u64;
+    Ok(attempts)
 }
 
 /// Fire-and-forget handle to the database writer.
 pub struct StoreHandle {
     tx: UnboundedSender<WriteMsg>,
+    /// Writes that failed to commit since the process started. Read by
+    /// flush_blocking so a shutdown cannot claim success over a broken write.
+    failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl StoreHandle {
@@ -323,23 +359,34 @@ impl StoreHandle {
     /// no failure below can stall the request path.
     pub fn spawn(db_path: &Path) -> Result<Self> {
         let conn = open(db_path)?;
+        // Retention runs once at startup: it is bounded work (one indexed range
+        // delete) and it keeps the ledger from growing forever.
+        match prune_detail(&conn, OffsetDateTime::now_utc()) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(rows = n, "store: pruned request detail past retention"),
+            Err(e) => tracing::warn!(error = %e, "store: could not prune old request detail"),
+        }
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WriteMsg>();
+        let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_failures = std::sync::Arc::clone(&failures);
         std::thread::Builder::new()
             .name("lai-gw-store-writer".to_string())
-            .spawn(move || writer_loop(conn, rx))
+            .spawn(move || writer_loop(conn, rx, writer_failures))
             .context("spawning store writer thread")?;
-        Ok(StoreHandle { tx })
+        Ok(StoreHandle { tx, failures })
     }
 
     pub fn record_request(&self, r: RequestRecord) {
         if self.tx.send(WriteMsg::Request(Box::new(r))).is_err() {
-            tracing::warn!("store writer is gone; dropping request record");
+            // error!, not warn!: once the writer is gone nothing is persisted,
+            // and on Command Code an unpersisted ledger becomes real money.
+            tracing::error!("store writer is gone; dropping request record");
         }
     }
 
     pub fn record_attempt(&self, a: AttemptRecord) {
         if self.tx.send(WriteMsg::Attempt(Box::new(a))).is_err() {
-            tracing::warn!("store writer is gone; dropping attempt record");
+            tracing::error!("store writer is gone; dropping attempt record");
         }
     }
 
@@ -353,33 +400,67 @@ impl StoreHandle {
             .send(WriteMsg::Accounts(accounts.to_vec()))
             .is_err()
         {
-            tracing::warn!("store writer is gone; dropping account ledger snapshot");
+            tracing::error!("store writer is gone; dropping account ledger snapshot");
+        }
+    }
+
+    /// Persist ONE account without disturbing any other account's rows.
+    ///
+    /// This is what a targeted operation such as "accounts disable" must use: a
+    /// full-pool snapshot taken from configuration carries no gates, and saving
+    /// it deletes the gates of every account it covers.
+    pub fn save_account(&self, account: &Account) {
+        if self
+            .tx
+            .send(WriteMsg::Account(Box::new(account.clone())))
+            .is_err()
+        {
+            tracing::error!("store writer is gone; dropping account update");
         }
     }
 
     /// Persist learned prices. Sent after every probe that learned something.
     pub fn save_prices(&self, prices: Vec<crate::meter::PersistedPrice>) {
         if self.tx.send(WriteMsg::Prices(prices)).is_err() {
-            tracing::warn!("store writer is gone; dropping learned prices");
+            tracing::error!("store writer is gone; dropping learned prices");
         }
     }
 
-    /// Block until everything queued so far is committed. Used on shutdown and
-    /// by tests; not meant to run on the request path.
+    /// Block until everything queued so far is committed.
+    ///
+    /// Reports the writes that FAILED, not just the ones that were queued: a
+    /// shutdown that silently swallows a commit failure claims the ledger is on
+    /// disk when it is not, and the next start then re-spends quota that was
+    /// already consumed.
     pub fn flush_blocking(&self) -> Result<()> {
+        let before = self.failures.load(std::sync::atomic::Ordering::SeqCst);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.tx
             .send(WriteMsg::Flush(ack_tx))
             .map_err(|_| anyhow::anyhow!("store writer is gone"))?;
-        ack_rx
+        let first_error = ack_rx
             .recv()
             .map_err(|_| anyhow::anyhow!("store writer dropped the flush acknowledgement"))?;
+        if let Err(e) = first_error {
+            anyhow::bail!("a queued write failed to commit: {e}");
+        }
+        let after = self.failures.load(std::sync::atomic::Ordering::SeqCst);
+        if after > before {
+            anyhow::bail!(
+                "{} write(s) failed to commit since the last flush",
+                after - before
+            );
+        }
         Ok(())
     }
 }
 
 /// Drain the channel, committing messages in batches.
-fn writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<WriteMsg>) {
+fn writer_loop(
+    mut conn: Connection,
+    mut rx: UnboundedReceiver<WriteMsg>,
+    failures: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
     loop {
         let Some(first) = rx.blocking_recv() else {
             break;
@@ -396,7 +477,7 @@ fn writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<WriteMsg>) {
                 }
             }
         }
-        apply_batch(&mut conn, batch);
+        apply_batch(&mut conn, batch, &failures);
         if disconnected {
             break;
         }
@@ -408,28 +489,43 @@ fn writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<WriteMsg>) {
     }
 }
 
-/// Commit one batch. Individual failures are logged and skipped; a flush
-/// acknowledgement is always sent so flush_blocking cannot hang.
-fn apply_batch(conn: &mut Connection, batch: Vec<WriteMsg>) {
-    let mut flushes: Vec<std::sync::mpsc::Sender<()>> = Vec::new();
+/// Commit one batch.
+///
+/// Every failure is an ERROR and is counted, then reported through the next
+/// flush acknowledgement so a shutdown cannot claim success over a broken
+/// write. The acknowledgement is still always sent, so flush_blocking cannot
+/// hang on a database that has stopped working.
+fn apply_batch(
+    conn: &mut Connection,
+    batch: Vec<WriteMsg>,
+    failures: &std::sync::atomic::AtomicU64,
+) {
+    type Ack = std::sync::mpsc::Sender<std::result::Result<(), String>>;
+    let mut flushes: Vec<Ack> = Vec::new();
     let tx = match conn.transaction() {
         Ok(tx) => tx,
         Err(e) => {
-            tracing::warn!(error = %e, "store: could not begin a write transaction");
+            let message = format!("could not begin a write transaction: {e}");
+            tracing::error!("store: {message}");
+            failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for msg in &batch {
                 if let WriteMsg::Flush(ack) = msg {
-                    let _ = ack.send(());
+                    let _ = ack.send(Err(message.clone()));
                 }
             }
             return;
         }
     };
 
+    let mut first_error: Option<String> = None;
     for msg in &batch {
         let outcome = match msg {
             WriteMsg::Request(r) => insert_request(&tx, r),
             WriteMsg::Attempt(a) => insert_attempt(&tx, a),
             WriteMsg::Accounts(accounts) => save_accounts_tx(&tx, accounts),
+            WriteMsg::Account(account) => {
+                save_accounts_tx(&tx, std::slice::from_ref(account.as_ref()))
+            }
             WriteMsg::Prices(prices) => save_prices_tx(&tx, prices),
             WriteMsg::Flush(ack) => {
                 flushes.push(ack.clone());
@@ -437,15 +533,28 @@ fn apply_batch(conn: &mut Connection, batch: Vec<WriteMsg>) {
             }
         };
         if let Err(e) = outcome {
-            tracing::warn!(error = %e, "store: dropping a failed write");
+            // A dropped write is not cosmetic: the ledger is exactly what stops
+            // the next restart from re-spending quota it already consumed.
+            tracing::error!(error = %e, "store: a write failed and was dropped");
+            failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if first_error.is_none() {
+                first_error = Some(format!("{e:#}"));
+            }
         }
     }
 
     if let Err(e) = tx.commit() {
-        tracing::warn!(error = %e, "store: write transaction commit failed");
+        tracing::error!(error = %e, "store: write transaction commit failed");
+        failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if first_error.is_none() {
+            first_error = Some(format!("commit failed: {e}"));
+        }
     }
     for ack in flushes {
-        let _ = ack.send(());
+        let _ = ack.send(match &first_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        });
     }
 }
 
@@ -1781,5 +1890,93 @@ mod tests {
         assert_eq!(rows[0].request_id, "req-1");
         let usage = usage_rows(&conn, ts(0), GroupBy::Provider).expect("usage");
         assert_eq!(usage[0].cost, dec("0.25"));
+    }
+
+    /// Disabling one account must not erase the others' quota readings.
+    ///
+    /// "accounts disable X" saved a full pool snapshot built from configuration.
+    /// Those accounts carry no gates and state Unknown, so the upsert deleted
+    /// the gate rows of EVERY account it covered and reset their state -- one
+    /// account's problem wiped hours of probing for all of them, and the command
+    /// only printed the one it had been asked about.
+    #[test]
+    fn saving_one_account_leaves_another_accounts_gates_alone() {
+        let tmp = TempDb::new("single_account_save");
+        let handle = StoreHandle::spawn(&tmp.path).expect("spawn writer");
+        let mut both = Vec::new();
+        for id in ["acct-1", "acct-2"] {
+            let mut a = account(id);
+            a.state = AccountState::Active;
+            both.push(a);
+        }
+        handle.save_accounts(&both);
+        handle.flush_blocking().expect("flush");
+
+        let mut target = account("acct-1");
+        target.state = AccountState::Disabled;
+        target.available_at = None;
+        target.last_error = Some("disabled by operator".to_string());
+        handle.save_account(&target);
+        handle.flush_blocking().expect("flush");
+
+        let conn = open(&tmp.path).expect("reopen");
+        let loaded = load_accounts(&conn).expect("load_accounts");
+        let other = loaded
+            .iter()
+            .find(|a| a.account_id == "acct-2")
+            .expect("the untouched account is still there");
+        assert_eq!(
+            other.gates.len(),
+            2,
+            "the other account's readings must survive a targeted update"
+        );
+        assert_eq!(other.state, AccountState::Active);
+        let disabled = loaded
+            .iter()
+            .find(|a| a.account_id == "acct-1")
+            .expect("acct-1");
+        assert_eq!(disabled.state, AccountState::Disabled);
+    }
+
+    /// Old attempt telemetry goes; reported history does not move.
+    ///
+    /// Nothing ever deleted anything, so the ledger grew for the life of the
+    /// machine. Request rows are deliberately kept: "ai-gw usage" reads them
+    /// directly, so trimming them would shrink a 90-day report without saying so.
+    #[test]
+    fn pruning_drops_old_attempts_and_leaves_reported_history_intact() {
+        let tmp = TempDb::new("prune");
+        let now = OffsetDateTime::now_utc();
+        let long_ago = (now - time::Duration::days(60)).unix_timestamp();
+        let recent = now.unix_timestamp();
+        {
+            let mut conn = open(&tmp.path).expect("open");
+            insert_req(
+                &mut conn,
+                &request("old", long_ago, "xkiro", "a1", "m1", "0.25"),
+            );
+            insert_req(
+                &mut conn,
+                &request("new", recent, "xkiro", "a1", "m1", "0.50"),
+            );
+        }
+
+        let conn = open(&tmp.path).expect("reopen");
+        prune_detail(&conn, now).expect("prune");
+
+        let requests: i64 = conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
+            .expect("count requests");
+        assert_eq!(
+            requests, 2,
+            "request detail is what usage reports are built from"
+        );
+
+        let usage = usage_rows(&conn, ts(0), GroupBy::Provider).expect("usage");
+        assert_eq!(
+            usage[0].cost,
+            dec("0.75"),
+            "and the reported total is unchanged by pruning"
+        );
     }
 }

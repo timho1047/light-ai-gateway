@@ -11,6 +11,11 @@
 //! Rules every adapter must follow:
 //!   - Treat upstream JSON as UNTRUSTED: parse defensively, tolerate missing
 //!     and unknown fields, and never panic on an unexpected shape.
+//!   - Arithmetic on provider-supplied amounts goes through the saturating
+//!     helpers in this module. rust_decimal's `+` and `-` panic on overflow, and
+//!     an overflow is only ever one hostile or broken payload away: a window
+//!     with cap_usd "-7e28" and remaining_usd "7e28" is enough to take down the
+//!     task that owns the probe.
 //!   - Money arrives as fixed-point STRINGS from xKiro. Parse with
 //!     crate::domain::parse_money, never through f64.
 //!   - A failed probe returns Err. The caller carries the previous reading
@@ -252,12 +257,38 @@ async fn read_capped(
 
 /// Money from a JSON scalar: fixed-point string first, JSON number otherwise.
 /// Never routed through f64.
+///
+/// A bare JSON number is re-serialised to its own text form and then parsed as
+/// a Decimal. Going through `as_f64` + `Decimal::from_f64` instead would keep
+/// the whole binary double: the recorded balance 0.1 would come back as
+/// 0.1000000000000000055511151231257827, and an integer such as
+/// 12345678901234567890 would silently become 12345678901234567168. The text
+/// form is the shortest representation that round-trips the f64 serde_json
+/// already parsed into, so it is the best this adapter can do without the
+/// arbitrary_precision feature; `json_money_keeps_a_bare_json_number_exact`
+/// pins that down.
 pub(crate) fn json_money(value: &serde_json::Value) -> Option<Decimal> {
     match value {
         serde_json::Value::String(s) => crate::domain::parse_money(s),
         serde_json::Value::Number(n) => crate::domain::parse_money(&n.to_string()),
         _ => None,
     }
+}
+
+/// Addition that saturates instead of panicking.
+///
+/// meter.rs keeps the same pair (sat_add/sat_mul) for the pricing path, but
+/// keeps them private, and a shared home would make the quota adapters depend
+/// on the pricing module. Saturation points at Decimal::MAX, which is the
+/// conservative direction here: an amount is never made to look smaller than it
+/// is.
+pub(crate) fn sat_add(a: Decimal, b: Decimal) -> Decimal {
+    a.checked_add(b).unwrap_or(Decimal::MAX)
+}
+
+/// Subtraction that saturates instead of panicking (Decimal::MIN side).
+pub(crate) fn sat_sub(a: Decimal, b: Decimal) -> Decimal {
+    a.checked_sub(b).unwrap_or(Decimal::MIN)
 }
 
 /// A non-negative integer from a JSON scalar (counts, seconds, token limits).
@@ -469,6 +500,76 @@ pub(crate) mod testutil {
         }
     }
 
+    /// Serialises the tests that capture log output.
+    ///
+    /// They all share one process-wide subscriber and one buffer, so they must
+    /// not run at the same time as each other.
+    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run a future with WARN-and-above events captured as log lines.
+    ///
+    /// Some of an adapter's degraded paths are only visible in the log -- a
+    /// monthly gate that silently disappears, a window dropped because its
+    /// window_sec is unknown -- so for those the log line IS the behaviour under
+    /// test.
+    ///
+    /// The subscriber is GLOBAL, not thread-local. Installing one with
+    /// set_default looked right because the tests drive a current-thread runtime,
+    /// but under a full parallel run the warning intermittently landed in a
+    /// buffer nobody was reading and the test failed roughly one run in ten.
+    /// One subscriber plus a lock is deterministic.
+    // Holding the lock across the await IS the mechanism: the whole point is
+    // that two of these tests must not interleave their log capture.
+    #[allow(clippy::await_holding_lock)]
+    pub async fn capture_warnings<Fut: std::future::Future>(
+        fut: Fut,
+    ) -> (Vec<String>, Fut::Output) {
+        use std::io::Write;
+
+        /// Appends into a buffer the test can still read after the subscriber
+        /// is dropped.
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Process-wide, because the events are.
+        static BUFFER: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+
+        let buffer = BUFFER
+            .get_or_init(|| {
+                let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+                let writer = SharedWriter(Arc::clone(&buffer));
+                let subscriber = tracing_subscriber::fmt()
+                    .with_writer(move || SharedWriter(Arc::clone(&writer.0)))
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .without_time()
+                    .finish();
+                // Only the first caller installs it; every later one writes into
+                // the same buffer, which is what makes the capture independent of
+                // whichever thread happens to emit the event.
+                let _ = tracing::subscriber::set_global_default(subscriber);
+                buffer
+            })
+            .clone();
+
+        let _serialised = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        buffer.lock().expect("log buffer").clear();
+
+        let output = fut.await;
+
+        let text =
+            String::from_utf8(buffer.lock().expect("log buffer").clone()).unwrap_or_default();
+        (text.lines().map(str::to_string).collect(), output)
+    }
+
     /// A client that behaves like the gateway's shared client: redirects are
     /// never followed, so credentials cannot leave the pinned host.
     pub fn strict_client() -> reqwest::Client {
@@ -556,6 +657,45 @@ mod tests {
                 probe_for(QuotaAdapter::Deepseek, base).expect("deepseek adapter"),
             ),
         ]
+    }
+
+    /// A JSON number must reach Decimal through its own text form. `as_f64`
+    /// would keep the whole binary double (0.1 would become
+    /// 0.1000000000000000055511151231257827) and would blunt a 20-digit integer
+    /// balance to 12345678901234567168.
+    #[test]
+    fn json_money_keeps_a_bare_json_number_exact() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(r#"{"tiny": 0.1, "big": 12345678901234567890, "amount": 12.5}"#)
+                .expect("valid JSON fixture");
+
+        assert_eq!(
+            json_money(&parsed["tiny"]),
+            crate::domain::parse_money("0.1")
+        );
+        assert_eq!(
+            json_money(&parsed["big"]),
+            crate::domain::parse_money("12345678901234567890")
+        );
+        assert_eq!(
+            json_money(&parsed["amount"]),
+            crate::domain::parse_money("12.5")
+        );
+        assert_eq!(json_money(&serde_json::json!(null)), None);
+        assert_eq!(json_money(&serde_json::json!(true)), None);
+    }
+
+    /// Provider amounts are untrusted, and rust_decimal's own operators panic on
+    /// overflow. Every adapter amount therefore goes through these two helpers,
+    /// which saturate at the far end of the range instead.
+    #[test]
+    fn saturating_helpers_stop_an_overflowing_amount_from_panicking() {
+        let huge = crate::domain::parse_money("7e28").expect("a huge amount must parse");
+        let negative = crate::domain::parse_money("-7e28").expect("a huge amount must parse");
+
+        assert_eq!(sat_add(huge, huge), Decimal::MAX);
+        assert_eq!(sat_sub(negative, huge), Decimal::MIN);
+        assert_eq!(sat_add(Decimal::ONE, Decimal::ONE), Decimal::from(2));
     }
 
     #[test]

@@ -94,7 +94,7 @@ pub struct Gateway {
 
 impl Gateway {
     pub async fn new(config: Config) -> Result<Arc<Self>> {
-        Self::with_credentials(config, crate::secrets::CredentialStore::keychain()).await
+        Self::with_credentials(config, crate::secrets::CredentialStore::from_env()).await
     }
 
     /// Build a gateway against an explicit credential store.
@@ -248,6 +248,7 @@ impl Gateway {
         est_cost: Decimal,
         request_id: &str,
         attempt_no: u32,
+        exclude: &[String],
     ) -> Result<(ResolvedRoute, AttemptPlan), PlanError> {
         let route = self
             .config
@@ -260,6 +261,7 @@ impl Gateway {
             est_cost,
             request_id,
             attempt_no,
+            exclude,
         )?;
         // Fix the price tier now, from the time the request starts. Deciding it
         // later would let a request that began in one window be billed against
@@ -313,11 +315,6 @@ impl Gateway {
         crate::meter::conservative_estimate(&usage, multiplier)
     }
 
-    /// Commit the estimated cost before the upstream call.
-    pub fn reserve(&self, plan: &AttemptPlan, est_cost: Decimal) {
-        self.pool.reserve(plan, est_cost);
-    }
-
     /// Record a completed attempt that succeeded.
     pub fn record_success(
         &self,
@@ -360,6 +357,13 @@ impl Gateway {
     }
 
     fn accumulate_usage(&self, provider: &str, model: &str, tier: u32, usage: &TokenUsage) {
+        // Only real measurements feed the price table. An estimate built from
+        // "characters divided by four" is not a token count, and dividing a real
+        // spend delta by it produces a rate that is neither observed nor
+        // configured -- it then sizes the hard gate for every later request.
+        if !usage.measured {
+            return;
+        }
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
@@ -438,6 +442,11 @@ impl Gateway {
                     plan = ?outcome.plan,
                     "quota probe ok"
                 );
+                self.warn_on_ledger_drift(
+                    &account.qualified(),
+                    &outcome.gates,
+                    self.config.policy.drift_threshold,
+                );
                 self.pool
                     .apply_probe(&account.qualified(), outcome.gates, now());
                 self.save_accounts();
@@ -449,6 +458,52 @@ impl Gateway {
                 tracing::warn!(provider, account = %account.id, error = %e, "quota probe failed");
                 self.pool.mark_stale(&account.qualified(), &e.message);
                 self.save_accounts();
+            }
+        }
+    }
+
+    /// Report a probe whose reading disagrees with the local ledger by more
+    /// than policy.drift_threshold.
+    ///
+    /// This is the only reason the ledger can drift at all: the gateway sees
+    /// every request it serves, so between probes its own accounting should
+    /// track the provider's. A large gap means either the account is being used
+    /// by something other than this gateway -- which the learned-price scheme
+    /// cannot tolerate, because it would attribute that spend to these tokens --
+    /// or a write was lost. The correction itself is the wholesale gate
+    /// replacement that follows; this makes it visible instead of silent.
+    fn warn_on_ledger_drift(&self, qualified: &str, fresh: &[crate::domain::Gate], threshold: f64) {
+        if threshold <= 0.0 {
+            return;
+        }
+        let Some(current) = self.pool.account(qualified) else {
+            return;
+        };
+        for gate in fresh {
+            let Some(previous) = current.gates.iter().find(|g| g.kind == gate.kind) else {
+                continue;
+            };
+            // Only the direction that threatens the gate is worth a warning:
+            // the provider believing MORE was spent than we recorded. The other
+            // direction is a window rolling over, which is normal, and warning
+            // about it fired on every reset.
+            if gate.used <= previous.used {
+                continue;
+            }
+            let scale = previous.used.abs().max(gate.used.abs());
+            if scale <= Decimal::ZERO {
+                continue;
+            }
+            let drift = (gate.used - previous.used) / scale;
+            if drift > Decimal::try_from(threshold).unwrap_or(Decimal::ZERO) {
+                tracing::warn!(
+                    account = qualified,
+                    gate = gate.kind.label(),
+                    local = %previous.used,
+                    provider = %gate.used,
+                    drift_pct = %(drift * Decimal::from(100)).round_dp(1),
+                    "the local ledger had drifted from the provider; the provider reading wins"
+                );
             }
         }
     }
