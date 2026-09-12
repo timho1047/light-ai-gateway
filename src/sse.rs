@@ -25,6 +25,8 @@ pub struct SseObservation {
     pub usage: Option<TokenUsage>,
     /// True when the stream signalled completion.
     pub done: bool,
+    /// True when this line carried an in-stream error frame.
+    pub error: bool,
 }
 
 /// Aggregate result for one streamed response.
@@ -33,6 +35,14 @@ pub struct SseResult {
     pub usage: TokenUsage,
     pub saw_done: bool,
     pub content_chunks: u64,
+    /// Set when the stream carried an error frame.
+    ///
+    /// Some providers answer with HTTP 200 and only report the failure inside
+    /// the stream, for example:
+    ///   data: {"error":{"message":"A server error occurred.","type":"server_error"}}
+    /// Relaying those bytes is correct, but recording them as a success is not:
+    /// it inflates request counts and hides a provider that is failing.
+    pub error: Option<String>,
 }
 
 /// Incremental SSE meter. Feed it raw lines exactly as received.
@@ -75,6 +85,16 @@ impl SseMeter {
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             return obs;
         };
+
+        // An error delivered inside the stream, after a 200. Recorded so the
+        // request is not counted as a success, while the bytes are still relayed
+        // to the client unchanged.
+        if let Some(err) = stream_error(&value) {
+            if self.inner.error.is_none() {
+                self.inner.error = Some(err);
+            }
+            obs.error = true;
+        }
 
         // Usage may arrive on any frame. The final OpenAI usage frame carries an
         // empty choices array, so nothing here indexes choices[0].
@@ -273,6 +293,19 @@ impl StreamMeter {
         }
         first
     }
+}
+
+/// A top-level error object carried inside an otherwise successful stream.
+///
+/// Returns a short, machine-readable description. The human message is
+/// deliberately not kept: providers reword it freely and it is not ours to
+/// interpret.
+fn stream_error(value: &Value) -> Option<String> {
+    let err = value.get("error")?;
+    let ty = err.get("type").and_then(Value::as_str);
+    let code = err.get("code").and_then(Value::as_str);
+    let label = code.or(ty).unwrap_or("error");
+    Some(label.chars().take(64).collect())
 }
 
 /// Ensure stream_options.include_usage is set. Returns true when it was added.
@@ -495,6 +528,26 @@ mod tests {
         let r = m.finish();
         assert_eq!(r.content_chunks, 2);
         assert_eq!(m.content_chars(), 11);
+    }
+
+    /// Regression, seen against a live provider: HTTP 200 with the failure
+    /// reported inside the stream. The bytes must still be relayed, but the
+    /// request must not be counted as a success.
+    #[test]
+    fn an_error_frame_inside_a_successful_stream_is_detected() {
+        let mut m = SseMeter::new();
+        let obs = m.feed_line(
+            r#"data: {"error":{"message":"A server error occurred.","type":"server_error","code":"internal_error"}}"#,
+        );
+        assert!(obs.error, "the error frame must be reported");
+        assert_eq!(m.finish().error.as_deref(), Some("internal_error"));
+
+        // A normal stream must not be marked as errored.
+        let mut ok = SseMeter::new();
+        ok.feed_line(r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#);
+        ok.feed_line("data: [DONE]");
+        assert_eq!(ok.finish().error, None);
+        assert!(ok.finish().saw_done);
     }
 
     #[test]

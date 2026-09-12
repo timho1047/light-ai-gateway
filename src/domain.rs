@@ -236,7 +236,23 @@ pub struct Account {
     pub last_error: Option<String>,
 }
 
+/// Canonical account identity.
+///
+/// An account id is unique only WITHIN a provider. Keying anything -- pool
+/// lookups, sticky sessions, database rows -- by the bare id silently merged
+/// two different accounts: with xkiro/acc-1 and commandcode/acc-1 configured,
+/// both quota probes wrote onto whichever sorted first, so one account showed
+/// the other's allowances. Provider and id are therefore always taken together.
+pub fn qualified_id(provider: &str, account_id: &str) -> String {
+    format!("{provider}/{account_id}")
+}
+
 impl Account {
+    /// This account's canonical identity: provider/id.
+    pub fn qualified(&self) -> String {
+        qualified_id(&self.provider, &self.id)
+    }
+
     /// Covered gates only.
     pub fn covered_gates(&self) -> impl Iterator<Item = &Gate> {
         self.gates.iter().filter(|g| g.class() == GateClass::Covered)

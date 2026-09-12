@@ -82,16 +82,23 @@ pub(crate) fn outcome_from_credits_body(
     let limits = object.get("windowLimits").and_then(Value::as_object);
     let mut gates = Vec::new();
 
-    // A top-level flag means the account is currently enforced, and the
-    // provider does not say which window is binding. Treat every window as
-    // spent: this is the only reading that reliably keeps the router off an
-    // account that would silently bill purchased credits.
-    let account_enforced = limits
-        .map(|l| json_truthy(l.get("limited").unwrap_or(&Value::Null))
-            || json_truthy(l.get("exceeded").unwrap_or(&Value::Null)))
-        .unwrap_or(false);
-
+    // The top-level windowLimits.limited flag is DESCRIPTIVE, not a verdict on
+    // any particular window: it reports that this account has rolling limits at
+    // all. Treating it as exhaustion was measured against a live account and is
+    // wrong -- that account returned limited=true while its five-hour window was
+    // 1.2% used (0.17 of 14) and its weekly 9.2% used (3.23 of 35), with
+    // exceeded=false on both. Coercing those to "spent" refused an account with
+    // 98% of its allowance free.
+    //
+    // The authoritative per-window signal is exceeded. Only that marks a window
+    // spent, and it is what stands between the router and an account that would
+    // silently bill purchased credits.
     if let Some(limits) = limits {
+        if json_truthy(limits.get("limited").unwrap_or(&Value::Null)) {
+            tracing::debug!(
+                "command-code reports windowLimits.limited=true; treating as descriptive,                  only a per-window exceeded flag marks a window spent"
+            );
+        }
         for (field, kind) in [
             ("fiveHour", GateKind::FiveHour),
             ("weekly", GateKind::Weekly),
@@ -99,10 +106,8 @@ pub(crate) fn outcome_from_credits_body(
             let Some(window) = limits.get(field).and_then(Value::as_object) else {
                 continue;
             };
-            let window_enforced = account_enforced
-                || json_truthy(window.get("limited").unwrap_or(&Value::Null))
-                || json_truthy(window.get("exceeded").unwrap_or(&Value::Null));
-            if let Some(g) = window_gate(kind, window, window_enforced) {
+            let window_exceeded = json_truthy(window.get("exceeded").unwrap_or(&Value::Null));
+            if let Some(g) = window_gate(kind, window, window_exceeded) {
                 gates.push(g);
             }
         }
@@ -152,15 +157,15 @@ pub(crate) fn outcome_from_credits_body(
     })
 }
 
-fn window_gate(kind: GateKind, window: &Map<String, Value>, enforced: bool) -> Option<Gate> {
+fn window_gate(kind: GateKind, window: &Map<String, Value>, exceeded: bool) -> Option<Gate> {
     let cap = window.get("cap").and_then(json_money)?;
     let used = window.get("used").and_then(json_money)?;
     let resets_at = window.get("resetAt").and_then(json_timestamp);
 
-    // An enforced window reads as spent. max() rather than assignment so a
-    // provider that already over-reports usage is not quietly clamped back to
-    // the cap.
-    let used = if enforced { used.max(cap) } else { used };
+    // A window the provider marks exceeded reads as spent. max() rather than
+    // assignment so a provider that already over-reports usage is not quietly
+    // clamped back to the cap.
+    let used = if exceeded { used.max(cap) } else { used };
 
     Some(gate(kind, cap, used, resets_at))
 }
@@ -387,10 +392,11 @@ mod tests {
         assert_eq!(monthly.class(), crate::domain::GateClass::Covered);
     }
 
-    /// Command Code does not error on exhaustion: the only warning is the
-    /// window flag, so a flagged window must read as spent.
+    /// Command Code does not error on exhaustion, so a window the provider marks
+    /// exceeded must read as spent -- that flag is what keeps the router off an
+    /// account that would silently bill purchased credits.
     #[test]
-    fn commandcode_window_flags_read_a_window_as_spent() {
+    fn commandcode_an_exceeded_window_reads_as_spent() {
         let per_window = r#"{
           "windowLimits": {
             "fiveHour": { "cap": 10, "used": 2, "resetAt": "2025-06-01T10:00:00Z", "exceeded": true },
@@ -401,35 +407,50 @@ mod tests {
         assert_eq!(
             gate_of(&outcome, GateKind::FiveHour).unwrap().used,
             parse_money("10").unwrap(),
-            "an enforced window reads as spent even though used < cap"
+            "an exceeded window reads as spent even though used < cap"
         );
         assert_eq!(
             gate_of(&outcome, GateKind::Weekly).unwrap().used,
             parse_money("20").unwrap(),
-            "an unflagged window keeps its reported usage"
+            "a window that is not exceeded keeps its reported usage"
         );
+    }
 
-        // A top-level flag marks every window: the provider does not say which
-        // one is binding, and under-reporting headroom spends real money.
-        let account_wide = r#"{
+    /// Regression, captured from a live Command Code account.
+    ///
+    /// The response reported windowLimits.limited = true while the five-hour
+    /// window was 1.2% used (0.168 of 14) and the weekly 9.2% used (3.23 of 35),
+    /// with exceeded = false on both. Treating that descriptive flag as
+    /// exhaustion marked both windows spent and refused an account with 98% of
+    /// its allowance free.
+    #[test]
+    fn commandcode_a_limited_account_that_is_not_exceeded_is_still_usable() {
+        let live = r#"{
+          "credits": { "belowThreshold": false, "creditThreshold": 0,
+                       "monthlyCredits": 66.768898525, "purchasedCredits": 0, "freeCredits": 0 },
           "windowLimits": {
-            "fiveHour": { "cap": 10, "used": 2 },
-            "weekly": { "cap": 100, "used": 20 },
-            "limited": 1
+            "limited": true,
+            "exceeded": null,
+            "fiveHour": { "used": 0.168821086, "cap": 14, "exceeded": false, "resetAt": 1789219615705 },
+            "weekly": { "used": 3.231101475, "cap": 35, "exceeded": false, "resetAt": 1789708155238 }
           }
         }"#;
-        let outcome = outcome_from_credits_body(account_wide, None, None).expect("must parse");
-        assert_eq!(
-            gate_of(&outcome, GateKind::FiveHour).unwrap().used,
-            parse_money("10").unwrap()
+        let outcome = outcome_from_credits_body(live, None, None).expect("must parse");
+
+        let five = gate_of(&outcome, GateKind::FiveHour).expect("five hour gate");
+        assert_eq!(five.cap, parse_money("14").unwrap());
+        assert_eq!(five.used, parse_money("0.168821086").unwrap());
+        assert!(
+            five.remaining() > parse_money("13").unwrap(),
+            "a limited-but-not-exceeded window must keep its headroom, got {}",
+            five.remaining()
         );
-        assert_eq!(
-            gate_of(&outcome, GateKind::Weekly).unwrap().used,
-            parse_money("100").unwrap()
-        );
-        assert_eq!(
-            gate_of(&outcome, GateKind::Weekly).unwrap().remaining(),
-            Decimal::ZERO
+
+        let weekly = gate_of(&outcome, GateKind::Weekly).expect("weekly gate");
+        assert!(
+            weekly.remaining() > parse_money("31").unwrap(),
+            "got {}",
+            weekly.remaining()
         );
     }
 

@@ -78,7 +78,8 @@ pub trait ProxyBackend: Send + Sync + 'static {
         attempt_no: u32,
     ) -> std::result::Result<AttemptPlan, PlanError>;
 
-    fn account(&self, account_id: &str) -> Option<Account>;
+    /// Look up an account by canonical provider/id identity.
+    fn account(&self, qualified_id: &str) -> Option<Account>;
 
     fn retry_after_for(&self, provider: &str) -> Option<Duration>;
 
@@ -158,8 +159,8 @@ impl ProxyBackend for GatewayBackend {
             .select(provider, "", None, est_cost, request_id, attempt_no)
     }
 
-    fn account(&self, account_id: &str) -> Option<Account> {
-        self.gateway.pool.account(account_id)
+    fn account(&self, qualified_id: &str) -> Option<Account> {
+        self.gateway.pool.account(qualified_id)
     }
 
     fn retry_after_for(&self, provider: &str) -> Option<Duration> {
@@ -405,7 +406,7 @@ async fn chat_completions(
         };
         last_plan = Some(plan.clone());
 
-        let Some(account) = state.backend.account(&plan.account_id) else {
+        let Some(account) = state.backend.account(&plan.qualified_account()) else {
             tracing::error!(account = %plan.account_id, "the planned account vanished from the pool");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -637,7 +638,7 @@ async fn chat_completions(
             // Every attempt failed. Record the request itself so failures show
             // up in history instead of existing only as orphaned attempt rows.
             if let Some(plan) = last_plan.as_ref()
-                && let Some(account) = state.backend.account(&plan.account_id) {
+                && let Some(account) = state.backend.account(&plan.qualified_account()) {
                     let total_ms = (now() - request_started).whole_milliseconds().max(0) as u64;
                     state.backend.record_failed_request(RequestRecord {
                         request_id: request_id.clone(),
@@ -718,7 +719,7 @@ async fn list_models(
         Ok(plan) => plan,
         Err(err) => return plan_error_response(&err, state.backend.as_ref()),
     };
-    let Some(account) = state.backend.account(&plan.account_id) else {
+    let Some(account) = state.backend.account(&plan.qualified_account()) else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -1018,6 +1019,15 @@ impl RelayStream {
             return;
         };
         let mut result = self.meter.finish();
+
+        // A stream that carried an error frame is a failure even though the
+        // HTTP status was 200 and the bytes were relayed intact. Recording it
+        // as a success inflates request counts and hides a failing provider.
+        let status = if result.error.is_some() {
+            RequestStatus::Error
+        } else {
+            status
+        };
 
         if !result.usage.measured {
             // The upstream never sent a usage frame. Estimate conservatively
@@ -1384,7 +1394,7 @@ mod tests {
         ) {
             self.pool.settle(plan, Decimal::ZERO, false);
             self.pool
-                .note_error(&plan.account_id, class, retry_after, window_reset);
+                .note_error(&plan.qualified_account(), class, retry_after, window_reset);
             self.failures.lock().unwrap().push(RecordedFailure {
                 account_id: plan.account_id.clone(),
                 class,
@@ -1421,14 +1431,16 @@ key = "sk-a2"
         Config::from_toml_str(&toml).unwrap()
     }
 
-    fn activate(pool: &Pool, id: &str, used: i64) {
+    /// Give an account a probed window. Takes the canonical provider/id, since
+    /// a bare id is ambiguous across providers.
+    fn activate(pool: &Pool, qualified_id: &str, used: i64) {
         let gates = vec![gate(
             GateKind::FiveHour,
             Decimal::from(100),
             Decimal::from(used),
             None,
         )];
-        pool.apply_probe(id, gates, now());
+        pool.apply_probe(qualified_id, gates, now());
     }
 
     fn fake_backend(base_url: &str) -> Arc<FakeBackend> {
@@ -1437,8 +1449,8 @@ key = "sk-a2"
             .build_accounts(&crate::secrets::CredentialStore::memory())
             .unwrap();
         let pool = Pool::new(accounts, &config.policy);
-        activate(&pool, "a1", 1);
-        activate(&pool, "a2", 0);
+        activate(&pool, "mock/a1", 1);
+        activate(&pool, "mock/a2", 0);
         Arc::new(FakeBackend::new(config, pool))
     }
 
@@ -1588,13 +1600,13 @@ key = "sk-a2"
         let longest = now() + time::Duration::seconds(300);
         let earliest = now() + time::Duration::seconds(120);
         fake.pool.note_error(
-            "a1",
+            "mock/a1",
             UpstreamErrorClass::QuotaExhausted,
             None,
             Some(earliest),
         );
         fake.pool.note_error(
-            "a2",
+            "mock/a2",
             UpstreamErrorClass::QuotaExhausted,
             None,
             Some(longest),
@@ -1653,8 +1665,8 @@ key = "sk-a2"
             .build_accounts(&crate::secrets::CredentialStore::memory())
             .unwrap();
         let pool = Pool::new(accounts, &config.policy);
-        activate(&pool, "a1", 1);
-        activate(&pool, "a2", 0);
+        activate(&pool, "mock/a1", 1);
+        activate(&pool, "mock/a2", 0);
         let fake = Arc::new(FakeBackend::new(config, pool));
         let addr = spawn_router(build_router_with(fake)).await;
         let client = reqwest::Client::new();

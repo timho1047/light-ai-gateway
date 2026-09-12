@@ -160,9 +160,15 @@ pub(crate) async fn get_body(
         ));
     }
     if !(200..300).contains(&status) {
-        // Machine-readable code only, truncated and redacted: the human message
-        // is reworded freely by providers and may echo the credential.
-        let mut detail = format!("{label}: HTTP {status}");
+        // Name the URL that actually failed. Without it a 404 from a probe base
+        // that accidentally kept its /v1 segment reads as "HTTP 404" with no clue
+        // which path was wrong, which is exactly how a real misconfiguration was
+        // mistaken for a bad credential. The URL is safe to print: the key
+        // travels in a header, and only scheme/host/path are included.
+        //
+        // The body contributes a machine-readable code only, truncated: the human
+        // message is reworded freely by providers and may echo the credential.
+        let mut detail = format!("{label}: HTTP {status} at {}", safe_url(&parsed));
         if let Ok(body) = read_capped(response, key, label).await {
             let (ty, code) = crate::error::parse_error_body(&body);
             if let Some(code) = code.or(ty) {
@@ -174,6 +180,20 @@ pub(crate) async fn get_body(
     }
 
     read_capped(response, key, label).await
+}
+
+/// A URL fit for an error message: scheme, host and path only.
+///
+/// The query string and any userinfo are deliberately dropped. They are the only
+/// parts that can carry a credential, and a diagnostic that leaks one is worse
+/// than a diagnostic that is vague.
+pub(crate) fn safe_url(url: &reqwest::Url) -> String {
+    let mut out = format!("{}://{}", url.scheme(), url.host_str().unwrap_or("?"));
+    if let Some(port) = url.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    out.push_str(url.path());
+    out
 }
 
 /// GET a pinned endpoint and parse the body as JSON.

@@ -889,15 +889,19 @@ fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
     // API; an account that can never be billed again is exactly the Disabled
     // state that insufficient credit produces, so it is used here and the
     // reason is rewritten to say what really happened.
+    // Target the canonical identity: the same account id can exist under
+    // several providers, and disabling the wrong one would silently take a
+    // healthy account out of the pool.
+    let qualified = crate::domain::qualified_id(&provider, account_id);
     pool.note_error(
-        account_id,
+        &qualified,
         UpstreamErrorClass::InsufficientCredit,
         None,
         None,
     );
     let mut snapshot = pool.snapshot();
-    let Some(account) = snapshot.iter_mut().find(|a| a.id == account_id) else {
-        bail!("account {account_id:?} disappeared while disabling it");
+    let Some(account) = snapshot.iter_mut().find(|a| a.qualified() == qualified) else {
+        bail!("account {qualified} disappeared while disabling it");
     };
     account.last_error = Some("disabled by operator (ai-gw accounts disable)".to_string());
 
@@ -1013,6 +1017,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
         targets.insert(provider, (adapter, base));
     }
 
+    // Doctor is deliberately strict: it exists to report problems.
     match config.build_accounts(&creds) {
         Err(e) => {
             println!("  skipped: {e:#}");
@@ -1250,7 +1255,7 @@ async fn cmd_keys_test(
         .resolve(creds, provider, account)
         .with_context(|| format!("resolving the credential for {provider}/{account}"))?;
 
-    let Some(probe) = crate::quota::probe_for(p.adapter, p.probe_base_url.as_deref().unwrap_or(&p.base_url)) else {
+    let Some(probe) = crate::quota::probe_for(p.adapter, &p.probe_base()) else {
         println!("{provider}/{account}: credential found ({} chars), but this provider has no quota probe to test against",
             key.expose().len());
         return Ok(());

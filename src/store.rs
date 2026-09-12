@@ -60,9 +60,12 @@ const WRITE_BATCH_MAX: usize = 256;
 /// Schema DDL. Every statement is IF NOT EXISTS, so init_schema is idempotent
 /// and safe to run against a database created by an older build.
 const SCHEMA: &str = r#"
+-- Account identity is (provider, id), never id alone. Two providers may both
+-- have an account called "acc-1"; keying on the bare id silently merged them,
+-- so one account's quota reading landed on the other.
 CREATE TABLE IF NOT EXISTS accounts (
-    id                TEXT PRIMARY KEY,
     provider          TEXT    NOT NULL,
+    id                TEXT    NOT NULL,
     label             TEXT    NOT NULL,
     base_url          TEXT    NOT NULL,
     currency          TEXT    NOT NULL,
@@ -74,10 +77,12 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_probe_at     INTEGER,
     rpm_limit         INTEGER,
     concurrency_limit INTEGER,
-    updated_at        INTEGER NOT NULL
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (provider, id)
 );
 
 CREATE TABLE IF NOT EXISTS gates (
+    provider   TEXT    NOT NULL,
     account_id TEXT    NOT NULL,
     kind       TEXT    NOT NULL,
     cap        TEXT    NOT NULL,
@@ -87,7 +92,7 @@ CREATE TABLE IF NOT EXISTS gates (
     source     TEXT    NOT NULL,
     checked_at INTEGER NOT NULL,
     stale      INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (account_id, kind)
+    PRIMARY KEY (provider, account_id, kind)
 );
 
 CREATE TABLE IF NOT EXISTS requests (
@@ -153,9 +158,66 @@ CREATE INDEX IF NOT EXISTS idx_usage_daily_day   ON usage_daily(day);
 "#;
 
 /// Apply the schema. Safe to call repeatedly.
+/// Bumped whenever a change cannot be applied to existing rows in place.
+///
+/// 1 -> 2: account identity changed from id alone to (provider, id). Rows
+/// written under the old key cannot be attributed to a provider, so the account
+/// and gate tables are rebuilt rather than guessed at. Usage history already
+/// carried provider and is preserved.
+pub const SCHEMA_VERSION: i64 = 2;
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        [],
+    )?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.and_then(|s| s.parse().ok()).unwrap_or(0))
+}
+
+fn set_schema_version(conn: &Connection, version: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![version.to_string()],
+    )?;
+    Ok(())
+}
+
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    let existing_accounts: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'accounts'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    let version = schema_version(conn)?;
+
+    if existing_accounts && version < SCHEMA_VERSION {
+        // Accounts written before version 2 were keyed by the bare account id,
+        // so two providers sharing an id are indistinguishable in them and the
+        // rows cannot be attributed with certainty. Rebuild rather than guess:
+        // a wrong attribution would show one account's quota on another.
+        tracing::warn!(
+            from = version,
+            to = SCHEMA_VERSION,
+            "store: account identity changed to (provider, id); rebuilding the              account and quota tables. Usage history is preserved."
+        );
+        conn.execute_batch("DROP TABLE IF EXISTS gates; DROP TABLE IF EXISTS accounts;")
+            .context("dropping pre-v2 account tables")?;
+    }
+
     conn.execute_batch(SCHEMA)
         .context("applying store schema")?;
+    set_schema_version(conn, SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -470,8 +532,7 @@ fn save_accounts_tx(tx: &Transaction<'_>, accounts: &[Account]) -> Result<()> {
                  available_at, window_started_at, last_error, last_probe_at, rpm_limit,
                  concurrency_limit, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(id) DO UPDATE SET
-                 provider          = excluded.provider,
+             ON CONFLICT(provider, id) DO UPDATE SET
                  label             = excluded.label,
                  base_url          = excluded.base_url,
                  currency          = excluded.currency,
@@ -504,13 +565,17 @@ fn save_accounts_tx(tx: &Transaction<'_>, accounts: &[Account]) -> Result<()> {
 
         // Gates are a set keyed by kind: replace wholesale so a gate that
         // disappeared upstream cannot linger forever.
-        tx.execute("DELETE FROM gates WHERE account_id = ?1", params![a.id])?;
+        tx.execute(
+            "DELETE FROM gates WHERE provider = ?1 AND account_id = ?2",
+            params![a.provider, a.id],
+        )?;
         for g in &a.gates {
             tx.execute(
                 "INSERT OR REPLACE INTO gates (
-                     account_id, kind, cap, used, resets_at, confidence, source, checked_at, stale
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     provider, account_id, kind, cap, used, resets_at, confidence, source, checked_at, stale
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
+                    a.provider,
                     a.id,
                     gate_kind_str(g.kind),
                     dec_str(g.cap),
@@ -563,7 +628,7 @@ pub fn load_accounts(conn: &Connection) -> Result<Vec<AccountOverview>> {
     let mut out = Vec::with_capacity(rows.len());
     for (id, provider, label, currency, state, available_at, window_started_at, last_error) in rows
     {
-        let gates = load_gates(conn, &id)?;
+        let gates = load_gates(conn, &provider, &id)?;
         let state = parse_state(&state).unwrap_or_else(|| {
             // Never guess Active: an unreadable state must not serve traffic.
             tracing::warn!(state = %state, account = %id, "store: unknown account state; using Unknown");
@@ -584,13 +649,13 @@ pub fn load_accounts(conn: &Connection) -> Result<Vec<AccountOverview>> {
     Ok(out)
 }
 
-fn load_gates(conn: &Connection, account_id: &str) -> Result<Vec<Gate>> {
+fn load_gates(conn: &Connection, provider: &str, account_id: &str) -> Result<Vec<Gate>> {
     let rows = {
         let mut stmt = conn.prepare(
             "SELECT kind, cap, used, resets_at, confidence, source, checked_at, stale
-             FROM gates WHERE account_id = ?1 ORDER BY kind",
+             FROM gates WHERE provider = ?1 AND account_id = ?2 ORDER BY kind",
         )?;
-        let mapped = stmt.query_map(params![account_id], |row| {
+        let mapped = stmt.query_map(params![provider, account_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 dec_at(row, 1)?,
@@ -608,7 +673,7 @@ fn load_gates(conn: &Connection, account_id: &str) -> Result<Vec<Gate>> {
     let mut gates = Vec::with_capacity(rows.len());
     for (kind, cap, used, resets_at, confidence, source, checked_at, stale) in rows {
         let Some(kind) = parse_gate_kind(&kind) else {
-            tracing::warn!(account = %account_id, kind = %kind, "store: unknown gate kind; skipping row");
+            tracing::warn!(provider = %provider, account = %account_id, kind = %kind, "store: unknown gate kind; skipping row");
             continue;
         };
         gates.push(Gate {
@@ -1049,6 +1114,16 @@ mod tests {
     }
 
     #[test]
+    fn schema_records_its_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+        // Idempotent: a second call must not rebuild anything.
+        init_schema(&conn).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
     fn schema_creation_is_idempotent() {
         let conn = mem();
         init_schema(&conn).expect("second init must succeed");
@@ -1087,6 +1162,46 @@ mod tests {
             db_exists(&tmp.path),
             "schema creation must leave a non-empty database file"
         );
+    }
+
+    /// Regression: the same account id under two providers.
+    ///
+    /// The tables were once keyed by account_id alone, so xkiro/acc-1 and
+    /// commandcode/acc-1 were one row and one set of gates: whichever was saved
+    /// last won, and the board showed one account's allowances on the other.
+    #[test]
+    fn accounts_with_the_same_id_under_different_providers_stay_separate() {
+        let tmp = TempDb::new("shared-id");
+        let handle = StoreHandle::spawn(&tmp.path).expect("spawn writer");
+
+        let mut xk = account("acc-1");
+        xk.provider = "xkiro".to_string();
+        xk.gates = vec![gate(GateKind::FiveHour, "200.0", "20.0", None)];
+
+        let mut cc = account("acc-1");
+        cc.provider = "commandcode".to_string();
+        cc.gates = vec![gate(GateKind::FiveHour, "14.0", "1.0", None)];
+
+        handle.save_accounts(&[xk, cc]);
+        handle.flush_blocking().expect("flush");
+
+        let conn = open(&tmp.path).expect("reopen");
+        let loaded = load_accounts(&conn).expect("load");
+        assert_eq!(loaded.len(), 2, "both accounts must survive, got {loaded:?}");
+
+        let xk_row = loaded.iter().find(|a| a.provider == "xkiro").unwrap();
+        assert_eq!(xk_row.gates.len(), 1);
+        assert_eq!(xk_row.gates[0].cap, dec("200.0"));
+        assert_eq!(xk_row.gates[0].used, dec("20.0"));
+
+        let cc_row = loaded.iter().find(|a| a.provider == "commandcode").unwrap();
+        assert_eq!(cc_row.gates.len(), 1, "gates must not be shared");
+        assert_eq!(
+            cc_row.gates[0].cap,
+            dec("14.0"),
+            "the other provider's gates overwrote this one"
+        );
+        assert_eq!(cc_row.gates[0].used, dec("1.0"));
     }
 
     #[test]

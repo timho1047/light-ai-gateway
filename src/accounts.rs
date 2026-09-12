@@ -91,6 +91,11 @@ impl AttemptPlan {
     pub fn sticky_key(&self) -> Option<&str> {
         self.session_key.as_deref()
     }
+
+    /// Canonical identity of the account this plan targets: provider/id.
+    pub fn qualified_account(&self) -> String {
+        crate::domain::qualified_id(&self.provider, &self.account_id)
+    }
 }
 
 /// Outcome of evaluating one account against the hard gate.
@@ -124,10 +129,21 @@ struct Inflight {
     count: u32,
 }
 
+/// Find an account by its canonical provider/id identity.
+///
+/// Never match on the bare id: it is unique only within a provider.
+fn find_mut<'a>(accounts: &'a mut [Account], qualified: &str) -> Option<&'a mut Account> {
+    accounts.iter_mut().find(|a| a.qualified() == qualified)
+}
+
+fn find<'a>(accounts: &'a [Account], qualified: &str) -> Option<&'a Account> {
+    accounts.iter().find(|a| a.qualified() == qualified)
+}
+
 struct PoolInner {
     accounts: Vec<Account>,
-    /// session key -> account id.
-    sticky: HashMap<String, AccountId>,
+    /// session key -> canonical provider/id of the bound account.
+    sticky: HashMap<String, String>,
     inflight: HashMap<AccountId, Inflight>,
     /// Recent completed request costs, used to size the safety reserve.
     recent_costs: std::collections::VecDeque<Decimal>,
@@ -321,7 +337,10 @@ impl Pool {
         self.reap(&mut inner, at);
 
         struct Cand {
+            /// Bare account id, as it appears in configuration.
             id: AccountId,
+            /// Canonical provider/id, used for sticky binding.
+            qualified: String,
             decision: GateDecision,
             util: f64,
             remaining: Decimal,
@@ -362,6 +381,7 @@ impl Pool {
                 GateDecision::Covered => {
                     covered_cands.push(Cand {
                         id: acct.id.clone(),
+                        qualified: acct.qualified(),
                         decision: GateDecision::Covered,
                         util: acct.peak_covered_utilization().unwrap_or(0.0),
                         remaining: acct.min_covered_remaining().unwrap_or(Decimal::MAX),
@@ -371,6 +391,7 @@ impl Pool {
                 GateDecision::Metered => {
                     metered_cands.push(Cand {
                         id: acct.id.clone(),
+                        qualified: acct.qualified(),
                         decision: GateDecision::Metered,
                         util: 0.0,
                         remaining: self.metered_headroom(acct).unwrap_or(Decimal::MAX),
@@ -385,18 +406,12 @@ impl Pool {
         // more than any utilisation ordering.
         if let Some(key) = session_key
             && let Some(bound) = inner.sticky.get(key) {
-                let usable = covered_cands
+                let bound_cand = covered_cands
                     .iter()
-                    .find(|c| &c.id == bound)
-                    .map(|c| c.decision)
-                    .or_else(|| {
-                        metered_cands
-                            .iter()
-                            .find(|c| &c.id == bound)
-                            .map(|c| c.decision)
-                    });
-                if let Some(decision) = usable {
-                    let coverage = match decision {
+                    .find(|c| &c.qualified == bound)
+                    .or_else(|| metered_cands.iter().find(|c| &c.qualified == bound));
+                if let Some(cand) = bound_cand {
+                    let coverage = match cand.decision {
                         GateDecision::Covered => GateClass::Covered,
                         GateDecision::Metered => GateClass::Metered,
                         GateDecision::Reject(_) => {
@@ -405,7 +420,7 @@ impl Pool {
                     };
                     return Ok(AttemptPlan {
                         request_id: request_id.to_string(),
-                        account_id: bound.clone(),
+                        account_id: cand.id.clone(),
                         provider: provider.to_string(),
                         model: model.to_string(),
                         session_key: session_key.map(str::to_string),
@@ -443,7 +458,7 @@ impl Pool {
             .filter(|c| !c.draining && c.util < self.soft_threshold)
             .collect();
 
-        let chosen_id = if let Some(first) = below.first() {
+        let chosen: &Cand = if let Some(first) = below.first() {
             // CONSUME-FIRST: the most utilised still-eligible account, so the
             // pool burns down one account at a time and switches rarely.
             below
@@ -454,8 +469,8 @@ impl Pool {
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then_with(|| b.remaining.cmp(&a.remaining))
                 })
-                .map(|c| c.id.clone())
-                .unwrap_or_else(|| first.id.clone())
+                .copied()
+                .unwrap_or(first)
         } else {
             // Every account is at or above the soft threshold. Rather than
             // refusing, fall back to the least-utilised one: switching at 80%
@@ -465,18 +480,22 @@ impl Pool {
                 a.util
                     .partial_cmp(&b.util)
                     .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.id.cmp(&b.id))
+                    .then_with(|| a.qualified.cmp(&b.qualified))
             });
-            pool[0].id.clone()
+            &pool[0]
         };
 
         if let Some(key) = session_key {
-            inner.sticky.insert(key.to_string(), chosen_id.clone());
+            // Sticky binds to the canonical identity, so two providers using the
+            // same account id can never bind to each other.
+            inner
+                .sticky
+                .insert(key.to_string(), chosen.qualified.clone());
         }
 
         Ok(AttemptPlan {
             request_id: request_id.to_string(),
-            account_id: chosen_id,
+            account_id: chosen.id.clone(),
             provider: provider.to_string(),
             model: model.to_string(),
             session_key: session_key.map(str::to_string),
@@ -488,16 +507,17 @@ impl Pool {
     /// Commit estimated cost against an account before the request goes out.
     pub fn reserve(&self, plan: &AttemptPlan, est_cost: Decimal) {
         let mut inner = self.inner.lock().unwrap();
+        let qualified = plan.qualified_account();
         let e = inner
             .inflight
-            .entry(plan.account_id.clone())
+            .entry(qualified.clone())
             .or_insert(Inflight {
                 committed: Decimal::ZERO,
                 count: 0,
             });
         e.committed += est_cost;
         e.count += 1;
-        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id)
+        if let Some(acct) = find_mut(&mut inner.accounts, &qualified)
             && acct.window_started_at.is_none() {
                 acct.window_started_at = Some(now());
             }
@@ -509,8 +529,9 @@ impl Pool {
     /// any work, so the gate must not be charged for it.
     pub fn settle(&self, plan: &AttemptPlan, actual_cost: Decimal, billed: bool) {
         let mut inner = self.inner.lock().unwrap();
+        let qualified = plan.qualified_account();
 
-        if let Some(e) = inner.inflight.get_mut(&plan.account_id) {
+        if let Some(e) = inner.inflight.get_mut(&qualified) {
             // Release the reservation; the real number replaces it below.
             if e.count > 0 {
                 e.count -= 1;
@@ -523,7 +544,7 @@ impl Pool {
             return;
         }
 
-        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id) {
+        if let Some(acct) = find_mut(&mut inner.accounts, &qualified) {
             // Charge covered windows first (they are the ones that expire),
             // then metered pools.
             let mut left = actual_cost;
@@ -565,7 +586,7 @@ impl Pool {
         // Crossing the soft threshold retires the account from NEW sessions.
         // Sticky sessions are deliberately left bound so they keep their cache.
         let soft = self.soft_threshold;
-        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == plan.account_id)
+        if let Some(acct) = find_mut(&mut inner.accounts, &qualified)
             && acct.state == AccountState::Active
                 && let Some(u) = acct.peak_covered_utilization()
                     && u >= soft {
@@ -579,10 +600,7 @@ impl Pool {
     /// next request of this session rebinds instead of failing.
     fn maybe_forget_sticky(&self, inner: &mut PoolInner, plan: &AttemptPlan) {
         if let Some(key) = plan.sticky_key() {
-            let unusable = inner
-                .accounts
-                .iter()
-                .find(|a| a.id == plan.account_id)
+            let unusable = find(&inner.accounts, &plan.qualified_account())
                 .map(|a| {
                     matches!(
                         a.state,
@@ -601,16 +619,17 @@ impl Pool {
     /// window_reset should come from a quota probe when one is available: on
     /// providers that reuse a single 429 code for pacing and exhaustion it is
     /// the only trustworthy signal.
+    /// qualified_id is the canonical provider/id, never a bare account id.
     pub fn note_error(
         &self,
-        account_id: &str,
+        qualified_id: &str,
         class: UpstreamErrorClass,
         retry_after: Option<Duration>,
         window_reset: Option<OffsetDateTime>,
     ) {
         let at = now();
         let mut inner = self.inner.lock().unwrap();
-        let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == account_id) else {
+        let Some(acct) = find_mut(&mut inner.accounts, qualified_id) else {
             return;
         };
 
@@ -653,11 +672,11 @@ impl Pool {
     }
 
     /// Apply fresh gate readings from a quota probe.
-    pub fn apply_probe(&self, account_id: &str, gates: Vec<Gate>, at: OffsetDateTime) {
+    pub fn apply_probe(&self, qualified_id: &str, gates: Vec<Gate>, at: OffsetDateTime) {
         let mut inner = self.inner.lock().unwrap();
         let allow_metered = self.allow_metered;
         let soft = self.soft_threshold;
-        let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == account_id) else {
+        let Some(acct) = find_mut(&mut inner.accounts, qualified_id) else {
             return;
         };
         if gates.is_empty() {
@@ -696,9 +715,9 @@ impl Pool {
     ///
     /// Carrying the reading forward is important. Writing zero on failure would
     /// both overstate availability and make the CLI claim an empty account.
-    pub fn mark_stale(&self, account_id: &str, reason: &str) {
+    pub fn mark_stale(&self, qualified_id: &str, reason: &str) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(acct) = inner.accounts.iter_mut().find(|a| a.id == account_id) {
+        if let Some(acct) = find_mut(&mut inner.accounts, qualified_id) {
             for g in acct.gates.iter_mut() {
                 g.stale = true;
             }
@@ -710,14 +729,10 @@ impl Pool {
         self.inner.lock().unwrap().accounts.clone()
     }
 
-    pub fn account(&self, id: &str) -> Option<Account> {
-        self.inner
-            .lock()
-            .unwrap()
-            .accounts
-            .iter()
-            .find(|a| a.id == id)
-            .cloned()
+    /// Look up by canonical provider/id identity.
+    pub fn account(&self, qualified_id: &str) -> Option<Account> {
+        let inner = self.inner.lock().unwrap();
+        find(&inner.accounts, qualified_id).cloned()
     }
 
     pub fn providers(&self) -> Vec<ProviderId> {
@@ -778,12 +793,12 @@ impl Pool {
     }
 
     /// Replace the sticky binding for a session, used when a switch happens.
-    pub fn rebind(&self, session_key: &str, account_id: &str) {
+    pub fn rebind(&self, session_key: &str, qualified_id: &str) {
         self.inner
             .lock()
             .unwrap()
             .sticky
-            .insert(session_key.to_string(), account_id.to_string());
+            .insert(session_key.to_string(), qualified_id.to_string());
     }
 
     /// Restore persisted accounts into the pool. Freshly restored accounts are
@@ -792,7 +807,8 @@ impl Pool {
     pub fn restore(&self, restored: Vec<crate::domain::AccountOverview>) {
         let mut inner = self.inner.lock().unwrap();
         for r in restored {
-            if let Some(a) = inner.accounts.iter_mut().find(|a| a.id == r.account_id) {
+            let qualified = crate::domain::qualified_id(&r.provider, &r.account_id);
+            if let Some(a) = find_mut(&mut inner.accounts, &qualified) {
                 a.gates = r.gates;
                 a.available_at = r.available_at;
                 a.window_started_at = r.window_started_at;
@@ -874,6 +890,89 @@ mod tests {
 
     fn policy() -> PolicyConfig {
         PolicyConfig::default()
+    }
+
+    /// Regression, found against a real configuration holding both
+    /// xkiro/acc-1 and commandcode/acc-1.
+    ///
+    /// Account ids are unique only within a provider. Keying pool state by the
+    /// bare id made both quota probes write onto whichever account sorted first,
+    /// so one account displayed the other's allowances and the other stayed
+    /// unprobed. Identity is (provider, id) everywhere for exactly this reason.
+    #[test]
+    fn two_providers_may_share_an_account_id_without_colliding() {
+        let p = Pool::new(
+            vec![
+                acct("acc-1", "xkiro", vec![cover(200, 20)], AccountState::Active),
+                acct(
+                    "acc-1",
+                    "commandcode",
+                    vec![cover(14, 1)],
+                    AccountState::Active,
+                ),
+            ],
+            &policy(),
+        );
+
+        // A probe for one provider must land only on that provider's account.
+        p.apply_probe(
+            "xkiro/acc-1",
+            vec![cover(200, 55)],
+            crate::domain::now(),
+        );
+        assert_eq!(p.account("xkiro/acc-1").unwrap().gates[0].used, Decimal::from(55));
+        assert_eq!(
+            p.account("commandcode/acc-1").unwrap().gates[0].used,
+            Decimal::from(1),
+            "the other provider's account must be untouched"
+        );
+
+        // Selection is scoped to the requested provider.
+        let xk = p.select("xkiro", "m", None, Decimal::ONE, "r", 1).unwrap();
+        assert_eq!(xk.account_id, "acc-1");
+        assert_eq!(xk.qualified_account(), "xkiro/acc-1");
+        let cc = p
+            .select("commandcode", "m", None, Decimal::ONE, "r", 1)
+            .unwrap();
+        assert_eq!(cc.qualified_account(), "commandcode/acc-1");
+
+        // An error on one must not park the other.
+        p.note_error(
+            "xkiro/acc-1",
+            UpstreamErrorClass::QuotaExhausted,
+            None,
+            None,
+        );
+        assert_eq!(p.account("xkiro/acc-1").unwrap().state, AccountState::Parked);
+        assert_eq!(
+            p.account("commandcode/acc-1").unwrap().state,
+            AccountState::Active
+        );
+    }
+
+    #[test]
+    fn a_sticky_session_is_bound_to_one_provider_account() {
+        let p = Pool::new(
+            vec![
+                acct("acc-1", "xkiro", vec![cover(200, 20)], AccountState::Active),
+                acct(
+                    "acc-1",
+                    "commandcode",
+                    vec![cover(14, 1)],
+                    AccountState::Active,
+                ),
+            ],
+            &policy(),
+        );
+        let first = p
+            .select("xkiro", "m", Some("sess"), Decimal::ONE, "r", 1)
+            .unwrap();
+        assert_eq!(first.qualified_account(), "xkiro/acc-1");
+        // Same session key, different provider: must not follow the binding.
+        let other = p
+            .select("commandcode", "m", Some("sess"), Decimal::ONE, "r", 1)
+            .unwrap();
+        assert_eq!(other.qualified_account(), "commandcode/acc-1");
     }
 
     #[test]
@@ -1045,7 +1144,7 @@ mod tests {
         let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
         p.reserve(&plan, Decimal::from(2));
         p.settle(&plan, Decimal::from(5), true);
-        let a = p.account("a").unwrap();
+        let a = p.account("p/a").unwrap();
         assert_eq!(a.gates[0].used, Decimal::from(5));
     }
 
@@ -1057,7 +1156,7 @@ mod tests {
         );
         let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
         p.settle(&plan, Decimal::from(85), true);
-        assert_eq!(p.account("a").unwrap().state, AccountState::Draining);
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Draining);
     }
 
     #[test]
@@ -1067,8 +1166,8 @@ mod tests {
             &policy(),
         );
         let _ = p.select("p", "m", Some("s"), Decimal::ONE, "r", 1).unwrap();
-        p.note_error("a", UpstreamErrorClass::QuotaExhausted, None, None);
-        let a = p.account("a").unwrap();
+        p.note_error("p/a", UpstreamErrorClass::QuotaExhausted, None, None);
+        let a = p.account("p/a").unwrap();
         assert_eq!(a.state, AccountState::Parked);
         assert!(p.select("p", "m", Some("s"), Decimal::ONE, "r2", 1).is_err());
     }
@@ -1079,8 +1178,8 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
             &policy(),
         );
-        p.note_error("a", UpstreamErrorClass::InsufficientCredit, None, None);
-        assert_eq!(p.account("a").unwrap().state, AccountState::Disabled);
+        p.note_error("p/a", UpstreamErrorClass::InsufficientCredit, None, None);
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Disabled);
     }
 
     #[test]
@@ -1090,12 +1189,12 @@ mod tests {
             &policy(),
         );
         p.note_error(
-            "a",
+            "p/a",
             UpstreamErrorClass::RateLimitBurst,
             Some(Duration::from_secs(3)),
             None,
         );
-        assert_eq!(p.account("a").unwrap().state, AccountState::Active);
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Active);
     }
 
     #[test]
@@ -1104,8 +1203,8 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 40)], AccountState::Active)],
             &policy(),
         );
-        p.mark_stale("a", "timeout");
-        let a = p.account("a").unwrap();
+        p.mark_stale("p/a", "timeout");
+        let a = p.account("p/a").unwrap();
         assert_eq!(
             a.gates[0].used,
             Decimal::from(40),
@@ -1132,8 +1231,8 @@ mod tests {
             window_started_at: a.window_started_at,
             last_error: a.last_error.clone(),
         }]);
-        assert_eq!(p.account("a").unwrap().state, AccountState::Unknown);
-        assert_eq!(p.account("a").unwrap().gates[0].used, Decimal::from(10));
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Unknown);
+        assert_eq!(p.account("p/a").unwrap().gates[0].used, Decimal::from(10));
     }
 
     #[test]
@@ -1144,7 +1243,7 @@ mod tests {
         let p = Pool::new(vec![a], &policy());
         let plan = p.select("p", "m", None, Decimal::ONE, "r", 1).unwrap();
         assert_eq!(plan.account_id, "a");
-        let a = p.account("a").unwrap();
+        let a = p.account("p/a").unwrap();
         assert_eq!(a.state, AccountState::Active);
         assert_eq!(
             a.gates[0].used,

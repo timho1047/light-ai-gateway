@@ -320,6 +320,21 @@ fn default_currency() -> String {
     "USD".to_string()
 }
 
+impl ProviderConfig {
+    /// The bare host every quota adapter appends its documented path to.
+    ///
+    /// This is the single source of truth: it was previously duplicated, and the
+    /// copy in the CLI bypassed the version-suffix normalisation, so ai-gw keys
+    /// test kept calling https://api.xkiro.com/v1/v1/usage after the gateway
+    /// itself had been fixed.
+    pub fn probe_base(&self) -> String {
+        match &self.probe_base_url {
+            Some(explicit) => explicit.trim_end_matches('/').to_string(),
+            None => strip_api_version_suffix(self.base_url.trim_end_matches('/')),
+        }
+    }
+}
+
 /// Optional per-model pricing. Models absent from this table are priced at a
 /// deliberately conservative default, because under-estimating cost makes the
 /// hard gate too permissive and spends real money.
@@ -528,6 +543,43 @@ impl Config {
         Ok(out)
     }
 
+    /// Build accounts, tolerating ones whose credential cannot be resolved.
+    ///
+    /// Returns (usable, unusable). An unusable account keeps its identity so the
+    /// board and doctor can show it, but it is marked Disabled and carries an
+    /// empty key, so the pool can never select it and it can never be sent
+    /// upstream. This exists because one stale account entry -- a provider you
+    /// configured but never registered a key for -- otherwise takes down the
+    /// whole board and stops the gateway from starting at all.
+    pub fn build_accounts_lenient(
+        &self,
+        store: &crate::secrets::CredentialStore,
+    ) -> Result<(Vec<Account>, Vec<Account>)> {
+        let mut usable = Vec::new();
+        let mut unusable = Vec::new();
+        for (provider_name, p) in &self.providers {
+            for (account_id, a) in &p.accounts {
+                let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
+                match secret_ref.resolve(store, provider_name, account_id) {
+                    Ok(key) => usable.push(build_one(provider_name, p, account_id, a, key)),
+                    Err(e) => {
+                        let mut acct = build_one(
+                            provider_name,
+                            p,
+                            account_id,
+                            a,
+                            ApiKey::new(""),
+                        );
+                        acct.state = AccountState::Disabled;
+                        acct.last_error = Some(format!("{e:#}"));
+                        unusable.push(acct);
+                    }
+                }
+            }
+        }
+        Ok((usable, unusable))
+    }
+
     /// Build the account list WITHOUT resolving credentials.
     ///
     /// Only for operations that need identity and state and never make an
@@ -565,17 +617,19 @@ impl Config {
         Ok(out)
     }
 
-    /// Providers that need a probe adapter, as (provider, adapter, probe url).
+    /// Providers that need a probe adapter, as (provider, adapter, probe host).
+    ///
+    /// Every adapter appends a fully documented path to this host (xKiro
+    /// /v1/usage, Command Code /alpha/billing/credits, DeepSeek /user/balance),
+    /// so it must be the bare host. base_url is the OpenAI-compatible root and
+    /// normally ends in /v1, so passing it through unchanged produced
+    /// https://api.xkiro.com/v1/v1/usage, which is a 404 -- a real failure an
+    /// operator hit. A trailing /v1 is therefore stripped when probe_base_url is
+    /// not set explicitly.
     pub fn probe_targets(&self) -> Vec<(ProviderId, QuotaAdapter, String)> {
         self.providers
             .iter()
-            .map(|(name, p)| {
-                let base = p
-                    .probe_base_url
-                    .clone()
-                    .unwrap_or_else(|| p.base_url.clone());
-                (name.clone(), p.adapter, base.trim_end_matches('/').to_string())
-            })
+            .map(|(name, p)| (name.clone(), p.adapter, p.probe_base()))
             .collect()
     }
 
@@ -651,6 +705,57 @@ currency = "USD"
 "#;
 
 /// A documented starter configuration.
+/// Assemble one Account from its configuration. Shared by the strict and
+/// lenient builders so the two cannot drift apart.
+fn build_one(
+    provider_name: &str,
+    p: &ProviderConfig,
+    account_id: &str,
+    a: &AccountConfig,
+    key: ApiKey,
+) -> Account {
+    Account {
+        id: account_id.to_string(),
+        provider: provider_name.to_string(),
+        label: a.label.clone().unwrap_or_else(|| account_id.to_string()),
+        base_url: p.base_url.trim_end_matches('/').to_string(),
+        api_key: key,
+        currency: a.currency.clone().unwrap_or_else(|| p.currency.clone()),
+        gates: Vec::new(),
+        state: AccountState::Unknown,
+        available_at: None,
+        window_started_at: None,
+        credit_multiplier: a
+            .credit_multiplier
+            .or(p.credit_multiplier)
+            .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ONE))
+            .unwrap_or(Decimal::ONE),
+        rpm_limit: a.rpm_limit,
+        concurrency_limit: a.concurrency_limit,
+        last_probe_at: None,
+        last_error: None,
+    }
+}
+
+/// Drop a trailing "/v1" (or "/v1beta" style) segment from an API root.
+///
+/// The OpenAI-compatible base_url points at the versioned root while quota
+/// endpoints live above it, so the version segment has to come off. Only a
+/// single trailing segment is removed, and only when it looks like an API
+/// version, so a path that merely happens to be deep is left alone.
+pub fn strip_api_version_suffix(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if let Some((head, tail)) = trimmed.rsplit_once('/') {
+        let looks_like_version = tail
+            .strip_prefix('v')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()));
+        if looks_like_version && !head.is_empty() {
+            return head.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 pub fn sample_toml() -> &'static str {
     SAMPLE
 }
@@ -678,6 +783,64 @@ key = { keychain = true }
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn probe_hosts_strip_the_version_segment_of_a_base_url() {
+        // Regression: base_url is the OpenAI root (ends in /v1) while quota
+        // endpoints live above it. Passing base_url through unchanged made the
+        // xKiro probe call /v1/v1/usage and 404 on a real account.
+        assert_eq!(
+            strip_api_version_suffix("https://api.xkiro.com/v1"),
+            "https://api.xkiro.com"
+        );
+        assert_eq!(
+            strip_api_version_suffix("https://api.xkiro.com/v1/"),
+            "https://api.xkiro.com"
+        );
+        assert_eq!(
+            strip_api_version_suffix("https://api.deepseek.com"),
+            "https://api.deepseek.com"
+        );
+        // Not a version segment: leave it alone.
+        assert_eq!(
+            strip_api_version_suffix("https://host/openai"),
+            "https://host/openai"
+        );
+    }
+
+    #[test]
+    fn probe_targets_use_a_bare_host_even_when_base_url_is_versioned() {
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+[providers.xkiro.accounts.a]
+key = "k"
+[providers.cc]
+adapter = "command-code"
+base_url = "https://api.commandcode.ai/provider/v1"
+probe_base_url = "https://api.commandcode.ai"
+[providers.cc.accounts.a]
+key = "k"
+[routes]
+"m" = "xkiro"
+"#,
+        )
+        .unwrap();
+        let targets = cfg.probe_targets();
+        let xkiro = targets.iter().find(|t| t.0 == "xkiro").unwrap();
+        assert_eq!(xkiro.2, "https://api.xkiro.com");
+        // The CLI's keys test resolves the same way; a duplicated copy of this
+        // logic is what left it calling /v1/v1/usage after the gateway was fixed.
+        assert_eq!(
+            cfg.providers.get("xkiro").unwrap().probe_base(),
+            "https://api.xkiro.com"
+        );
+        // An explicit probe_base_url always wins.
+        let cc = targets.iter().find(|t| t.0 == "cc").unwrap();
+        assert_eq!(cc.2, "https://api.commandcode.ai");
     }
 
     #[test]

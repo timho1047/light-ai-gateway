@@ -57,7 +57,25 @@ impl Gateway {
         config: Config,
         credentials: crate::secrets::CredentialStore,
     ) -> Result<Arc<Self>> {
-        let accounts = config.build_accounts(&credentials)?;
+        // Tolerate individual accounts whose credential is missing: one stale
+        // config entry should not stop the gateway from serving with the accounts
+        // that do work. Unusable accounts join the pool in Disabled state, so
+        // they render on the board but can never be selected.
+        let (mut accounts, unusable) = config.build_accounts_lenient(&credentials)?;
+        for acct in &unusable {
+            tracing::warn!(
+                provider = %acct.provider,
+                account = %acct.id,
+                reason = %acct.last_error.as_deref().unwrap_or("unavailable"),
+                "account disabled: its credential could not be resolved"
+            );
+        }
+        if accounts.is_empty() {
+            anyhow::bail!(
+                "no account could be loaded: every configured account is missing a credential.                  Run ai-gw keys list to see which ones, then ai-gw keys add <provider> <account>"
+            );
+        }
+        accounts.extend(unusable);
         let pool = Pool::new(accounts, &config.policy);
 
         // Probes are pinned to configured hosts so credentials can never be
@@ -233,7 +251,7 @@ impl Gateway {
         let billed = attempt.billed;
         self.pool.settle(plan, Decimal::ZERO, billed);
         self.pool
-            .note_error(&plan.account_id, class, retry_after, window_reset);
+            .note_error(&plan.qualified_account(), class, retry_after, window_reset);
         self.save_accounts();
         self.store.record_attempt(attempt);
     }
@@ -287,6 +305,18 @@ impl Gateway {
     }
 
     async fn probe_one(&self, provider: &str, account: &Account) {
+        // Never probe an account we have no credential for. The request would be
+        // sent unauthenticated and return 401, overwriting the far more useful
+        // "no credential, run ai-gw keys add ..." message that is already on the
+        // account, and burning a round trip to say nothing.
+        if account.api_key.is_empty() {
+            tracing::debug!(
+                provider,
+                account = %account.id,
+                "skipping probe: no credential stored for this account"
+            );
+            return;
+        }
         let Some(probe) = self.probes.get(provider).cloned() else {
             return;
         };
@@ -294,7 +324,7 @@ impl Gateway {
             Ok(outcome) => {
                 if outcome.gates.is_empty() {
                     self.pool
-                        .mark_stale(&account.id, "probe returned no gates");
+                        .mark_stale(&account.qualified(), "probe returned no gates");
                     self.save_accounts();
                     return;
                 }
@@ -305,7 +335,8 @@ impl Gateway {
                     plan = ?outcome.plan,
                     "quota probe ok"
                 );
-                self.pool.apply_probe(&account.id, outcome.gates, now());
+                self.pool
+                    .apply_probe(&account.qualified(), outcome.gates, now());
                 self.save_accounts();
             }
             Err(e) => {
@@ -313,7 +344,7 @@ impl Gateway {
                 // failure would both overstate availability and make the CLI
                 // claim a funded account is empty.
                 tracing::warn!(provider, account = %account.id, error = %e, "quota probe failed");
-                self.pool.mark_stale(&account.id, &e.message);
+                self.pool.mark_stale(&account.qualified(), &e.message);
                 self.save_accounts();
             }
         }
