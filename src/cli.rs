@@ -1932,21 +1932,75 @@ async fn cmd_keys_test(
                 probe.name(),
                 outcome.gates.len()
             );
-            for g in &outcome.gates {
-                println!(
-                    "    {:<18} {}/{} {:?}",
-                    g.kind.label(),
-                    g.used,
-                    g.cap,
-                    g.class()
-                );
-            }
+            println!("{}", gate_reading(&outcome.gates, &account_model.currency));
             Ok(())
         }
         Err(e) => {
             println!("{provider}/{account}: FAILED - {e}");
             bail!("the stored credential was rejected or the probe endpoint is unreachable")
         }
+    }
+}
+
+/// Every gate the probe read, one per line, in the shape the board uses.
+///
+/// The unit is a column rather than an assumption: a free-token allowance is
+/// counted in tokens and an rpm gate in requests per minute, so a raw 30000000
+/// sitting where a balance goes is how an allowance gets read as money. The class
+/// is spelled out in the same words as the board's columns rather than as a Rust
+/// enum name.
+fn gate_reading(gates: &[Gate], currency: &str) -> String {
+    use crate::table::{Align, Table};
+    use rust_decimal::prelude::ToPrimitive;
+
+    if gates.is_empty() {
+        return "    no gates in the response".to_string();
+    }
+    let mut table = Table::new(&[
+        ("GATE", Align::Left),
+        ("USED", Align::Right),
+        ("CAP", Align::Right),
+        ("UNIT", Align::Left),
+        ("POT", Align::Left),
+    ]);
+    for g in gates {
+        // A token allowance is read at the scale it is spent at, exactly as the
+        // usage tables read it; everything else is money and keeps its decimals.
+        let amount = |d: Decimal| match g.kind {
+            GateKind::FreeTokens => crate::table::tokens(d.to_u64().unwrap_or_default()),
+            _ => board_amount(d),
+        };
+        table.push(vec![
+            g.kind.label().to_string(),
+            amount(g.used),
+            amount(g.cap),
+            gate_unit(g.kind, currency).to_string(),
+            class_label(g.class()).to_string(),
+        ]);
+    }
+    table
+        .render()
+        .lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// What a gate is counted in.
+fn gate_unit(kind: GateKind, currency: &str) -> &str {
+    match kind {
+        GateKind::FreeTokens => "tokens",
+        GateKind::Rpm => "req/min",
+        _ => currency,
+    }
+}
+
+/// A gate class in the words the board uses for its two money columns.
+fn class_label(class: GateClass) -> &'static str {
+    match class {
+        GateClass::Covered => "covered",
+        GateClass::Metered => "metered",
+        GateClass::RateLimit => "rate limit",
     }
 }
 
@@ -2828,6 +2882,72 @@ key = {{ key_file = "{key_file}" }}
         );
         assert!(rows[0].contains("credits"), "the pot is labelled: {board}");
         assert!(rows[1].contains("wallet"), "the pot is labelled: {board}");
+    }
+
+    /// `lgw keys test` prints one row per gate. The unit column is the point: a
+    /// free-token allowance and a balance are not the same kind of number, and a
+    /// raw 30000000 next to a currency code is how one gets read as the other.
+    #[test]
+    fn a_gate_reading_names_its_unit_and_keeps_its_columns_straight() {
+        let t = now();
+        let gates = vec![
+            gate(
+                GateKind::FiveHour,
+                "100",
+                "40",
+                None,
+                Confidence::Exact,
+                false,
+                t,
+            ),
+            gate(
+                GateKind::FreeTokens,
+                "30000000",
+                "368",
+                None,
+                Confidence::Exact,
+                false,
+                t,
+            ),
+            gate(
+                GateKind::Rpm,
+                "600",
+                "12",
+                None,
+                Confidence::Exact,
+                false,
+                t,
+            ),
+            gate(
+                GateKind::Wallet,
+                "12.34",
+                "0",
+                None,
+                Confidence::Exact,
+                false,
+                t,
+            ),
+        ];
+        let out = gate_reading(&gates, "USD");
+        assert!(out.contains("30.0M"), "a token allowance is scaled: {out}");
+        assert!(out.contains("tokens"), "{out}");
+        assert!(out.contains("req/min"), "{out}");
+        assert!(!out.contains("Metered"), "no Rust enum names: {out}");
+        assert!(!out.contains("RateLimit"), "no Rust enum names: {out}");
+
+        let pot = |line: &str| {
+            ["covered", "metered", "rate limit"]
+                .iter()
+                .filter_map(|word| line.find(*word))
+                .next()
+                .expect("every row names its pot")
+        };
+        let columns: Vec<usize> = out.lines().skip(1).map(pot).collect();
+        assert_eq!(columns.len(), gates.len(), "{out}");
+        assert!(
+            columns.iter().all(|c| *c == columns[0]),
+            "the pot column drifted: {out}"
+        );
     }
 
     /// The board must not print a free-token allowance.
