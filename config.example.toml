@@ -145,8 +145,24 @@ output = 0.42
 # input = 0.30
 # output = 1.20
 # "cache read" = 0.03
+
+# Command Code, on its real rate card: off-peak is the default tier, and peak is
+# a weekday-only window at exactly double. Both are written out because the
+# pricing page states both, and a number copied from the page cannot drift from
+# it. The default tier covers every hour no window matches, including weekends.
 #
-# [prices.commandcode."deepseek/deepseek-v4.1-flash"]
-# input = 1.00
-# output = 3.00
-# "cache read" = 0.10
+# Leave the peak block out and those seven hours a day are billed at the
+# off-peak rate -- under-estimating, which is the direction that spends.
+[prices.commandcode."deepseek/deepseek-v4.1-flash"]
+input = 0.15
+output = 0.60
+"cache read" = 0.003
+
+[[prices.commandcode."deepseek/deepseek-v4.1-flash".schedules]]
+name = "peak"
+days = "mon-fri"
+hours = "01:00-04:00, 06:00-10:00"
+tz = "UTC"
+input = 0.30
+output = 1.20
+"cache read" = 0.006

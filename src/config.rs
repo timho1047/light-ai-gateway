@@ -1101,6 +1101,7 @@ output = 15.0
         assert_eq!(p.cache_read_per_token, rust_decimal::Decimal::new(3, 7));
     }
 
+
     /// The bug this guard exists for.
     ///
     /// "ai-gw init" writes db_path = "~/.light-ai-gateway/gateway.db", and the
@@ -1190,6 +1191,48 @@ output = 1.20
         let schedule = m.schedule("commandcode", "deepseek/deepseek-v4.1-flash").unwrap();
         assert_eq!(schedule.tiers.len(), 1);
         assert_eq!(schedule.tiers[0].hours.len(), 2);
+
+        // Both tiers must reach the PRICE TABLE, not just the parsed config. A
+        // peak tier that failed to install would not fail loudly: the estimate
+        // would fall back to the conservative $15/$75 per million, 100x the real
+        // rate, and refuse ordinary requests for the seven hours a day the
+        // window is open.
+        let mut table = crate::meter::PriceTable::new();
+        assert_eq!(table.seed_from_config(&cfg.prices), 2);
+        let million = crate::domain::TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let at = |tier| {
+            table.estimate(
+                "commandcode",
+                "deepseek/deepseek-v4.1-flash",
+                tier,
+                &million,
+                rust_decimal::Decimal::ONE,
+            )
+        };
+        assert_eq!(at(0), Some(Decimal::new(75, 2)), "0.15 + 0.60 = 0.75 USD");
+        assert_eq!(at(1), Some(Decimal::new(150, 2)), "0.30 + 1.20 = 1.50 USD");
+
+        // And the window that picks between them: 7 hours a day, weekdays only.
+        use time::macros::datetime;
+        assert_eq!(
+            schedule.tier_index_at(datetime!(2026-09-15 02:00:00 UTC)),
+            Some(0),
+            "Tuesday 02:00 is inside the window"
+        );
+        assert_eq!(
+            schedule.tier_index_at(datetime!(2026-09-15 05:00:00 UTC)),
+            None,
+            "Tuesday 05:00 falls between the two windows"
+        );
+        assert_eq!(
+            schedule.tier_index_at(datetime!(2026-09-19 02:00:00 UTC)),
+            None,
+            "Saturday is never peak"
+        );
     }
 
     #[test]
