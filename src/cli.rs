@@ -161,16 +161,6 @@ pub enum KeysCommand {
     Remove { provider: String, account: String },
     /// Check a stored credential by probing the provider with it.
     Test { provider: String, account: String },
-    /// Fold every per-account credential-store item into the single vault item.
-    ///
-    /// On macOS an ad-hoc signed binary is identified by the hash of its code, so
-    /// an "Always Allow" grant cannot survive a rebuild. Fewer items is the only
-    /// durable answer, and this turns N authorisation prompts into one.
-    Migrate {
-        /// Delete the per-account items once the vault is confirmed to hold them.
-        #[arg(long)]
-        prune: bool,
-    },
 }
 
 #[derive(Debug, Args)]
@@ -1719,7 +1709,6 @@ async fn cmd_keys(path: &Path, args: KeysArgs, pal: &Palette) -> Result<()> {
             stdin,
         } => cmd_keys_add(&config, &creds, &provider, &account, stdin, pal),
         KeysCommand::List => cmd_keys_list(&config, &creds, pal),
-        KeysCommand::Migrate { prune } => cmd_keys_migrate(path, prune),
         KeysCommand::Remove { provider, account } => cmd_keys_remove(&creds, &provider, &account),
         KeysCommand::Test { provider, account } => {
             cmd_keys_test(&config, &creds, &provider, &account, pal).await
@@ -1823,9 +1812,8 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
                 Ok(_) => ("ok".to_string(), true),
                 Err(e) => (format!("MISSING ({e})"), false),
             };
-            // Say which item the key came out of. An install that still keeps one
-            // item per account pays one authorisation prompt per account on
-            // macOS, and "lgw keys migrate" is how that stops.
+            // Say which item the key came out of. Every key lives in the vault,
+            // and the vault is the one item macOS asks about once.
             let mut source = secret_ref.describe();
             if matches!(secret_ref, SecretRef::Keychain) {
                 let origin = creds.origin(provider, id);
@@ -1845,40 +1833,11 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
     rows
 }
 
-/// What the vault line says, given how many keys still live in their own item.
-fn vault_status(per_account: usize) -> String {
-    if per_account == 0 {
-        "every key in one credential-store item".to_string()
-    } else {
-        format!("{per_account} key(s) still in separate per-account items")
-    }
-}
-
-/// The line under it: whether `lgw keys migrate` has anything to do.
-///
-/// A command that only ever runs when something is wrong has to say so when
-/// nothing is, or the only way to find out whether it is still needed is to run
-/// it and read the counts.
-fn migration_note(per_account: usize, pal: &Palette) -> String {
-    if per_account == 0 {
-        pal.dim("nothing to migrate: no account still uses its own item")
-    } else {
-        pal.yellow(&format!(
-            "{per_account} key(s) still use their own item; 'lgw keys migrate --prune' folds them in"
-        ))
-    }
-}
-
 fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Result<()> {
     println!("backend: {}", creds.backend_name());
     let rows = credential_rows(config, creds);
-    let per_account = rows
-        .iter()
-        .filter(|r| r.source.contains("per-account"))
-        .count();
     if creds.is_vaulted() {
-        println!("vault   : {}", vault_status(per_account));
-        println!("          {}", migration_note(per_account, pal));
+        println!("vault   : every key in one credential-store item");
     }
     println!();
     let mut table = crate::table::Table::new(&[
@@ -1904,87 +1863,10 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Res
     }
     print!("{}", table.render(pal));
     println!();
-    if per_account > 0 {
-        println!(
-            "{}",
-            pal.yellow(
-                "On macOS every separate item is a separate authorisation prompt for this binary."
-            )
-        );
-        println!();
-    }
     println!(
         "{}",
         pal.dim("Register one with: lgw keys add <provider> <account>")
     );
-    Ok(())
-}
-
-/// Every configured credential that is expected to be in the credential store.
-///
-/// Only these can be migrated: the OS credential store has no portable way to
-/// enumerate its items, so a key belonging to an account no longer in the config
-/// is invisible here. That is harmless -- the per-account fallback still reads
-/// it -- but it will not be folded into the vault.
-fn keychain_pairs(config: &Config) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    for (provider, p) in &config.providers {
-        for (id, a) in &p.accounts {
-            if matches!(a.key, None | Some(SecretRef::Keychain)) {
-                pairs.push((provider.clone(), id.clone()));
-            }
-        }
-    }
-    if matches!(config.server.local_key, Some(SecretRef::Keychain)) {
-        pairs.push((
-            crate::secrets::LOCAL_KEY_PROVIDER.to_string(),
-            crate::secrets::LOCAL_KEY_ACCOUNT.to_string(),
-        ));
-    }
-    pairs
-}
-
-/// Fold every per-account credential-store item into the single vault item.
-///
-/// Why it exists: macOS identifies an ad-hoc signed binary by the hash of its
-/// code, so "Always Allow" never survives a rebuild, and the only durable fix is
-/// to have fewer items to authorise. This moves N items into one, and --prune
-/// removes the old ones once the vault is confirmed to hold their contents.
-fn cmd_keys_migrate(path: &Path, prune: bool) -> Result<()> {
-    let config = load_config(path)?;
-    let creds = credential_store();
-
-    if !creds.is_vaulted() {
-        println!(
-            "the {} backend keeps no vault; there is nothing to migrate",
-            creds.backend_name()
-        );
-        return Ok(());
-    }
-
-    let pairs = keychain_pairs(&config);
-    if pairs.is_empty() {
-        println!(
-            "no account in {} uses the OS credential store; nothing to migrate",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    let report = creds.migrate(&pairs, prune)?;
-    println!(
-        "merged {} key(s) into the vault; {} already there, {} with nothing stored",
-        report.merged, report.already, report.missing
-    );
-    if prune {
-        println!("removed {} per-account item(s)", report.pruned);
-    } else if report.merged > 0 {
-        println!();
-        println!("The old items are still there. Run the same command with --prune once");
-        println!("'lgw doctor' resolves every account, and they will be deleted.");
-    }
-    println!();
-    println!("Backend: {}", creds.backend_name());
     Ok(())
 }
 
@@ -3567,24 +3449,6 @@ key = {{ key_file = "{key_file}" }}
         }];
         assert!(
             !render_usage(&single, &[GroupBy::Model], now(), &Palette::off()).contains("m [USD]")
-        );
-    }
-
-    #[test]
-    fn the_vault_status_says_when_there_is_nothing_to_migrate() {
-        assert_eq!(vault_status(0), "every key in one credential-store item");
-        assert_eq!(
-            vault_status(2),
-            "2 key(s) still in separate per-account items"
-        );
-
-        let settled = migration_note(0, &Palette::off());
-        assert!(settled.contains("nothing to migrate"), "{settled}");
-        let pending = migration_note(2, &Palette::off());
-        assert!(pending.contains("--prune"), "{pending}");
-        assert!(
-            !pending.contains("nothing to migrate"),
-            "a key still in its own item is something to migrate: {pending}"
         );
     }
 

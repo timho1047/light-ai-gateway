@@ -137,31 +137,30 @@ program asking for it. `cargo install` produces an *ad-hoc* signature, whose
 identity is the hash of the code itself, so every rebuild looks like a different
 application to the keychain and an "Always Allow" grant does not survive it.
 
-On top of that, each account is its own keychain item, so a cold start asks once
-per account -- and `status`, `accounts probe` and `doctor` each ask again,
-because each is a new process reading the same items. A test on this checkout
-read every credential in 24 ms once the two were fixed; before, it waited on
-three prompts.
+On top of that, a grant is per ITEM, and an older build kept one keychain item
+per account: a cold start asked once per account, and `status`, `accounts probe`
+and `doctor` asked again, because each is a new process reading the same items.
+A test on this checkout read every credential in 24 ms once that was fixed;
+before, it waited on three prompts.
 
 Two things fix it:
-
-    lgw keys migrate --prune     # N items -> 1: one authorisation covers all
 
     scripts/lgw-identity.sh       # once: creates and trusts the certificate
     scripts/lgw-install.sh        # cargo install, then signs the result
 
-The first is a command; the second makes the grant stick, because the
-access-control entry then names a certificate that does not change when the code
-does. Both are optional -- without them the gateway behaves identically, it just
-keeps asking. `lgw keys list` shows which item each key came out of, and says
-so when per-account items are still in use.
+The first makes the grant stick, because the access-control entry then names a
+certificate that does not change when the code does; the second signs the binary
+that actually gets installed. Both are optional -- without them the gateway
+behaves identically, it just keeps asking.
 
-`lgw keys migrate` is for the install that predates the vault: `keys add` has
-written every key into the single vault item since, so a fresh install never
-needs it. It stays because the per-account read path stays -- an old install
-keeps working without migrating, and `--prune` is the only thing that deletes
-the leftover items once the vault holds them. On a settled install it reports
-"nothing to migrate" and touches nothing.
+There is also only one item to grant: every key lives in a single `vault` entry,
+which is where `lgw keys add` has always written them, and `lgw keys list` shows
+which item each key came out of. Nothing needs migrating, and there is no command
+to remember.
+
+If you are upgrading from a build that predates the vault, its per-account items
+are no longer read: `lgw keys add <provider> <account>` stores the key in the
+vault, and the old item can be deleted in Keychain Access.
 
 Note that a plain `cargo install --path .` replaces the signed binary with an
 ad-hoc one and brings the prompts back; use `scripts/lgw-install.sh` instead.
@@ -198,7 +197,6 @@ for tests and dry runs and never touches your real keychain.
     lgw usage --since 7d --group-by provider,model,account
     lgw prices [--drift-only]          configured price vs the price learned from real spend
     lgw keys add|list|remove|test      provider credentials
-    lgw keys migrate [--prune]         fold per-account key items into one
     lgw accounts list|probe|disable    account maintenance
     lgw accounts enable <id>           put a disabled account back
     lgw tail                           recent requests
@@ -412,7 +410,7 @@ count of what is wrong.
 |---|---|
 | `no eligible account` on every request | `lgw status` -- every account may be parked, disabled, or under the hard gate. The 429 body names the account with the most room, how much it has left, and the estimate that did not fit |
 | An account stays DISABLED after you fixed the key | a probe only restores an account that also shows headroom, and an operator disable is never undone by one -- see [Account recovery](#account-recovery) |
-| A password prompt on every run (macOS) | two independent causes, both fixable: `lgw keys migrate --prune` and `scripts/lgw-install.sh` |
+| A password prompt on every run (macOS) | the grant is bound to the code signature, and an ad-hoc one changes on every rebuild: run `scripts/lgw-install.sh` |
 | A price looks wrong | `lgw prices --drift-only`. A learned rate is an observation, not the truth, and a configured price is never overwritten by one |
 | Every request is 429 with a Retry-After of weeks | a covered window is spent and the earliest reset is that far away. `lgw status` shows a countdown per gate |
 | The board is empty after moving the database | the ledger path is `server.db_path` in the config. An empty board means "not probed yet", never "no accounts" |

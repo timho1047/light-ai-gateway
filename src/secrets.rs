@@ -23,12 +23,16 @@
 //! protects the second case and would not: anyone with the binary has the key.
 //! That is obfuscation, not encryption, so it is deliberately not implemented.
 //!
-//! Every key lives in ONE item (see VaultBackend), with reads falling back to the
-//! per-account items of an older install. That is not only tidier: on macOS an
-//! access-control grant is bound to the calling binary's code signature, and an
-//! ad-hoc signed binary is identified by the hash of its code, so it can never be
-//! remembered across a rebuild. Fewer items means fewer things to authorise, and
-//! "lgw keys migrate --prune" is what folds them together.
+//! Every key lives in ONE item (see VaultBackend): the store holds exactly one
+//! generic-password entry, a JSON object of provider/account to secret. That is
+//! not only tidier: on macOS an access-control grant is bound to the calling
+//! binary's code signature, and an ad-hoc signed binary is identified by the hash
+//! of its code, so a grant can never be remembered across a rebuild. One item
+//! means one thing to authorise, and "lgw keys add" has always written to it.
+//!
+//! An item from a build that predates the vault is no longer read. Nothing is
+//! migrated, and nothing is silently picked up either: a key that is not in the
+//! vault is reported missing, and "lgw keys add" is how it gets there.
 
 use crate::domain::ApiKey;
 use anyhow::{Context, Result};
@@ -82,13 +86,6 @@ pub trait SecretBackend: Send + Sync {
     fn origin(&self, _provider: &str, _account: &str) -> Result<CredentialOrigin> {
         Ok(CredentialOrigin::Absent)
     }
-
-    /// Fold per-account items into the vault. Backends without a vault have
-    /// nothing to do, so the default reports an empty migration rather than
-    /// pretending to have moved something.
-    fn migrate(&self, _pairs: &[(String, String)], _prune: bool) -> Result<MigrationReport> {
-        Ok(MigrationReport::default())
-    }
 }
 
 /// The composite key used inside the store.
@@ -105,8 +102,8 @@ pub fn missing_credential_message(provider: &str, account: &str) -> String {
 
 /// Name of the one item that holds every key.
 ///
-/// Every per-account item is named "provider/account", which always contains a
-/// slash, so this name cannot collide with one.
+/// Provider/account pairs are stored as keys INSIDE this item's JSON, never as
+/// items of their own, so there is nothing for this name to collide with.
 pub const VAULT_ITEM: &str = "vault";
 
 /// Where a credential was found, for display.
@@ -114,54 +111,29 @@ pub const VAULT_ITEM: &str = "vault";
 pub enum CredentialOrigin {
     /// The single vault item.
     Vault,
-    /// A per-account item from an install that predates the vault.
-    PerAccountItem,
     /// Nothing stored, or the backend has no such notion.
     Absent,
 }
 
 impl CredentialOrigin {
-    pub fn describe(self) -> &'static str {
-        match self {
-            CredentialOrigin::Vault => "vault item",
-            CredentialOrigin::PerAccountItem => "per-account item",
-            CredentialOrigin::Absent => "not stored",
-        }
-    }
-
     /// Short form for a table column.
     pub fn short(self) -> &'static str {
         match self {
             CredentialOrigin::Vault => "vault",
-            CredentialOrigin::PerAccountItem => "per-account",
             CredentialOrigin::Absent => "none",
         }
     }
 }
 
-/// What a migration did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct MigrationReport {
-    /// Keys copied out of per-account items.
-    pub merged: usize,
-    /// Keys the vault already had.
-    pub already: usize,
-    /// Configured accounts with nothing stored anywhere.
-    pub missing: usize,
-    /// Per-account items removed after the vault was confirmed to hold them.
-    pub pruned: usize,
-}
-
-/// Raw access to one named item in the credential store.
+/// Raw access to the one item the vault lives in.
 ///
-/// A level below SecretBackend on purpose. The vault keeps every key in a single
-/// item and falls back to the per-account ones, and putting that logic above a
-/// seam that tests can drive is the difference between "the merge is probably
-/// right" and a test that proves it.
+/// A level below SecretBackend on purpose: the vault serialises a map into one
+/// item and parses it back, and putting that above a seam a test can drive is the
+/// difference between "the JSON round trip is probably right" and a test that
+/// proves it.
 pub trait ItemStore: Send + Sync {
     fn read(&self, item: &str) -> Result<Option<String>>;
     fn write(&self, item: &str, value: &str) -> Result<()>;
-    fn delete(&self, item: &str) -> Result<bool>;
 }
 
 /// The real thing: one generic-password item per name.
@@ -201,14 +173,6 @@ impl ItemStore for KeychainItems {
             .set_password(value)
             .context("storing the credential in the OS credential store")
     }
-
-    fn delete(&self, item: &str) -> Result<bool> {
-        match self.entry(item)?.delete_credential() {
-            Ok(()) => Ok(true),
-            Err(keyring::Error::NoEntry) => Ok(false),
-            Err(e) => Err(anyhow::anyhow!("{e}")),
-        }
-    }
 }
 
 /// Every key in ONE credential-store item.
@@ -219,8 +183,8 @@ impl ItemStore for KeychainItems {
 /// hash of its code: "Always Allow" could never stick across a rebuild, and the
 /// only durable fix is to have fewer things to authorise.
 ///
-/// Reads fall back to per-account items so an install that predates the vault
-/// keeps working until it migrates.
+/// Nothing is read from anywhere else: a key that is not in this item is a key
+/// the operator is told to add.
 pub struct VaultBackend<S: ItemStore> {
     items: S,
     /// Parsed once per process: without it every account resolution is another
@@ -290,69 +254,30 @@ impl<S: ItemStore> SecretBackend for VaultBackend<S> {
         if let Some(secret) = map.get(&key) {
             return Ok(Some(ApiKey::new(secret.clone())));
         }
-        // Not in the vault yet: a pre-vault install still has one item per
-        // account, and that key has to keep working until it is migrated.
-        Ok(self.items.read(&key)?.map(ApiKey::new))
+        // Not in the vault. An item left over from a build that predates the
+        // vault is NOT read: a key that is reported missing is a key the operator
+        // can fix, while one that quietly comes from somewhere else is a puzzle.
+        Ok(None)
     }
 
     fn delete(&self, provider: &str, account: &str) -> Result<bool> {
         let key = entry_user(provider, account);
         let mut map = self.load()?;
-        let in_vault = map.remove(&key).is_some();
-        if in_vault {
-            self.store(&map)?;
+        if map.remove(&key).is_none() {
+            return Ok(false);
         }
-        // Both copies: leaving the per-account item behind would resurrect a
-        // removed key through the fallback above.
-        let legacy = self.items.delete(&key)?;
-        Ok(in_vault || legacy)
+        self.store(&map)?;
+        Ok(true)
     }
 
     fn origin(&self, provider: &str, account: &str) -> Result<CredentialOrigin> {
-        let key = entry_user(provider, account);
-        if self.load()?.contains_key(&key) {
-            return Ok(CredentialOrigin::Vault);
-        }
-        Ok(if self.items.read(&key)?.is_some() {
-            CredentialOrigin::PerAccountItem
-        } else {
-            CredentialOrigin::Absent
-        })
-    }
-
-    fn migrate(&self, pairs: &[(String, String)], prune: bool) -> Result<MigrationReport> {
-        let mut map = self.load()?;
-        let mut report = MigrationReport::default();
-        for (provider, account) in pairs {
-            let key = entry_user(provider, account);
-            if map.contains_key(&key) {
-                report.already += 1;
-                continue;
-            }
-            match self.items.read(&key)? {
-                Some(secret) => {
-                    map.insert(key, secret);
-                    report.merged += 1;
-                }
-                None => report.missing += 1,
-            }
-        }
-
-        // Write the vault BEFORE pruning. A crash between the two leaves a
-        // duplicate, which the next run reports as already-present; the other
-        // order would delete the only copy of a key.
-        if report.merged > 0 {
-            self.store(&map)?;
-        }
-        if prune {
-            for (provider, account) in pairs {
-                let key = entry_user(provider, account);
-                if map.contains_key(&key) && self.items.delete(&key)? {
-                    report.pruned += 1;
-                }
-            }
-        }
-        Ok(report)
+        Ok(
+            if self.load()?.contains_key(&entry_user(provider, account)) {
+                CredentialOrigin::Vault
+            } else {
+                CredentialOrigin::Absent
+            },
+        )
     }
 }
 
@@ -456,12 +381,6 @@ impl CredentialStore {
         self.backend
             .origin(provider, account)
             .unwrap_or(CredentialOrigin::Absent)
-    }
-
-    /// Fold per-account items into the vault, optionally removing them once the
-    /// vault is confirmed to hold their contents.
-    pub fn migrate(&self, pairs: &[(String, String)], prune: bool) -> Result<MigrationReport> {
-        self.backend.migrate(pairs, prune)
     }
 
     pub fn set(&self, provider: &str, account: &str, secret: &str) -> Result<()> {
@@ -646,17 +565,10 @@ mod tests {
                 .insert(item.to_string(), value.to_string());
             Ok(())
         }
-        fn delete(&self, item: &str) -> Result<bool> {
-            Ok(self.items.lock().expect("items").remove(item).is_some())
-        }
     }
 
     fn vault() -> VaultBackend<FakeItems> {
         VaultBackend::new(FakeItems::default())
-    }
-
-    fn pair(provider: &str, account: &str) -> (String, String) {
-        (provider.to_string(), account.to_string())
     }
 
     /// One item, however many accounts.
@@ -679,79 +591,30 @@ mod tests {
         );
     }
 
-    /// An install from before the vault keeps working until it migrates.
+    /// An item left over from a build that predates the vault is not read.
+    ///
+    /// Silently using it would make a key appear from nowhere: the board says
+    /// "ok" for an account whose vault entry is gone, and nothing says which of
+    /// the two copies is in play. Missing is a state the operator can act on, and
+    /// adding the key again is the one line that fixes it.
     #[test]
-    fn a_per_account_item_is_still_read_until_it_is_migrated() {
+    fn a_leftover_per_account_item_is_not_read() {
         let v = vault();
         v.items.put_legacy("xkiro", "acc-1", "sk-legacy");
 
-        assert_eq!(
-            v.get("xkiro", "acc-1").unwrap().unwrap().expose(),
-            "sk-legacy"
-        );
+        assert!(v.get("xkiro", "acc-1").unwrap().is_none());
         assert_eq!(
             v.origin("xkiro", "acc-1").unwrap(),
-            CredentialOrigin::PerAccountItem
+            CredentialOrigin::Absent
         );
-    }
 
-    /// Once migrated, the vault's copy is the one that is read.
-    #[test]
-    fn the_vault_wins_over_a_leftover_per_account_item() {
-        let v = vault();
-        v.items.put_legacy("xkiro", "acc-1", "sk-old");
-        v.set("xkiro", "acc-1", "sk-new").unwrap();
-
-        assert_eq!(v.get("xkiro", "acc-1").unwrap().unwrap().expose(), "sk-new");
+        // Adding it puts it in the vault, and the vault is where it is read from.
+        v.set("xkiro", "acc-1", "sk-vault").unwrap();
+        assert_eq!(
+            v.get("xkiro", "acc-1").unwrap().unwrap().expose(),
+            "sk-vault"
+        );
         assert_eq!(v.origin("xkiro", "acc-1").unwrap(), CredentialOrigin::Vault);
-    }
-
-    /// Merging, then running it again.
-    #[test]
-    fn migration_folds_items_in_and_is_idempotent() {
-        let v = vault();
-        v.items.put_legacy("xkiro", "acc-1", "sk-one");
-        v.items.put_legacy("xkiro", "acc-2", "sk-two");
-        let pairs = [
-            pair("xkiro", "acc-1"),
-            pair("xkiro", "acc-2"),
-            pair("xkiro", "acc-3"),
-        ];
-
-        let first = v.migrate(&pairs, false).unwrap();
-        assert_eq!(first.merged, 2);
-        assert_eq!(first.missing, 1, "acc-3 has nothing stored");
-        assert_eq!(v.get("xkiro", "acc-2").unwrap().unwrap().expose(), "sk-two");
-
-        let second = v.migrate(&pairs, false).unwrap();
-        assert_eq!(second.merged, 0, "nothing left to move");
-        assert_eq!(second.already, 2);
-        assert_eq!(second.missing, 1);
-    }
-
-    /// Pruning is what removes the old items, and only after the vault has them.
-    #[test]
-    fn pruning_removes_per_account_items_only_once_the_vault_holds_them() {
-        let v = vault();
-        v.items.put_legacy("xkiro", "acc-1", "sk-one");
-        let pairs = [pair("xkiro", "acc-1"), pair("xkiro", "acc-2")];
-
-        let keep = v.migrate(&pairs, false).unwrap();
-        assert_eq!(keep.merged, 1);
-        assert_eq!(keep.pruned, 0, "without --prune nothing is deleted");
-        assert_eq!(
-            v.items.names(),
-            vec![VAULT_ITEM.to_string(), "xkiro/acc-1".to_string()]
-        );
-
-        let drop = v.migrate(&pairs, true).unwrap();
-        assert_eq!(drop.pruned, 1);
-        assert_eq!(
-            v.items.names(),
-            vec![VAULT_ITEM.to_string()],
-            "acc-2 had no item, and acc-1's is now redundant"
-        );
-        assert_eq!(v.get("xkiro", "acc-1").unwrap().unwrap().expose(), "sk-one");
     }
 
     /// An unreadable vault must not look like "no credentials".
@@ -768,15 +631,20 @@ mod tests {
         );
     }
 
-    /// Deleting has to clear both copies, or the fallback resurrects the key.
+    /// Removing a key takes it out of the one item and says so.
+    ///
+    /// It reports nothing-removed for a key that was never there, and it leaves
+    /// the OTHER accounts in the item alone -- deleting one key must not clear
+    /// the vault.
     #[test]
-    fn removing_a_key_clears_both_copies() {
+    fn removing_a_key_leaves_the_other_keys_in_the_vault() {
         let v = vault();
-        v.items.put_legacy("xkiro", "acc-1", "sk-legacy");
-        v.set("xkiro", "acc-1", "sk-current").unwrap();
+        v.set("xkiro", "acc-1", "sk-one").unwrap();
+        v.set("xkiro", "acc-2", "sk-two").unwrap();
 
         assert!(v.delete("xkiro", "acc-1").unwrap());
         assert!(v.get("xkiro", "acc-1").unwrap().is_none());
+        assert_eq!(v.get("xkiro", "acc-2").unwrap().unwrap().expose(), "sk-two");
         assert_eq!(v.items.names(), vec![VAULT_ITEM.to_string()]);
         assert!(
             !v.delete("xkiro", "acc-1").unwrap(),

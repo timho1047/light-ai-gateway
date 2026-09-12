@@ -51,6 +51,5 @@ echo "signed by:  $IDENTITY"
 echo "requirement the keychain will remember:"
 codesign -d -r- "$BIN" 2>&1 | tail -1 | sed 's/^/    /'
 echo
-echo "Run lgw once and click Always Allow on the prompts. By default there is one"
-echo "per stored key; 'lgw keys migrate --prune' folds them into a single item, so"
-echo "one authorisation covers every account from then on."
+echo "Run lgw once and click Always Allow on the prompt. Every key lives in the"
+echo "single vault item, so one authorisation covers every account from then on."
