@@ -25,7 +25,12 @@ axum = "0.8.9"
 bytes = "1.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
 futures-util = "0.3.34"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+# v4 split the crate up: the platform stores are now separate crates and the API
+# this project uses (Entry::new, get_password, set_password, delete_credential)
+# lives behind the "v1" compatibility feature, which is what the default enables.
+# The old per-platform feature names are gone; v1 pulls in Keychain, Windows
+# Credential Manager and the Secret Service, chosen at runtime per platform.
+keyring = "4"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream", "rustls"] }
 rpassword = "7.5.4"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
