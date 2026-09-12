@@ -291,24 +291,46 @@ pub fn estimate_completion_tokens(max_tokens: Option<u64>, prompt_tokens: u64) -
     }
 }
 
+/// A generation window shorter than this cannot be measured: the provider
+/// buffered its output and delivered it in one burst.
+pub const MIN_TPS_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// No LLM API streams faster than this. A higher figure is an artifact of
+/// buffered delivery, not model speed.
+pub const MAX_PLAUSIBLE_TPS: f64 = 1000.0;
+
 /// Tokens per second over the generation window only. The time to first token
 /// is deliberately excluded from the denominator.
 ///
-/// Pass the instant the FIRST CONTENT chunk arrived as `first_content` (not
-/// the request start) and the instant of the last content chunk as
-/// `last_content`. Returns None when the window is empty or time ran
-/// backwards.
+/// Pass the instant the first content chunk arrived and the instant of the last
+/// content chunk. Returns None rather than a misleading figure when the result
+/// is not attributable to generation speed:
+///   - no completion tokens were produced;
+///   - the window is empty, or time ran backwards;
+///   - the window is shorter than MIN_TPS_WINDOW, which is what a buffered
+///     upstream looks like: several content frames arriving in one read;
+///   - the result exceeds MAX_PLAUSIBLE_TPS, which no real provider reaches.
+///
+/// Measured against live providers, buffered delivery produced figures such as
+/// 14818 and 77170 tokens per second. Those are more damaging than a blank,
+/// because they look like data and would be used to compare providers.
 pub fn compute_tps(
     completion_tokens: u64,
     first_content: Instant,
     last_content: Instant,
 ) -> Option<f64> {
-    let window = last_content.checked_duration_since(first_content)?;
-    let secs = window.as_secs_f64();
-    if secs <= 0.0 {
+    if completion_tokens == 0 {
         return None;
     }
-    Some(completion_tokens as f64 / secs)
+    let window = last_content.checked_duration_since(first_content)?;
+    if window < MIN_TPS_WINDOW {
+        return None;
+    }
+    let tps = completion_tokens as f64 / window.as_secs_f64();
+    if !tps.is_finite() || tps > MAX_PLAUSIBLE_TPS {
+        return None;
+    }
+    Some(tps)
 }
 
 /// Extract usage from an OpenAI-shaped response or chunk.
@@ -842,6 +864,35 @@ mod tests {
         );
         // Had TTFT leaked into the denominator this would be 20.0.
         assert!((tps - 20.0).abs() > 1.0);
+    }
+
+    /// Regression, seen against live providers. Both xKiro and Command Code
+    /// buffer short completions into a single burst, and dividing by that
+    /// near-zero window produced figures like 14818 and 77170 tokens per
+    /// second. An unmeasurable window must report nothing rather than a number
+    /// that looks like data.
+    #[test]
+    fn tps_is_none_for_a_buffered_single_burst() {
+        let t0 = Instant::now();
+        // All 64 tokens arrived in one read, 1ms after the first content frame.
+        assert_eq!(
+            compute_tps(64, t0, t0 + std::time::Duration::from_millis(1)),
+            None
+        );
+        // A window long enough to measure but still implying impossible speed.
+        assert_eq!(
+            compute_tps(500, t0, t0 + std::time::Duration::from_millis(120)),
+            None,
+            "4166 tok/s is not a real generation rate"
+        );
+        // A genuinely streamed response is measured normally.
+        let tps = compute_tps(100, t0, t0 + std::time::Duration::from_secs(1)).unwrap();
+        assert!((tps - 100.0).abs() < 0.001, "got {tps}");
+        // No tokens means no rate.
+        assert_eq!(
+            compute_tps(0, t0, t0 + std::time::Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]
