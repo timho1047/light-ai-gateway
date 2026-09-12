@@ -130,8 +130,9 @@ impl SecretRef {
                 Ok(ApiKey::new(v.trim().to_string()))
             }
             SecretRef::File { key_file } => {
-                let raw = std::fs::read_to_string(key_file)
-                    .with_context(|| format!("reading key_file {key_file}"))?;
+                let resolved = expand_tilde(key_file);
+                let raw = std::fs::read_to_string(&resolved)
+                    .with_context(|| format!("reading key_file {}", resolved.display()))?;
                 let v = raw.trim();
                 if v.is_empty() {
                     bail!("key_file {key_file} is empty");
@@ -780,13 +781,39 @@ impl Config {
     }
 
     pub fn db_path(&self) -> PathBuf {
-        PathBuf::from(&self.server.db_path)
+        expand_tilde(&self.server.db_path)
     }
 
     /// Soft threshold as Decimal for exact comparisons.
     pub fn soft_threshold_decimal(&self) -> Decimal {
         Decimal::try_from(self.policy.soft_threshold).unwrap_or(Decimal::new(80, 2))
     }
+}
+
+/// Expand a leading "~" the way a shell would.
+///
+/// Config paths are written by hand, so "~/.light-ai-gateway/gateway.db" is the
+/// natural way to spell them. Without this, PathBuf treats "~" as an ordinary
+/// directory name and the path resolves against the working directory, so the
+/// gateway silently creates a literal "~" directory wherever it happens to have
+/// been started. The same config then reads a different, empty ledger from a
+/// different cwd: the board goes blank, every account comes back Unknown, and
+/// nothing explains why.
+///
+/// Only the two spellings a shell would expand are handled. "~user/..." is left
+/// alone deliberately: resolving it needs an account database, and guessing
+/// would be worse than reporting a path that does not exist.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    fn home() -> String {
+        std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+    }
+    if path == "~" {
+        return PathBuf::from(home());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return PathBuf::from(home()).join(rest);
+    }
+    PathBuf::from(path)
 }
 
 impl FromStr for Config {
@@ -1072,6 +1099,50 @@ output = 15.0
         // $3/M input -> $0.30/M cache read, never zero: a free-looking cache
         // read would under-estimate cost, which is the spending direction.
         assert_eq!(p.cache_read_per_token, rust_decimal::Decimal::new(3, 7));
+    }
+
+    /// The bug this guard exists for.
+    ///
+    /// "ai-gw init" writes db_path = "~/.light-ai-gateway/gateway.db", and the
+    /// real config kept that line. PathBuf has no idea what "~" means, so it
+    /// resolved against the working directory: the live ledger ended up in
+    /// <cwd>/~/.light-ai-gateway/gateway.db and the file named by the config was
+    /// a 0-byte stranger. Restarting the gateway from another directory would
+    /// have produced a blank board with no explanation.
+    #[test]
+    fn a_tilde_db_path_is_expanded_instead_of_staying_relative() {
+        let cfg = Config::from_toml_str(
+            "[server]\ndb_path = \"~/.light-ai-gateway/gateway.db\"\n\
+             [providers.xkiro]\nadapter = \"xkiro\"\nbase_url = \"https://api.xkiro.com/v1\"\n\
+             [providers.xkiro.accounts.a]\n",
+        )
+        .unwrap();
+        let p = cfg.db_path();
+        assert!(p.is_absolute(), "must expand, got {}", p.display());
+        assert!(
+            !p.components().any(|c| c.as_os_str() == "~"),
+            "no literal ~ component: {}",
+            p.display()
+        );
+        assert!(p.ends_with(".light-ai-gateway/gateway.db"), "{}", p.display());
+    }
+
+    #[test]
+    fn expand_tilde_handles_exactly_the_two_shell_spellings() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~"), PathBuf::from(&home));
+        assert_eq!(
+            expand_tilde("~/.light-ai-gateway/gateway.db"),
+            PathBuf::from(&home).join(".light-ai-gateway/gateway.db")
+        );
+        // "~user" needs an account database to resolve, so it is left alone
+        // rather than guessed at; a relative or absolute path has no tilde.
+        assert_eq!(
+            expand_tilde("~someone/gw.db"),
+            PathBuf::from("~someone/gw.db")
+        );
+        assert_eq!(expand_tilde("/var/lib/gw.db"), PathBuf::from("/var/lib/gw.db"));
+        assert_eq!(expand_tilde("rel/gw.db"), PathBuf::from("rel/gw.db"));
     }
 
     #[test]
