@@ -2,6 +2,13 @@
 name = "light-ai-gateway"
 version = "0.1.0"
 edition = "2024"
+# The crate is light-ai-gateway, but the command every document, help text and
+# error message refers to is ai-gw. Declaring the binary explicitly is what makes
+# "cargo install" put a working ai-gw on PATH instead of a binary whose name
+# appears nowhere in the documentation.
+[[bin]]
+name = "ai-gw"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"

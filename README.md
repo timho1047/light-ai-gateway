@@ -22,19 +22,53 @@ everything cost.
 
 Design and rationale: [docs/DESIGN.md](docs/DESIGN.md).
 
+## Install
+
+The build produces a single self-contained binary: no runtime, no interpreter,
+nothing to install alongside it.
+
+    cargo install --path . --locked
+
+That builds in release mode and puts ai-gw on your PATH (~/.cargo/bin), which is
+already there if you installed Rust with rustup. Check it:
+
+    ai-gw --version
+
+Other ways to get the same binary:
+
+    # build it and copy it wherever you like; it has no dependencies
+    cargo build --release && cp target/release/ai-gw /usr/local/bin/
+
+    # straight from a git remote, once this is pushed somewhere
+    cargo install --git <repo-url> --locked
+
+To remove it again:
+
+    cargo uninstall light-ai-gateway
+
+Re-run cargo install after pulling changes; it replaces the binary in place.
+
 ## Quick start
 
-    cargo build --release
-    ./target/release/light-ai-gateway init          # writes an example config
-    cp config.example.toml ~/.light-ai-gateway/config.toml
+    ai-gw init                                      # writes ~/.light-ai-gateway/config.toml
     $EDITOR ~/.light-ai-gateway/config.toml         # add providers, accounts, routes
 
-    ai-gw keys add xkiro acc-1                      # hidden prompt; run once per account
+    ai-gw keys add xkiro acc-1                      # hidden prompt; once per account
     ai-gw keys add xkiro acc-2
     ai-gw keys list                                 # check everything resolves
 
     ai-gw doctor                                    # config, credentials, probe reachability
     ai-gw serve
+
+Where things live:
+
+    ~/.cargo/bin/ai-gw                          the binary
+    ~/.light-ai-gateway/config.toml             configuration
+    ~/.light-ai-gateway/gateway.db              usage ledger (SQLite)
+    the OS credential store                     API keys
+
+Config resolution order: --config PATH, then $AI_GW_CONFIG, then ./ai-gw.toml,
+then ~/.light-ai-gateway/config.toml. ai-gw doctor prints which one it used.
 
 Then point your client at it:
 
