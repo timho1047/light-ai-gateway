@@ -930,7 +930,7 @@ struct ModelsQuery {
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 
 /// One provider's own model catalog, keyed by the id that provider publishes.
-type Catalog = BTreeMap<String, Value>;
+pub type Catalog = BTreeMap<String, Value>;
 
 /// The model catalog: exactly the routes this gateway is configured to serve.
 ///
@@ -987,7 +987,7 @@ async fn list_models(
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut catalogs: BTreeMap<&str, Catalog> = BTreeMap::new();
     for provider in wanted.keys() {
-        match fetch_catalog(backend, provider, &request_id).await {
+        match catalog_for_provider(backend, provider, &request_id).await {
             Ok(catalog) => {
                 let unmatched: Vec<&str> = wanted[provider]
                     .iter()
@@ -1003,7 +1003,7 @@ async fn list_models(
                         provider,
                         model,
                         published = catalog.len(),
-                        closest = %closest_ids(&catalog, model),
+                        closest = %closest_hint(&catalog, model),
                         "this configured route is not in the provider's catalog; it is \
                          listed without the provider's fields"
                     );
@@ -1049,28 +1049,15 @@ fn model_entry(model: &str, provider: &str, published: Option<&Value>) -> Value 
     entry
 }
 
-/// Published ids that look like the one we are looking for.
-///
-/// When a route is missing from a catalog the reason is almost always the vendor
-/// prefix: "glm/glm-5.3-flash" against a catalog full of "z-ai/glm-5.3-flash". So
-/// the ids worth printing are the ones that share the model's own name, not the
-/// first eight alphabetically -- those are just whichever vendor sorts first.
-fn closest_ids(catalog: &Catalog, model: &str) -> String {
-    let name = model
-        .rsplit('/')
-        .next()
-        .unwrap_or(model)
-        .to_ascii_lowercase();
-    let mut ids: Vec<&str> = catalog
-        .keys()
-        .filter(|id| !name.is_empty() && id.to_ascii_lowercase().contains(name.as_str()))
-        .map(String::as_str)
-        .collect();
+/// The published ids closest to a model that is missing from a catalog, as one
+/// line for a log. "-" when nothing is close, so the line still reads.
+fn closest_hint(catalog: &Catalog, model: &str) -> String {
+    let ids = crate::closest_names(catalog.keys().map(String::as_str), model, 8);
     if ids.is_empty() {
-        ids = catalog.keys().map(String::as_str).collect();
+        "-".to_string()
+    } else {
+        ids.join(", ")
     }
-    ids.truncate(8);
-    ids.join(", ")
 }
 
 /// The provider's entry for a model: exact match first, then case-insensitive.
@@ -1111,8 +1098,8 @@ fn catalog_from(value: Value) -> Catalog {
         .collect()
 }
 
-/// Read one provider's catalog with an eligible account's key.
-async fn fetch_catalog(
+/// Read one provider's catalog with an eligible account's key, through the pool.
+async fn catalog_for_provider(
     backend: &dyn ProxyBackend,
     provider: &str,
     request_id: &str,
@@ -1128,12 +1115,23 @@ async fn fetch_catalog(
     let Some(account) = backend.account(&plan.qualified_account()) else {
         return Err("the planned account is no longer in the pool".to_string());
     };
+    fetch_catalog(&backend.http(), &account.base_url, &account.api_key).await
+}
 
-    let url = format!("{}/models", account.base_url.trim_end_matches('/'));
-    let response = backend
-        .http()
+/// Read and parse one provider's model catalog.
+///
+/// Shared by `/v1/models` and `lgw doctor`: the two have to agree about what a
+/// provider publishes, and a second copy of this is a second answer. Errors are
+/// strings because every caller reports them rather than acting on them.
+pub async fn fetch_catalog(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &ApiKey,
+) -> std::result::Result<Catalog, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = client
         .get(&url)
-        .bearer_auth(account.api_key.expose())
+        .bearer_auth(api_key.expose())
         .header(header::ACCEPT, "application/json")
         .send()
         .await
@@ -1150,6 +1148,11 @@ async fn fetch_catalog(
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("{url} did not answer with JSON: {e}"))?;
     Ok(catalog_from(value))
+}
+
+/// Whether the provider publishes this model id (exact, then case-insensitive).
+pub fn publishes(catalog: &Catalog, model: &str) -> bool {
+    lookup(catalog, model).is_some()
 }
 
 /// One upstream failure that is worth reporting to the client if no retry

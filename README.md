@@ -429,8 +429,17 @@ is what account switching destroys.
 ## When it does not work
 
 Start with `lgw doctor`. It parses the config, resolves every credential, probes
-every provider, flags a port other machines can reach, and exits non-zero with a
-count of what is wrong.
+every provider, checks the two things a model name can silently disagree about --
+a price entry no route can reach, and a route the provider's own `/v1/models` does
+not publish (it names the closest id it does publish) -- flags a port other
+machines can reach, and exits non-zero with a count of what is wrong.
+
+The second check is worth explaining: a route key is the model id sent upstream,
+so a wrong vendor prefix (`glm/glm-5.3-flash` where the provider has
+`z-ai/glm-5.3-flash`) is a request the provider refuses -- and it also orphans
+whatever price entry was written for the real id, leaving the route gated at the
+conservative default of 15 in / 75 out per million. Both halves of that are
+reported, separately, because either one can happen alone.
 
 | Symptom | Where to look |
 |---|---|

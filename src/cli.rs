@@ -1420,6 +1420,51 @@ fn credential_store() -> CredentialStore {
     CredentialStore::from_env()
 }
 
+/// A price entry that no route can reach.
+struct UnreachablePrice {
+    provider: String,
+    model: String,
+    /// Configured routes whose name is close to it: the likely typo.
+    closest: Vec<String>,
+}
+
+/// Price entries no route points at.
+///
+/// The price table is keyed by the model id the PROVIDER sees, which is the route
+/// name. An entry whose model no route maps to that provider is dead config --
+/// and worse than dead: the route it was written for is priced by the conservative
+/// default, so real traffic is sized at 15/75 per million instead of the rate
+/// card. That is exactly how a wrong vendor prefix in [routes] hides, which is why
+/// doctor says it out loud.
+fn unreachable_prices(config: &Config) -> Vec<UnreachablePrice> {
+    let mut out = Vec::new();
+    for (provider, models) in &config.prices {
+        for model in models.keys() {
+            if config.routes.get(model).is_some_and(|p| p == provider) {
+                continue;
+            }
+            out.push(UnreachablePrice {
+                provider: provider.clone(),
+                model: model.clone(),
+                closest: crate::closest_names(config.routes.keys().map(String::as_str), model, 3)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            });
+        }
+    }
+    out
+}
+
+/// The configured routes, grouped by provider and ordered by model name.
+fn routes_by_provider(config: &Config) -> BTreeMap<&str, Vec<&str>> {
+    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (model, provider) in &config.routes {
+        out.entry(provider.as_str()).or_default().push(model);
+    }
+    out
+}
+
 async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<()> {
     let mut problems = 0u32;
     println!("config path : {} (from {})", path.display(), origin.label());
@@ -1459,6 +1504,33 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
                 "WARNING: allow_metered is on; requests may silently spend wallet or purchased credits"
             )
         );
+    }
+
+    // Offline, and about the config rather than a credential: a price the routes
+    // cannot reach, which is how a mistyped route name hides.
+    let unreachable = unreachable_prices(&config);
+    if config.prices.values().all(|models| models.is_empty()) {
+        println!("prices      : none configured; every route is sized at the conservative default");
+    } else if unreachable.is_empty() {
+        println!(
+            "prices      : {}",
+            pal.green("every entry is reachable from a route")
+        );
+    } else {
+        println!("prices      :");
+        for entry in &unreachable {
+            let hint = if entry.closest.is_empty() {
+                String::new()
+            } else {
+                format!(" - did you mean {:?}?", entry.closest.join("\" or \""))
+            };
+            println!(
+                "  {}: no route sends this model to {}{hint}",
+                pal.red(&format!("[prices.{}.{:?}]", entry.provider, entry.model)),
+                entry.provider
+            );
+            problems += 1;
+        }
     }
 
     let db = config.db_path();
@@ -1556,6 +1628,48 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
                     },
                 }
             }
+        }
+    }
+
+    // What each provider actually publishes. A route the provider does not have is
+    // a request it will refuse, and this is the check that catches a mistyped
+    // vendor prefix on its own -- the price check above only catches it when a
+    // price entry happens to be spelled the other way round.
+    println!("catalog     :");
+    let by_provider = routes_by_provider(&config);
+    if by_provider.is_empty() {
+        println!("  no routes configured");
+    }
+    for (provider, routes) in &by_provider {
+        let Some(account) = usable.iter().find(|a| a.provider == *provider) else {
+            println!("  {provider}: skipped, no usable credential to ask with");
+            continue;
+        };
+        match crate::proxy::fetch_catalog(&client, &account.base_url, &account.api_key).await {
+            Ok(catalog) => {
+                for model in routes {
+                    if crate::proxy::publishes(&catalog, model) {
+                        println!("  {model} ({provider}): {}", pal.green("ok"));
+                        continue;
+                    }
+                    let closest =
+                        crate::closest_names(catalog.keys().map(String::as_str), model, 3);
+                    let hint = if closest.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" - closest published id: {}", closest.join(", "))
+                    };
+                    println!(
+                        "  {model} ({provider}): {} ({} models published){hint}",
+                        pal.red("NOT in the provider's catalog"),
+                        catalog.len()
+                    );
+                    problems += 1;
+                }
+            }
+            // Not a problem the operator can fix: the provider may simply not
+            // offer a model list. Say so and move on.
+            Err(reason) => println!("  {provider}: could not read its catalog: {reason}"),
         }
     }
 
@@ -3477,6 +3591,148 @@ key = {{ key_file = "{key_file}" }}
         assert!(text.contains("850ms"));
         assert!(text.contains("45.2"));
         assert!(text.contains("covered"));
+    }
+
+    // ----------------------------------------------------------------- doctor
+
+    /// The bug this exists for: the price was written for the id xkiro publishes,
+    /// the route was typed with the wrong vendor prefix, and the two never met.
+    /// The route then had no price at all, so the hard gate sized it at the
+    /// conservative default -- a 100x overestimate that nothing reported.
+    #[test]
+    fn a_price_no_route_can_reach_is_reported_with_the_route_it_was_meant_for() {
+        let config = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+
+[providers.xkiro.accounts.acc-1]
+key = "sk-x"
+
+[prices.xkiro."z-ai/glm-5.3-flash"]
+input = 0.15
+output = 0.5
+
+[routes]
+"glm/glm-5.3-flash" = "xkiro"
+"#,
+        )
+        .unwrap();
+
+        let found = unreachable_prices(&config);
+        assert_eq!(found.len(), 1, "the price entry cannot be reached");
+        assert_eq!(found[0].provider, "xkiro");
+        assert_eq!(found[0].model, "z-ai/glm-5.3-flash");
+        assert_eq!(
+            found[0].closest,
+            vec!["glm/glm-5.3-flash"],
+            "the hint names the route that probably meant this model"
+        );
+    }
+
+    #[test]
+    fn a_price_a_route_can_reach_is_not_reported() {
+        let config = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+
+[providers.xkiro.accounts.acc-1]
+key = "sk-x"
+
+[prices.xkiro."z-ai/glm-5.3-flash"]
+input = 0.15
+output = 0.5
+
+[routes]
+"z-ai/glm-5.3-flash" = "xkiro"
+"#,
+        )
+        .unwrap();
+
+        assert!(unreachable_prices(&config).is_empty());
+        assert_eq!(
+            routes_by_provider(&config).get("xkiro"),
+            Some(&vec!["z-ai/glm-5.3-flash"])
+        );
+    }
+
+    /// The same model name under the wrong provider is still unreachable: a price
+    /// is looked up by (provider, model), and the route is what decides provider.
+    #[test]
+    fn a_price_for_another_provider_is_unreachable() {
+        let config = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+
+[providers.xkiro.accounts.acc-1]
+key = "sk-x"
+
+[providers.commandcode]
+adapter = "command-code"
+base_url = "https://api.commandcode.ai/provider/v1"
+
+[providers.commandcode.accounts.acc-1]
+key = "sk-c"
+
+[prices.xkiro."deepseek/deepseek-v4.1-flash"]
+input = 0.15
+output = 0.6
+
+[routes]
+"deepseek/deepseek-v4.1-flash" = "commandcode"
+"#,
+        )
+        .unwrap();
+
+        let found = unreachable_prices(&config);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].provider, "xkiro");
+        assert_eq!(found[0].model, "deepseek/deepseek-v4.1-flash");
+    }
+
+    /// Routes are grouped per provider, each in model order, which is how the
+    /// catalog check asks each provider once.
+    #[test]
+    fn routes_are_grouped_by_provider_in_model_order() {
+        let config = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+
+[providers.xkiro.accounts.acc-1]
+key = "sk-x"
+
+[providers.commandcode]
+adapter = "command-code"
+base_url = "https://api.commandcode.ai/provider/v1"
+
+[providers.commandcode.accounts.acc-1]
+key = "sk-c"
+
+[routes]
+"z-ai/glm-5.3-flash" = "xkiro"
+"deepseek/deepseek-v4.1-flash" = "commandcode"
+"z-ai/glm-5.3-pro" = "xkiro"
+"#,
+        )
+        .unwrap();
+
+        let grouped = routes_by_provider(&config);
+        assert_eq!(
+            grouped.get("xkiro"),
+            Some(&vec!["z-ai/glm-5.3-flash", "z-ai/glm-5.3-pro"])
+        );
+        assert_eq!(
+            grouped.get("commandcode"),
+            Some(&vec!["deepseek/deepseek-v4.1-flash"])
+        );
+        assert_eq!(grouped.len(), 2, "one group per provider that has routes");
     }
 
     // ------------------------------------------------------------------- init
