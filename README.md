@@ -110,6 +110,32 @@ Then point your client at it:
     export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
     export OPENAI_API_KEY=unused          # or the local_key you configured
 
+### Endpoints
+
+    POST /v1/chat/completions     the proxy: retries, account switching, the usage ledger
+    GET  /v1/models               the models this gateway will serve, described by the provider
+
+`/v1/models` answers with your `[routes]` and nothing else: everything the
+provider sells but you have not routed is left out, because asking for one of
+those gets a "no route for model" error, and a model picker full of models that
+cannot be called is worse than a short one. The fields come from the provider's
+own `/v1/models` response, passed through unchanged -- context length, prices,
+capability flags, whatever that provider publishes -- with `id`, `object` and,
+when the provider does not name an owner itself, `owned_by` set to the provider:
+
+    curl http://127.0.0.1:8787/v1/models                     # every route
+    curl "http://127.0.0.1:8787/v1/models?provider=xkiro"    # one provider's routes
+
+One upstream call per provider per request, made with an eligible account's key;
+a model list spends no tokens and gives the account's reservation straight back. A
+provider whose catalog cannot be read does
+not break the list: its routes are still returned, without that provider's
+fields, and the reason is logged. A route that the provider's catalog does not
+mention is still listed -- the route is what works, and its absence from the
+catalog is the provider's business -- but with `RUST_LOG=debug` the log prints the
+published ids closest to it, which is how a wrong vendor prefix gets found (ours
+had `glm/glm-5.3-flash` where xkiro publishes `z-ai/glm-5.3-flash`).
+
 ## Credentials
 
 Keys go into the operating system's own credential store (macOS Keychain,

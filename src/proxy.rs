@@ -39,6 +39,7 @@ use axum::routing::{get, post};
 use futures_util::Stream;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -916,100 +917,239 @@ async fn chat_completions(
 
 #[derive(serde::Deserialize)]
 struct ModelsQuery {
+    /// Only list the routes served by this provider.
     #[serde(default)]
     provider: Option<String>,
 }
 
-/// Pass the model list through for one provider.
+/// Cap on a provider's model catalog.
+///
+/// It is a list of names, not a payload: a provider answering with more than this
+/// is not answering the question we asked, and reading it unbounded lets one slow
+/// upstream hold the endpoint open.
+const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+
+/// One provider's own model catalog, keyed by the id that provider publishes.
+type Catalog = BTreeMap<String, Value>;
+
+/// The model catalog: exactly the routes this gateway is configured to serve.
+///
+/// The SET is ours and the FIELDS are the provider's. A client's contract with
+/// this gateway is `[routes]` -- `Config::resolve` refuses anything else with "no
+/// route for model", so answering with the provider's whole catalog would
+/// advertise a hundred models that all fail, and the one thing a model list is
+/// for is picking one that works. Each listed model therefore comes from the
+/// route table, while everything else about it (display name, context length,
+/// pricing, capabilities -- whatever the provider publishes) is passed through
+/// from that provider's own `/v1/models` response. Nothing here is a second copy
+/// that can drift from what the provider charges.
+///
+/// One upstream call per provider, not per model. A provider whose catalog cannot
+/// be read does not fail the request either: its configured routes are listed
+/// with the fields we do have, the reason is logged, and a client still gets the
+/// list it needs.
 async fn list_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Response {
-    let provider = {
-        let cfg = state.backend.config();
-        match query.provider {
-            Some(p) if cfg.providers.contains_key(&p) => p,
-            Some(p) => {
-                return error_response(
-                    StatusCode::NOT_FOUND,
-                    "invalid_request_error",
-                    &format!("unknown provider {p}"),
-                );
-            }
-            None => match cfg.providers.keys().next() {
-                Some(p) => p.clone(),
-                None => {
-                    return error_response(
-                        StatusCode::NOT_FOUND,
-                        "invalid_request_error",
-                        "no providers are configured",
-                    );
-                }
-            },
-        }
-    };
+    let backend = state.backend.as_ref();
+
+    if let Some(named) = &query.provider
+        && !backend.config().providers.contains_key(named)
+    {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "invalid_request_error",
+            &format!("unknown provider {named}"),
+        );
+    }
+
+    // routes is model -> provider, and it iterates in model order, which is the
+    // order a reader scans a model list in.
+    let routes: Vec<(String, String)> = backend
+        .config()
+        .routes
+        .iter()
+        .filter(|(_, provider)| {
+            query
+                .provider
+                .as_ref()
+                .is_none_or(|named| named == *provider)
+        })
+        .map(|(model, provider)| (model.clone(), provider.clone()))
+        .collect();
+
+    let mut wanted: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (model, provider) in &routes {
+        wanted.entry(provider.as_str()).or_default().push(model);
+    }
 
     let request_id = uuid::Uuid::new_v4().to_string();
-    let plan = match state
-        .backend
-        .pick_account(&provider, Decimal::ZERO, &request_id, 1)
-    {
-        Ok(plan) => plan,
-        Err(err) => return plan_error_response(&err, state.backend.as_ref()),
+    let mut catalogs: BTreeMap<&str, Catalog> = BTreeMap::new();
+    for provider in wanted.keys() {
+        match fetch_catalog(backend, provider, &request_id).await {
+            Ok(catalog) => {
+                let unmatched: Vec<&str> = wanted[provider]
+                    .iter()
+                    .copied()
+                    .filter(|model| lookup(&catalog, model).is_none())
+                    .collect();
+                for model in unmatched {
+                    // A model list is read for its fields, so a route the provider
+                    // does not publish is a route with no fields -- and the first
+                    // question is always "what does the provider call it?". The ids
+                    // answer that. Debug level, names only.
+                    tracing::debug!(
+                        provider,
+                        model,
+                        published = catalog.len(),
+                        closest = %closest_ids(&catalog, model),
+                        "this configured route is not in the provider's catalog; it is \
+                         listed without the provider's fields"
+                    );
+                }
+                catalogs.insert(provider, catalog);
+            }
+            Err(reason) => tracing::warn!(
+                provider,
+                reason = %reason,
+                "the model catalog could not be read; listing this provider's configured \
+                 routes without the provider's own fields"
+            ),
+        }
+    }
+
+    let mut data: Vec<Value> = Vec::with_capacity(routes.len());
+    for (model, provider) in &routes {
+        let published = catalogs
+            .get(provider.as_str())
+            .and_then(|catalog| lookup(catalog, model));
+        data.push(model_entry(model, provider, published));
+    }
+
+    json_response(json!({ "object": "list", "data": data }))
+}
+
+/// One model: the provider's entry, with the two fields that are ours.
+///
+/// `id` and `object` are always set here -- the client asked for this route's
+/// name, and an entry without `object` is not a model object. `owned_by` names
+/// the provider only when the provider's own entry does not: when it is there it
+/// is the provider's answer, not ours, and it is never overwritten.
+fn model_entry(model: &str, provider: &str, published: Option<&Value>) -> Value {
+    let mut entry = match published {
+        Some(Value::Object(fields)) => Value::Object(fields.clone()),
+        _ => json!({}),
     };
-    let Some(account) = state.backend.account(&plan.qualified_account()) else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "the planned account is no longer in the pool",
-        );
+    entry["id"] = json!(model);
+    entry["object"] = json!("model");
+    if entry.get("owned_by").and_then(Value::as_str).is_none() {
+        entry["owned_by"] = json!(provider);
+    }
+    entry
+}
+
+/// Published ids that look like the one we are looking for.
+///
+/// When a route is missing from a catalog the reason is almost always the vendor
+/// prefix: "glm/glm-5.3-flash" against a catalog full of "z-ai/glm-5.3-flash". So
+/// the ids worth printing are the ones that share the model's own name, not the
+/// first eight alphabetically -- those are just whichever vendor sorts first.
+fn closest_ids(catalog: &Catalog, model: &str) -> String {
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let mut ids: Vec<&str> = catalog
+        .keys()
+        .filter(|id| !name.is_empty() && id.to_ascii_lowercase().contains(name.as_str()))
+        .map(String::as_str)
+        .collect();
+    if ids.is_empty() {
+        ids = catalog.keys().map(String::as_str).collect();
+    }
+    ids.truncate(8);
+    ids.join(", ")
+}
+
+/// The provider's entry for a model: exact match first, then case-insensitive.
+///
+/// A provider that spells its own id differently from the route is not a reason
+/// to drop the fields we asked for, and a case-insensitive match cannot pick the
+/// wrong model -- only the same name spelled differently.
+fn lookup<'a>(catalog: &'a Catalog, model: &str) -> Option<&'a Value> {
+    catalog.get(model).or_else(|| {
+        catalog
+            .iter()
+            .find(|(id, _)| id.eq_ignore_ascii_case(model))
+            .map(|(_, entry)| entry)
+    })
+}
+
+/// Index a `/models` response by model id.
+///
+/// Both envelopes in the wild are accepted -- OpenAI's
+/// `{"object":"list","data":[]}` and a bare array -- because a provider that
+/// answers the same question in the other shape is not worth failing a model list
+/// over. Entries without a usable id are dropped rather than listed as blank.
+fn catalog_from(value: Value) -> Catalog {
+    let entries = match value {
+        Value::Array(entries) => entries,
+        other => other
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let id = entry.get("id").and_then(Value::as_str)?.trim().to_string();
+            (!id.is_empty()).then_some((id, entry))
+        })
+        .collect()
+}
+
+/// Read one provider's catalog with an eligible account's key.
+async fn fetch_catalog(
+    backend: &dyn ProxyBackend,
+    provider: &str,
+    request_id: &str,
+) -> std::result::Result<Catalog, String> {
+    // A model list spends no tokens, so it is planned at zero cost, and
+    // pick_account hands the reservation straight back: polling the list cannot
+    // fill an account's concurrency limit. (An account with an rpm_limit does
+    // count the call, which is the one place a polling client is visible to the
+    // pool -- hence one call per provider, not one per model.)
+    let plan = backend
+        .pick_account(provider, Decimal::ZERO, request_id, 1)
+        .map_err(|e| e.to_string())?;
+    let Some(account) = backend.account(&plan.qualified_account()) else {
+        return Err("the planned account is no longer in the pool".to_string());
     };
 
     let url = format!("{}/models", account.base_url.trim_end_matches('/'));
-    let response = match state
-        .backend
+    let response = backend
         .http()
         .get(&url)
         .bearer_auth(account.api_key.expose())
         .header(header::ACCEPT, "application/json")
         .send()
         .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                &format!("the upstream is unreachable: {e}"),
-            );
-        }
-    };
+        .map_err(|e| format!("{url} is unreachable: {e}"))?;
 
     let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
     if !status.is_success() {
         let text = read_bounded(response, 8 * 1024).await;
-        let detail = upstream_error_message(&text)
-            .unwrap_or_else(|| format!("upstream returned HTTP {}", status.as_u16()));
-        return error_response(StatusCode::BAD_GATEWAY, "upstream_error", &detail);
+        return Err(upstream_error_message(&text)
+            .unwrap_or_else(|| format!("{url} returned HTTP {}", status.as_u16())));
     }
 
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from_stream(response.bytes_stream()))
-        .unwrap_or_else(|_| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                "failed to build the upstream response",
-            )
-        })
+    let text = read_bounded(response, MAX_CATALOG_BYTES).await;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{url} did not answer with JSON: {e}"))?;
+    Ok(catalog_from(value))
 }
 
 /// One upstream failure that is worth reporting to the client if no retry
@@ -1198,6 +1338,16 @@ fn sanitize_message(message: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// A JSON body with the status the OpenAI SDKs expect from a success.
+fn json_response(payload: Value) -> Response {
+    let mut response = Response::new(Body::from(payload.to_string()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 fn error_response(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -1446,11 +1596,16 @@ mod tests {
         JsonOk,
     }
 
+    /// What a provider answers `GET /models` with. The default is the one model
+    /// the test config routes to; tests about the catalog set their own.
+    const MOCK_CATALOG: &str = r#"{"object":"list","data":[{"id":"mock/model","object":"model"}]}"#;
+
     struct MockUpstream {
         mode: MockMode,
         calls: AtomicUsize,
         bearers: Mutex<Vec<String>>,
         bodies: Mutex<Vec<Value>>,
+        catalog: String,
     }
 
     async fn mock_models(State(m): State<Arc<MockUpstream>>, headers: HeaderMap) -> Response {
@@ -1460,9 +1615,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         m.bearers.lock().unwrap().push(bearer);
-        let mut response = Response::new(Body::from(
-            r#"{"object":"list","data":[{"id":"mock/model","object":"model"}]}"#,
-        ));
+        let mut response = Response::new(Body::from(m.catalog.clone()));
         response
             .headers_mut()
             .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
@@ -1529,11 +1682,17 @@ mod tests {
     }
 
     async fn spawn_mock(mode: MockMode) -> (String, Arc<MockUpstream>) {
+        spawn_mock_with_catalog(mode, MOCK_CATALOG).await
+    }
+
+    /// A mock provider whose `/models` answers with the given catalog.
+    async fn spawn_mock_with_catalog(mode: MockMode, catalog: &str) -> (String, Arc<MockUpstream>) {
         let state = Arc::new(MockUpstream {
             mode,
             calls: AtomicUsize::new(0),
             bearers: Mutex::new(Vec::new()),
             bodies: Mutex::new(Vec::new()),
+            catalog: catalog.to_string(),
         });
         let app = Router::new()
             .route("/chat/completions", post(mock_chat))
@@ -1753,6 +1912,42 @@ key = "sk-a2"
         Arc::new(FakeBackend::new(config, pool))
     }
 
+    /// Two providers with one route each: what a model list has to fan out over.
+    fn fake_backend_two(base_a: &str, base_b: &str) -> Arc<FakeBackend> {
+        let toml = format!(
+            r#"
+[server]
+listen = "127.0.0.1:0"
+
+[providers.mock]
+adapter = "none"
+base_url = "{base_a}"
+
+[providers.mock.accounts.a1]
+key = "sk-a1"
+
+[providers.other]
+adapter = "none"
+base_url = "{base_b}"
+
+[providers.other.accounts.b1]
+key = "sk-b1"
+
+[routes]
+"mock/model" = "mock"
+"other/model" = "other"
+"#
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+        let accounts = config
+            .build_accounts(&crate::secrets::CredentialStore::memory())
+            .unwrap();
+        let pool = Pool::new(accounts, &config.policy);
+        activate(&pool, "mock/a1", 0);
+        activate(&pool, "other/b1", 0);
+        Arc::new(FakeBackend::new(config, pool))
+    }
+
     async fn spawn_router(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1880,6 +2075,169 @@ key = "sk-a2"
             0,
             "a passthrough must not hold a reservation"
         );
+    }
+
+    /// The list is the configured routes, and the fields are the provider's own.
+    #[tokio::test]
+    async fn the_model_list_is_the_routes_described_by_the_provider() {
+        let catalog = r#"{"object":"list","data":[
+            {"id":"mock/not-routed","object":"model","display_name":"Not Routed"},
+            {"id":"mock/model","object":"model","owned_by":"z-ai","display_name":"Mock Model",
+             "context_length":200000,
+             "pricing":{"currency":"USD","unit":"per_1m_tokens","input":0.44,"output":1.86}}
+        ]}"#;
+        let (upstream_url, mock) = spawn_mock_with_catalog(MockMode::JsonOk, catalog).await;
+        let addr = spawn_router(build_router_with(fake_backend(&upstream_url))).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+
+        assert_eq!(body["object"], json!("list"));
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(
+            data.len(),
+            1,
+            "the provider's catalog is not advertised: {body}"
+        );
+        assert_eq!(data[0]["id"], json!("mock/model"));
+        assert_eq!(data[0]["object"], json!("model"));
+        // Whatever the provider published is passed through, field for field.
+        assert_eq!(data[0]["display_name"], json!("Mock Model"));
+        assert_eq!(data[0]["context_length"], json!(200000));
+        assert_eq!(data[0]["pricing"]["unit"], json!("per_1m_tokens"));
+        assert_eq!(data[0]["pricing"]["input"], json!(0.44));
+        // And its own answer is not overwritten by ours.
+        assert_eq!(data[0]["owned_by"], json!("z-ai"));
+        assert_eq!(
+            *mock.bearers.lock().unwrap(),
+            vec!["Bearer sk-a1".to_string()]
+        );
+    }
+
+    /// A provider that does not list a configured route does not remove it.
+    ///
+    /// The route is what this gateway will actually serve, so hiding it because
+    /// the provider's catalog is stale -- or spells the name differently -- would
+    /// make the list lie about what works. Fields we cannot source stay absent.
+    #[tokio::test]
+    async fn a_route_the_provider_does_not_list_is_still_listed() {
+        let (upstream_url, _mock) = spawn_mock_with_catalog(
+            MockMode::JsonOk,
+            r#"{"object":"list","data":[{"id":"mock/other","object":"model"}]}"#,
+        )
+        .await;
+        let addr = spawn_router(build_router_with(fake_backend(&upstream_url))).await;
+
+        let body: Value = reqwest::Client::new()
+            .get(format!("{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "{body}");
+        assert_eq!(data[0]["id"], json!("mock/model"));
+        assert_eq!(data[0]["object"], json!("model"));
+        assert_eq!(data[0]["owned_by"], json!("mock"), "{body}");
+        assert!(
+            data[0].get("display_name").is_none(),
+            "no field is invented for the provider: {body}"
+        );
+    }
+
+    /// An unreachable provider leaves the route table intact.
+    ///
+    /// A model list is how a client decides what to send; failing it because one
+    /// provider's status endpoint is down would take the whole gateway out of the
+    /// picker even though every other provider is fine.
+    #[tokio::test]
+    async fn an_unreadable_catalog_still_lists_the_routes() {
+        // Port 1 is not listening, so the upstream call fails.
+        let addr = spawn_router(build_router_with(fake_backend("http://127.0.0.1:1"))).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            200,
+            "a broken provider is not a broken model list"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["data"][0]["id"], json!("mock/model"));
+        assert_eq!(body["data"][0]["owned_by"], json!("mock"));
+    }
+
+    /// Every configured route, from every provider, one upstream call each.
+    #[tokio::test]
+    async fn the_model_list_fans_out_over_providers_once_each() {
+        let (a_url, a) = spawn_mock_with_catalog(
+            MockMode::JsonOk,
+            r#"{"object":"list","data":[{"id":"mock/model","object":"model","display_name":"A"}]}"#,
+        )
+        .await;
+        let (b_url, b) = spawn_mock_with_catalog(
+            MockMode::JsonOk,
+            r#"{"object":"list","data":[{"id":"other/model","object":"model","display_name":"B"}]}"#,
+        )
+        .await;
+        let addr = spawn_router(build_router_with(fake_backend_two(&a_url, &b_url))).await;
+
+        let body: Value = reqwest::Client::new()
+            .get(format!("{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2, "{body}");
+        assert_eq!(data[0]["id"], json!("mock/model"));
+        assert_eq!(data[1]["id"], json!("other/model"));
+        assert_eq!(data[0]["display_name"], json!("A"));
+        assert_eq!(data[1]["display_name"], json!("B"));
+        assert_eq!(
+            *a.bearers.lock().unwrap(),
+            vec!["Bearer sk-a1".to_string()],
+            "each provider is asked once, with its own key"
+        );
+        assert_eq!(*b.bearers.lock().unwrap(), vec!["Bearer sk-b1".to_string()]);
+
+        // ?provider= narrows the answer to that provider's routes, without asking
+        // the other one again.
+        let filtered: Value = reqwest::Client::new()
+            .get(format!("{addr}/v1/models?provider=other"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let data = filtered["data"].as_array().unwrap();
+        assert_eq!(data.len(), 1, "{filtered}");
+        assert_eq!(data[0]["id"], json!("other/model"));
+        assert_eq!(
+            a.bearers.lock().unwrap().len(),
+            1,
+            "the filtered list does not re-ask the other provider"
+        );
+
+        let unknown = reqwest::Client::new()
+            .get(format!("{addr}/v1/models?provider=nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), 404);
     }
 
     #[tokio::test]

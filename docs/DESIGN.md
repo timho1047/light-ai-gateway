@@ -269,6 +269,8 @@ SQLite（`rusqlite` bundled + WAL + `busy_timeout`，单写者 actor 批量提�
 6. 事件驱动的重新决策 + sticky（防抖动，§2）
 7. SQLite 落库 + `lgw status` / `usage`
 
+`/v1/models` 与 `[routes]` 是同一份真相：只列已配置的 route（其他模型无论如何都会被 `resolve` 拒绝，列出来等于骗客户端），字段逐字透传上游 `/v1/models`。上游没发布的 route 仍然列出，只是只剩 `id`/`object`/`owned_by`；`RUST_LOG=debug` 会打印上游最接近的 id，用于发现写错的 vendor 前缀。
+
 **Phase 1**：价格自学习（Δspent/Δtokens）+ 切换前强制探测 + `tail` TUI + `doctor`。
 
 **Phase 2（只有 N 确实涨上来才做）**：错峰调度、权重策略、herd-safe 旋转、新供应商 adapter。
