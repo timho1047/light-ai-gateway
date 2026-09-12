@@ -30,7 +30,7 @@ use crate::domain::{
 };
 use crate::quota::probe_for;
 use crate::router::Gateway;
-use crate::secrets::CredentialStore;
+use crate::secrets::{CredentialStore, LOCAL_KEY_ACCOUNT, LOCAL_KEY_PROVIDER};
 use crate::store;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -1676,19 +1676,38 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
     // Two settings whose absence is invisible until it costs money or leaks
     // quota. Neither was checked anywhere: the proxy opened its port silently
     // and doctor reported "no problems found".
-    if config.server.local_key.is_none() {
-        println!(
-            "local auth  : {} - anything that can reach {} can spend the pooled quota.",
-            pal.red("MISSING"),
-            config.server.listen
-        );
-        println!(
-            "              {}",
-            pal.dim("fix: lgw keys add local gateway, then set local_key")
-        );
-        problems += 1;
-    } else {
-        println!("local auth  : {}", pal.green("configured"));
+    match &config.server.local_key {
+        None => {
+            println!(
+                "local auth  : {} - anything that can reach {} can spend the pooled quota.",
+                pal.red("MISSING"),
+                config.server.listen
+            );
+            println!(
+                "              {}",
+                pal.dim(
+                    "fix: lgw keys add local gateway, then local_key = { keychain = true } under [server]"
+                )
+            );
+            problems += 1;
+        }
+        Some(secret_ref) => {
+            // "The config names a key" and "the key is there" are different
+            // facts, and serve fails closed on the second one. Doctor is where
+            // that shows up instead of at the next restart.
+            match secret_ref.resolve(&creds, LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT) {
+                Ok(key) => println!(
+                    "local auth  : {} ({} from {})",
+                    pal.green("configured"),
+                    crate::secrets::describe_secret(key.expose()),
+                    secret_ref.describe()
+                ),
+                Err(e) => {
+                    println!("local auth  : {} - {e}", pal.red("NOT RESOLVABLE"));
+                    problems += 1;
+                }
+            }
+        }
     }
     if !listens_on_loopback(&config.server.listen) {
         println!(
@@ -1852,16 +1871,23 @@ fn read_secret(provider: &str, account: &str, from_stdin: bool) -> Result<String
     Ok(trimmed)
 }
 
-fn cmd_keys_add(
-    config: &Config,
-    creds: &CredentialStore,
-    provider: &str,
-    account: &str,
-    from_stdin: bool,
-    pal: &Palette,
-) -> Result<()> {
-    // The credential is looked up by provider/account, so both must exist in the
-    // configuration or the entry could never be reached.
+/// Whether `lgw keys add` may write this provider/account, and why not if it may not.
+///
+/// The credential is looked up by provider/account, so both normally have to exist
+/// in the configuration or the entry could never be reached. The gateway's OWN
+/// access token is the exception: it guards this process's port, it has no
+/// `[providers.local]` entry by design, and `lgw doctor` tells operators to add it
+/// by name -- so refusing it made the advice unusable.
+fn keys_add_target(config: &Config, provider: &str, account: &str) -> Result<()> {
+    if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
+        return Ok(());
+    }
+    if provider == LOCAL_KEY_PROVIDER {
+        bail!(
+            "{provider:?} is reserved for the gateway's own access token, whose only \
+             account is {LOCAL_KEY_ACCOUNT:?}"
+        );
+    }
     let p = config.providers.get(provider).with_context(|| {
         let known: Vec<&str> = config.providers.keys().map(String::as_str).collect();
         format!(
@@ -1877,6 +1903,18 @@ fn cmd_keys_add(
             known.join(", ")
         );
     }
+    Ok(())
+}
+
+fn cmd_keys_add(
+    config: &Config,
+    creds: &CredentialStore,
+    provider: &str,
+    account: &str,
+    from_stdin: bool,
+    pal: &Palette,
+) -> Result<()> {
+    keys_add_target(config, provider, account)?;
 
     let secret = read_secret(provider, account, from_stdin)?;
     creds
@@ -1893,6 +1931,17 @@ fn cmd_keys_add(
                 creds.backend_name(),
                 crate::secrets::describe_secret(&secret)
             );
+            if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
+                // The command doctor prints has to end somewhere useful: storing
+                // the token is half of it, the config line and the restart are the
+                // other half.
+                println!(
+                    "{}",
+                    pal.dim(
+                        "next: set local_key = { keychain = true } under [server], then restart lgw serve"
+                    )
+                );
+            }
             Ok(())
         }
         _ => bail!(
@@ -1922,29 +1971,50 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
     for (provider, p) in &config.providers {
         for (id, a) in &p.accounts {
             let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
-            let (status, resolves) = match secret_ref.resolve(creds, provider, id) {
-                Ok(_) => ("ok".to_string(), true),
-                Err(e) => (format!("MISSING ({e})"), false),
-            };
-            // Say which item the key came out of. Every key lives in the vault,
-            // and the vault is the one item macOS asks about once.
-            let mut source = secret_ref.describe();
-            if matches!(secret_ref, SecretRef::Keychain) {
-                let origin = creds.origin(provider, id);
-                if origin != crate::secrets::CredentialOrigin::Absent {
-                    source = format!("{source} ({})", origin.short());
-                }
-            }
-            rows.push(CredentialRow {
-                provider: provider.clone(),
-                account: id.clone(),
-                source,
-                status,
-                resolves,
-            });
+            rows.push(credential_row(creds, provider, id, &secret_ref));
         }
     }
+    // The gateway's own access token is not a provider credential, but it is a
+    // stored secret with a status, and "did I set that up?" is what this table is
+    // for. It is listed only when the config says to read it from the store.
+    if let Some(secret_ref @ SecretRef::Keychain) = &config.server.local_key {
+        rows.push(credential_row(
+            creds,
+            LOCAL_KEY_PROVIDER,
+            LOCAL_KEY_ACCOUNT,
+            secret_ref,
+        ));
+    }
     rows
+}
+
+/// One credential: where it comes from and whether it resolves. Never the secret.
+fn credential_row(
+    creds: &CredentialStore,
+    provider: &str,
+    account: &str,
+    secret_ref: &SecretRef,
+) -> CredentialRow {
+    let (status, resolves) = match secret_ref.resolve(creds, provider, account) {
+        Ok(_) => ("ok".to_string(), true),
+        Err(e) => (format!("MISSING ({e})"), false),
+    };
+    // Say which item the key came out of. Every key lives in the vault, and the
+    // vault is the one item macOS asks about once.
+    let mut source = secret_ref.describe();
+    if matches!(secret_ref, SecretRef::Keychain) {
+        let origin = creds.origin(provider, account);
+        if origin != crate::secrets::CredentialOrigin::Absent {
+            source = format!("{source} ({})", origin.short());
+        }
+    }
+    CredentialRow {
+        provider: provider.to_string(),
+        account: account.to_string(),
+        source,
+        status,
+        resolves,
+    }
 }
 
 fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Result<()> {
@@ -1993,6 +2063,16 @@ fn cmd_keys_remove(creds: &CredentialStore, provider: &str, account: &str) -> Re
     Ok(())
 }
 
+/// Whether the gateway's own access token is stored, as its length in characters.
+///
+/// The length alone is enough: it catches a truncated paste, and it is the only
+/// fact about that token a report may print.
+fn local_token_status(creds: &CredentialStore) -> Result<Option<usize>> {
+    Ok(creds
+        .get(LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT)?
+        .map(|key| key.expose().len()))
+}
+
 /// Resolve the stored credential and prove it works against the provider.
 async fn cmd_keys_test(
     config: &Config,
@@ -2001,6 +2081,23 @@ async fn cmd_keys_test(
     account: &str,
     pal: &Palette,
 ) -> Result<()> {
+    // The gateway's own access token guards this process's port; no provider has
+    // ever heard of it, so there is nothing to probe. Its status is the whole
+    // check, and saying that is better than "unknown provider".
+    if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
+        return match local_token_status(creds)? {
+            Some(length) => {
+                println!(
+                    "{provider}/{account}: {} - stored ({length} chars); this is the token \
+                     clients must send in Authorization",
+                    pal.green("ok")
+                );
+                Ok(())
+            }
+            None => bail!("no local gateway token is stored; run: lgw keys add local gateway"),
+        };
+    }
+
     let p = config
         .providers
         .get(provider)
@@ -2693,6 +2790,102 @@ key = {{ key_file = "{key_file}" }}
         let p = std::env::temp_dir().join(format!("lgw-key-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&p, contents).unwrap();
         p
+    }
+
+    /// The command `lgw doctor` prints has to work: the gateway's own token is the
+    /// one credential with no provider behind it.
+    #[test]
+    fn the_gateway_token_is_the_one_key_that_needs_no_provider() {
+        let config = keys_config("/tmp/lgw-unused-key-file");
+
+        assert!(
+            keys_add_target(&config, LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT).is_ok(),
+            "doctor tells operators to run exactly this"
+        );
+        // Anything else under that reserved name is a typo, not a provider.
+        let err = keys_add_target(&config, LOCAL_KEY_PROVIDER, "gateway-2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
+
+        assert!(keys_add_target(&config, "nope", "acc").is_err());
+        assert!(keys_add_target(&config, "xkiro", "from-store").is_ok());
+        let err = keys_add_target(&config, "xkiro", "nope")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown account"), "{err}");
+    }
+
+    /// The token is listed once the config says to look for it in the store, and
+    /// its absence is reported as the command that fixes it.
+    #[test]
+    fn the_gateway_token_is_listed_when_the_config_asks_the_store_for_it() {
+        let path = temp_key_file("sk-unused");
+        let config = Config::from_toml_str(&format!(
+            r#"
+[server]
+local_key = {{ keychain = true }}
+
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+
+[providers.xkiro.accounts.from-store]
+key = {{ key_file = "{}" }}
+
+[routes]
+"m" = "xkiro"
+"#,
+            path.to_str().unwrap()
+        ))
+        .unwrap();
+        let creds = CredentialStore::memory();
+
+        let rows = credential_rows(&config, &creds);
+        let local = rows
+            .iter()
+            .find(|r| r.provider == LOCAL_KEY_PROVIDER)
+            .expect("the gateway's own token is part of the credential report");
+        assert_eq!(local.account, LOCAL_KEY_ACCOUNT);
+        assert!(
+            local.source.starts_with("credential-store"),
+            "{}",
+            local.source
+        );
+        assert!(!local.resolves);
+        assert!(
+            local.status.contains("lgw keys add local gateway"),
+            "the status names the fix: {}",
+            local.status
+        );
+
+        creds
+            .set(LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT, "sk-local-token")
+            .unwrap();
+        let rows = credential_rows(&config, &creds);
+        let local = rows
+            .iter()
+            .find(|r| r.provider == LOCAL_KEY_PROVIDER)
+            .unwrap();
+        assert!(local.resolves, "{}", local.status);
+        assert_eq!(local.status, "ok");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Nothing that reports a credential may print it, and this one reports only
+    /// the length that catches a truncated paste.
+    #[test]
+    fn the_gateway_token_status_is_its_length_and_nothing_else() {
+        let creds = CredentialStore::memory();
+        assert_eq!(local_token_status(&creds).unwrap(), None);
+
+        creds
+            .set(LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT, "sk-local-token")
+            .unwrap();
+        assert_eq!(
+            local_token_status(&creds).unwrap(),
+            Some("sk-local-token".len())
+        );
     }
 
     #[test]

@@ -152,6 +152,19 @@ by provider/account name.
 The key is read from a hidden prompt rather than a command-line argument, because
 arguments are visible to every process on the machine and land in shell history.
 
+The gateway has a token of its own as well: the one credential with no provider
+behind it, which clients must send once other machines (or other users) can reach
+the port. Any string you invent works; it is compared, never forwarded upstream:
+
+    lgw keys add local gateway            # hidden prompt, same as any other key
+    # then, under [server] in the config:
+    # local_key = { keychain = true }
+
+`local/gateway` is the single reserved name that needs no `[providers.*]` entry.
+`lgw keys list` shows it next to the provider keys, `lgw doctor` checks that it
+actually resolves (not merely that the config mentions it), and `lgw keys test local
+gateway` reports that it is stored -- there is no upstream to probe for this one.
+
 Explicit alternatives are still supported when you want them:
 key = { keychain = true }, key = { env = "X" }, key = { key_file = "/run/secrets/x" },
 or an inline literal (discouraged).
