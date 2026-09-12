@@ -1,5 +1,7 @@
 # light-ai-gateway
 
+**English** | [简体中文](README.zh-CN.md)
+
 A very small OpenAI-compatible gateway that pools multiple provider accounts and
 routes around exhausted quota windows, so you stop switching API keys by hand.
 
@@ -40,8 +42,10 @@ everything cost.
 - **Shows you the numbers.** A terminal board of covered allowance against
   metered balance, with reset countdowns.
 
-Design and rationale: [docs/DESIGN.md](docs/DESIGN.md). It is written in
-Chinese; this README is the English reference.
+Design and rationale: [docs/DESIGN.md](docs/DESIGN.md) (in Chinese). This file
+is the English reference; [README.zh-CN.md](README.zh-CN.md) is the Chinese one.
+The two mirror each other -- if they ever disagree, the English one is what the
+code does.
 
 ## Install
 
