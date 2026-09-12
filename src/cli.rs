@@ -22,6 +22,7 @@
 //! touching the network. Only status --refresh, accounts probe and doctor reach
 //! out to providers.
 
+use crate::ansi::Palette;
 use crate::config::{Config, QuotaAdapter, SecretRef};
 use crate::domain::{
     Account, AccountOverview, AccountState, Confidence, Gate, GateClass, GateKind, GroupBy,
@@ -74,8 +75,36 @@ pub struct Cli {
     #[arg(long, short = 'c', global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
+    /// When to colour the output: auto, always, never.
+    ///
+    /// `auto` colours only a terminal, so a pipe or a redirect -- every script
+    /// and log that reads this program -- gets the same bytes it always did.
+    #[arg(long, global = true, value_enum, default_value_t = ColorWhen::Auto, value_name = "WHEN")]
+    pub color: ColorWhen,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// What `--color` was told to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorWhen {
+    /// Colour a terminal, leave a pipe alone.
+    Auto,
+    /// Colour even when the output is not a terminal.
+    Always,
+    /// Never colour.
+    Never,
+}
+
+impl ColorWhen {
+    fn palette(self) -> Palette {
+        match self {
+            ColorWhen::Auto => Palette::auto(),
+            ColorWhen::Always => Palette::on(),
+            ColorWhen::Never => Palette::off(),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,6 +243,9 @@ pub async fn run() -> Result<()> {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     let (path, origin) = resolve_config_path(cli.config.clone());
+    // One decision, made once: every renderer below either has a palette or
+    // prints the plain text, and no command decides for itself.
+    let pal = cli.color.palette();
     match cli.command {
         Command::Init(args) => {
             let target = args.path.clone().unwrap_or_else(|| path.clone());
@@ -228,13 +260,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
             );
             crate::proxy::serve(config).await
         }
-        Command::Status(args) => cmd_status(&path, args.refresh).await,
-        Command::Usage(args) => cmd_usage(&path, &args),
-        Command::Accounts(args) => cmd_accounts(&path, args).await,
-        Command::Tail(args) => cmd_tail(&path, args.limit),
-        Command::Doctor => cmd_doctor(&path, origin).await,
-        Command::Keys(args) => cmd_keys(&path, args).await,
-        Command::Prices(args) => cmd_prices(&path, &args),
+        Command::Status(args) => cmd_status(&path, args.refresh, &pal).await,
+        Command::Usage(args) => cmd_usage(&path, &args, &pal),
+        Command::Accounts(args) => cmd_accounts(&path, args, &pal).await,
+        Command::Tail(args) => cmd_tail(&path, args.limit, &pal),
+        Command::Doctor => cmd_doctor(&path, origin, &pal).await,
+        Command::Keys(args) => cmd_keys(&path, args, &pal).await,
+        Command::Prices(args) => cmd_prices(&path, &args, &pal),
     }
 }
 
@@ -315,14 +347,14 @@ fn open_ledger(db: &Path) -> Result<Connection> {
 // status
 // ---------------------------------------------------------------------------
 
-async fn cmd_status(path: &Path, refresh: bool) -> Result<()> {
+async fn cmd_status(path: &Path, refresh: bool, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let now = OffsetDateTime::now_utc();
 
     if refresh {
         let gateway = Gateway::new(config).await?;
         let rows: Vec<AccountOverview> = gateway.snapshot().iter().map(overview_of).collect();
-        print!("{}", render_board(&rows, now));
+        print!("{}", render_board(&rows, now, pal));
         let _ = gateway.shutdown();
         return Ok(());
     }
@@ -336,7 +368,7 @@ async fn cmd_status(path: &Path, refresh: bool) -> Result<()> {
         );
         return Ok(());
     }
-    print!("{}", render_board(&rows, now));
+    print!("{}", render_board(&rows, now, pal));
     Ok(())
 }
 
@@ -374,13 +406,13 @@ const BOARD_HEADERS: [(&str, crate::table::Align); 6] = [
 /// unit. Their sub-columns are measured across the whole board (see BoardWidths)
 /// rather than per cell, so a fraction, a window label and a currency code line
 /// up down the page even though accounts hold different numbers of windows.
-fn render_board(rows: &[AccountOverview], now: OffsetDateTime) -> String {
+fn render_board(rows: &[AccountOverview], now: OffsetDateTime, pal: &Palette) -> String {
     // Measured widths, like every other table here. The board used to carry its
     // own [14, 18, 26, 26, 8], and an account whose state explanation ran long --
     // "DISABLED (insufficient_credit)" is exactly 32 -- pulled the columns after
     // it out of line.
-    let covered: Vec<Option<Covered>> = rows.iter().map(covered_of).collect();
-    let metered: Vec<Option<Metered>> = rows.iter().map(metered_of).collect();
+    let covered: Vec<Option<Covered>> = rows.iter().map(|r| covered_of(r, pal)).collect();
+    let metered: Vec<Option<Metered>> = rows.iter().map(|r| metered_of(r, pal)).collect();
     let covered_refs: Vec<&Covered> = covered.iter().flatten().collect();
     let metered_refs: Vec<&Metered> = metered.iter().flatten().collect();
     let widths = BoardWidths::measure(&covered_refs, &metered_refs);
@@ -393,18 +425,22 @@ fn render_board(rows: &[AccountOverview], now: OffsetDateTime) -> String {
             render_or_dash(covered[i].as_ref(), |c| widths.covered(c)),
             render_or_dash(metered[i].as_ref(), |m| widths.metered(m)),
             reset_cell(r, now),
-            state_cell(r),
+            state_cell(r, pal),
         ]);
     }
-    let mut out = table.render();
+    let mut out = table.render(pal);
+    out.push('\n');
+    // The legend explains two columns that look alike and are not, so it is set
+    // quieter than the table it belongs to.
+    out.push_str(&pal.dim(
+        "covered = prepaid allowance consumed (used/cap, forfeited at reset)   \
+         metered = real money remaining (spending it is permanent)",
+    ));
     out.push('\n');
     out.push_str(
-        "covered = prepaid allowance consumed (used/cap, forfeited at reset)   \
-         metered = real money remaining (spending it is permanent)\n",
+        &pal.dim("~ = estimated reading   STALE = last probe failed, previous value carried over"),
     );
-    out.push_str(
-        "~ = estimated reading   STALE = last probe failed, previous value carried over\n",
-    );
+    out.push('\n');
     out
 }
 
@@ -557,7 +593,7 @@ impl BoardWidths {
 /// Every gate carries its own label. Without one the column is a row of bare
 /// fractions whose meaning depends on knowing the order, which is exactly how an
 /// allowance gets mistaken for a monthly cap.
-fn covered_of(r: &AccountOverview) -> Option<Covered> {
+fn covered_of(r: &AccountOverview, pal: &Palette) -> Option<Covered> {
     let mut gates: Vec<&Gate> = r
         .gates
         .iter()
@@ -578,11 +614,11 @@ fn covered_of(r: &AccountOverview) -> Option<Covered> {
     Some(Covered {
         windows,
         currency: r.currency.clone(),
-        marks: markers(&gates),
+        marks: markers(&gates, pal),
     })
 }
 
-fn metered_of(r: &AccountOverview) -> Option<Metered> {
+fn metered_of(r: &AccountOverview, pal: &Palette) -> Option<Metered> {
     let mut gates: Vec<&Gate> = r
         .gates
         .iter()
@@ -610,7 +646,7 @@ fn metered_of(r: &AccountOverview) -> Option<Metered> {
     Some(Metered {
         pots,
         currency: r.currency.clone(),
-        marks: markers(&gates),
+        marks: markers(&gates, pal),
     })
 }
 
@@ -619,16 +655,16 @@ fn metered_of(r: &AccountOverview) -> Option<Metered> {
 /// The board itself measures across every row, so these single-row forms exist
 /// only for the tests that assert on one cell at a time.
 #[cfg(test)]
-fn covered_cell(r: &AccountOverview) -> String {
-    match covered_of(r) {
+fn covered_cell(r: &AccountOverview, pal: &Palette) -> String {
+    match covered_of(r, pal) {
         Some(c) => BoardWidths::measure(&[&c], &[]).covered(&c),
         None => "-".to_string(),
     }
 }
 
 #[cfg(test)]
-fn metered_cell(r: &AccountOverview) -> String {
-    match metered_of(r) {
+fn metered_cell(r: &AccountOverview, pal: &Palette) -> String {
+    match metered_of(r, pal) {
         Some(m) => BoardWidths::measure(&[], &[&m]).metered(&m),
         None => "-".to_string(),
     }
@@ -636,11 +672,14 @@ fn metered_cell(r: &AccountOverview) -> String {
 
 /// A stale reading dominates an estimated one: it is the reading most likely to
 /// be wrong, and it must never be silently rendered as a fresh number.
-fn markers(gates: &[&Gate]) -> String {
+fn markers(gates: &[&Gate], pal: &Palette) -> String {
     if gates.iter().any(|g| g.stale) {
-        " STALE".to_string()
+        // A stale reading is the one most likely to be wrong, so it is the
+        // loudest thing on the row.
+        pal.red(" STALE")
     } else if gates.iter().any(|g| g.confidence == Confidence::Estimated) {
-        " ~EST".to_string()
+        // Estimated is not wrong, only weaker evidence: yellow, not red.
+        pal.yellow(" ~EST")
     } else {
         String::new()
     }
@@ -683,8 +722,15 @@ fn format_countdown(now: OffsetDateTime, at: OffsetDateTime) -> String {
     }
 }
 
-fn state_cell(r: &AccountOverview) -> String {
-    let mut s = r.state.label().to_string();
+fn state_cell(r: &AccountOverview, pal: &Palette) -> String {
+    // Only ACTIVE needs no action, so it is the only state that is green; a
+    // state that a reader has to do something about is never the quiet one.
+    let mut s = match r.state {
+        AccountState::Active => pal.green(r.state.label()),
+        AccountState::Draining => pal.yellow(r.state.label()),
+        AccountState::Parked | AccountState::Disabled => pal.red(r.state.label()),
+        AccountState::Unknown => pal.dim(r.state.label()),
+    };
 
     // A terminal state explains itself first; otherwise describe the shape of
     // what was read. Only one parenthetical is shown so the column stays short.
@@ -798,7 +844,7 @@ fn load_price_table(config: &Config) -> crate::meter::PriceTable {
     table
 }
 
-fn cmd_usage(path: &Path, args: &UsageArgs) -> Result<()> {
+fn cmd_usage(path: &Path, args: &UsageArgs, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let conn = open_ledger(&config.db_path())?;
     let now = OffsetDateTime::now_utc();
@@ -823,31 +869,31 @@ fn cmd_usage(path: &Path, args: &UsageArgs) -> Result<()> {
         );
         return Ok(());
     }
-    print!("{}", render_usage(&rows, &dims, since));
+    print!("{}", render_usage(&rows, &dims, since, pal));
 
     // Rates in effect, then what each model is actually costing against them.
     // The panel comes first because the drift table is unreadable without it.
     let table = load_price_table(&config);
     println!();
-    print_price_panel(&config, &table);
+    print_price_panel(&config, &table, pal);
 
     let names = tier_names(&config);
     let drift_rows = price_rows(&table, &names);
     if !drift_rows.is_empty() {
         println!();
-        print!("{}", render_price_rows(&drift_rows));
+        print!("{}", render_price_rows(&drift_rows, pal));
     }
     Ok(())
 }
 
 /// The drift table, shared by the usage and prices commands.
-fn render_price_rows(rows: &[PriceRow]) -> String {
+fn render_price_rows(rows: &[PriceRow], pal: &Palette) -> String {
     use crate::table::{Align, Table};
 
     let mut out = String::new();
-    out.push_str(
-        "DRIFT   observed spend against the configured schedule, USD per million tokens\n\n",
-    );
+    let title = "DRIFT   observed spend against the configured schedule, USD per million tokens";
+    out.push_str(&pal.bold(title));
+    out.push_str("\n\n");
     let mut table = Table::new(&[
         ("PROVIDER", Align::Left),
         ("MODEL", Align::Left),
@@ -869,24 +915,27 @@ fn render_price_rows(rows: &[PriceRow]) -> String {
             r.expected_per_million.clone(),
             r.actual_per_million.clone(),
             if r.significant {
-                format!("{} !", r.drift)
+                // The whole reading is coloured, not just the marker: this is
+                // the row an operator came for.
+                pal.red(&format!("{} !", r.drift))
             } else {
                 r.drift.clone()
             },
             r.samples.to_string(),
         ]);
     }
-    out.push_str(&table.render());
+    out.push_str(&table.render(pal));
     out.push('\n');
-    out.push_str(
-        "EXPECTED is your configured rates applied to the observed usage for that tier.\n",
-    );
-    out.push_str("ACTUAL is what the observed spend works out to over the same usage.\n");
-    out.push_str("MIX is your input / output / cache-read share of tokens, per tier.\n");
-    out.push_str(
-        "DRIFT is ACTUAL against EXPECTED; ! marks 20% or more, meaning the upstream is\n",
-    );
-    out.push_str("no longer charging what you configured - for that tier in particular.\n");
+    for line in [
+        "EXPECTED is your configured rates applied to the observed usage for that tier.",
+        "ACTUAL is what the observed spend works out to over the same usage.",
+        "MIX is your input / output / cache-read share of tokens, per tier.",
+        "DRIFT is ACTUAL against EXPECTED; ! marks 20% or more, meaning the upstream is",
+        "no longer charging what you configured - for that tier in particular.",
+    ] {
+        out.push_str(&pal.dim(line));
+        out.push('\n');
+    }
     out
 }
 
@@ -1011,7 +1060,12 @@ fn usage_rows_multi(
     Ok(acc.into_values().collect())
 }
 
-fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> String {
+fn render_usage(
+    rows: &[UsageRow],
+    dims: &[GroupBy],
+    since: OffsetDateTime,
+    pal: &Palette,
+) -> String {
     let header = dims
         .iter()
         .map(|d| d.column_header())
@@ -1040,14 +1094,18 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
     };
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "USAGE since {} (grouped by {})\n\n",
+    // The title is what a reader scans for when several reports are on screen
+    // at once, so it is the bold one.
+    let title = format!(
+        "USAGE since {} (grouped by {})",
         stamp(since),
         dims.iter()
             .map(|d| d.column_header().to_ascii_lowercase())
             .collect::<Vec<_>>()
             .join(", ")
-    ));
+    );
+    out.push_str(&pal.bold(&title));
+    out.push_str("\n\n");
 
     // Widths are measured, and the counts are scaled, so a nine-digit token count
     // cannot push the cost column out of line the way it used to.
@@ -1069,7 +1127,7 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
             crate::table::money_with(r.cost, &r.currency),
         ]);
     }
-    out.push_str(&table.render());
+    out.push_str(&table.render(pal));
 
     // Totals are per currency. Adding CNY to USD would be meaningless, and
     // DESIGN section 7 calls that out explicitly.
@@ -1085,13 +1143,15 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
     if rows.len() > 1 && !totals.is_empty() {
         out.push('\n');
         for (currency, (requests, input, output, cached, cost)) in totals {
-            out.push_str(&format!(
-                "TOTAL {currency}: {requests} requests, in {}, out {}, cached {}, cost {} {currency}\n",
+            let total = format!(
+                "TOTAL {currency}: {requests} requests, in {}, out {}, cached {}, cost {} {currency}",
                 crate::table::tokens(input),
                 crate::table::tokens(output),
                 crate::table::tokens(cached),
                 crate::table::money(cost),
-            ));
+            );
+            out.push_str(&pal.bold(&total));
+            out.push('\n');
         }
     }
     out
@@ -1101,7 +1161,7 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
 // tail
 // ---------------------------------------------------------------------------
 
-fn cmd_tail(path: &Path, limit: u32) -> Result<()> {
+fn cmd_tail(path: &Path, limit: u32, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let conn = open_ledger(&config.db_path())?;
     let rows = store::recent_requests(&conn, limit)?;
@@ -1109,11 +1169,11 @@ fn cmd_tail(path: &Path, limit: u32) -> Result<()> {
         println!("no requests recorded yet in {}", config.db_path().display());
         return Ok(());
     }
-    print!("{}", render_tail(&rows));
+    print!("{}", render_tail(&rows, pal));
     Ok(())
 }
 
-fn render_tail(rows: &[RequestSummary]) -> String {
+fn render_tail(rows: &[RequestSummary], pal: &Palette) -> String {
     use crate::table::{Align, Table, tokens};
 
     let mut out = String::new();
@@ -1145,9 +1205,21 @@ fn render_tail(rows: &[RequestSummary]) -> String {
             .tps
             .map(|t| format!("{t:.1}"))
             .unwrap_or_else(|| "-".to_string());
+        // ok is the expected case and stays plain; anything else is the reason
+        // someone opened this table, so it is the coloured thing.
+        let status = match r.status {
+            RequestStatus::Ok => status_label(r.status).to_string(),
+            _ => pal.red(status_label(r.status)),
+        };
+        // Spending metered money is not an error, but it is permanent, and this
+        // column is where an operator watches it happen.
+        let coverage = match r.coverage {
+            GateClass::Metered => pal.yellow(coverage_label(r.coverage)),
+            _ => coverage_label(r.coverage).to_string(),
+        };
         table.push(vec![
             clock(r.ts),
-            status_label(r.status).to_string(),
+            status,
             r.provider.clone(),
             r.account_id.clone(),
             truncate(&r.model, MODEL_WIDTH),
@@ -1156,10 +1228,10 @@ fn render_tail(rows: &[RequestSummary]) -> String {
             tokens(r.cached_tokens),
             ttft,
             tps,
-            coverage_label(r.coverage).to_string(),
+            coverage,
         ]);
     }
-    out.push_str(&table.render());
+    out.push_str(&table.render(pal));
     out
 }
 
@@ -1206,16 +1278,16 @@ fn truncate(s: &str, width: usize) -> String {
 // accounts
 // ---------------------------------------------------------------------------
 
-async fn cmd_accounts(path: &Path, args: AccountsArgs) -> Result<()> {
+async fn cmd_accounts(path: &Path, args: AccountsArgs, pal: &Palette) -> Result<()> {
     match args.command {
-        AccountsCommand::List => cmd_status(path, false).await,
-        AccountsCommand::Probe { account } => cmd_accounts_probe(path, account).await,
-        AccountsCommand::Disable { account } => cmd_accounts_disable(path, &account),
-        AccountsCommand::Enable { account } => cmd_accounts_enable(path, &account),
+        AccountsCommand::List => cmd_status(path, false, pal).await,
+        AccountsCommand::Probe { account } => cmd_accounts_probe(path, account, pal).await,
+        AccountsCommand::Disable { account } => cmd_accounts_disable(path, &account, pal),
+        AccountsCommand::Enable { account } => cmd_accounts_enable(path, &account, pal),
     }
 }
 
-async fn cmd_accounts_probe(path: &Path, account: Option<String>) -> Result<()> {
+async fn cmd_accounts_probe(path: &Path, account: Option<String>, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let target_provider = match &account {
         Some(id) => Some(provider_of(&config, id)?),
@@ -1226,11 +1298,11 @@ async fn cmd_accounts_probe(path: &Path, account: Option<String>) -> Result<()> 
     // so a single-account probe is authoritative rather than a cached reading.
     let gateway = Gateway::new(config).await?;
     if let (Some(provider), Some(id)) = (&target_provider, &account) {
-        println!("probing {provider}/{id} ...");
+        println!("{}", pal.dim(&format!("probing {provider}/{id} ...")));
         gateway.probe_account(provider, id).await;
     }
     let rows: Vec<AccountOverview> = gateway.snapshot().iter().map(overview_of).collect();
-    print!("{}", render_board(&rows, OffsetDateTime::now_utc()));
+    print!("{}", render_board(&rows, OffsetDateTime::now_utc(), pal));
     let _ = gateway.shutdown();
     Ok(())
 }
@@ -1286,7 +1358,7 @@ fn probe_client(config: &Config) -> Result<reqwest::Client> {
         .context("building the probe HTTP client")
 }
 
-fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
+fn cmd_accounts_disable(path: &Path, account_id: &str, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let provider = provider_of(&config, account_id)?;
     // Deliberately unresolved: disabling an account must work even when its
@@ -1336,12 +1408,15 @@ fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
     handle.flush_blocking()?;
 
     println!(
-        "{provider}/{account_id}: DISABLED (persisted to {})",
+        "{provider}/{account_id}: {} (persisted to {})",
+        pal.red("DISABLED"),
         db.display()
     );
     println!(
-        "note: a running lgw process keeps its own in-memory pool; restart lgw serve \
-         for this to take effect there"
+        "{}",
+        pal.dim(
+            "note: a running lgw process keeps its own in-memory pool; restart lgw serve for this to take effect there"
+        )
     );
     Ok(())
 }
@@ -1355,17 +1430,17 @@ fn credential_store() -> CredentialStore {
     CredentialStore::from_env()
 }
 
-async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
+async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<()> {
     let mut problems = 0u32;
     println!("config path : {} (from {})", path.display(), origin.label());
 
     let config = match Config::load(path) {
         Ok(c) => {
-            println!("config file : parsed ok");
+            println!("config file : {}", pal.green("parsed ok"));
             c
         }
         Err(e) => {
-            println!("config file : FAILED");
+            println!("config file : {}", pal.red("FAILED"));
             println!("              {e:#}");
             bail!("configuration is unusable; nothing else could be checked");
         }
@@ -1389,8 +1464,10 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     );
     if config.policy.allow_metered {
         println!(
-            "              WARNING: allow_metered is on; requests may silently spend wallet \
-             or purchased credits"
+            "              {}",
+            pal.yellow(
+                "WARNING: allow_metered is on; requests may silently spend wallet or purchased credits"
+            )
         );
     }
 
@@ -1425,7 +1502,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
             // this path never formats it at all.
             let qualified = crate::domain::qualified_id(provider, id);
             if usable.iter().any(|acct| acct.qualified() == qualified) {
-                println!("  {provider}/{id}: ok ({source})");
+                println!("  {provider}/{id}: {} ({source})", pal.green("ok"));
                 continue;
             }
             let reason = unusable
@@ -1433,7 +1510,10 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
                 .find(|acct| acct.qualified() == qualified)
                 .and_then(|acct| acct.last_error.clone())
                 .unwrap_or_else(|| "could not be resolved".to_string());
-            println!("  {provider}/{id}: MISSING ({source}) - {reason}");
+            println!(
+                "  {provider}/{id}: {} ({source}) - {reason}",
+                pal.red("MISSING")
+            );
             problems += 1;
         }
     }
@@ -1464,19 +1544,22 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
                         // Unknown is not selectable. Saying "local ledger only"
                         // made a dead account look like a configured one.
                         println!(
-                            "  {label}: UNUSABLE - adapter = none has no quota source, so this \
-                             account can never leave the UNKNOWN state"
+                            "  {label}: {} - adapter = none has no quota source, so this \
+                             account can never leave the UNKNOWN state",
+                            pal.red("UNUSABLE")
                         );
                         problems += 1;
                     }
                     Some((adapter, base)) => match probe_for(*adapter, base) {
                         None => println!("  {label}: no adapter for {adapter:?}"),
                         Some(probe) => match probe.probe(account, &client).await {
-                            Ok(outcome) => {
-                                println!("  {label}: ok ({} gates)", outcome.gates.len())
-                            }
+                            Ok(outcome) => println!(
+                                "  {label}: {} ({} gates)",
+                                pal.green("ok"),
+                                outcome.gates.len()
+                            ),
                             Err(e) => {
-                                println!("  {label}: UNREACHABLE - {}", e.message);
+                                println!("  {label}: {} - {}", pal.red("UNREACHABLE"), e.message);
                                 problems += 1;
                             }
                         },
@@ -1491,13 +1574,17 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     // and doctor reported "no problems found".
     if config.server.local_key.is_none() {
         println!(
-            "local auth  : MISSING - anything that can reach {} can spend the pooled quota.",
+            "local auth  : {} - anything that can reach {} can spend the pooled quota.",
+            pal.red("MISSING"),
             config.server.listen
         );
-        println!("              fix: lgw keys add local gateway, then set local_key");
+        println!(
+            "              {}",
+            pal.dim("fix: lgw keys add local gateway, then set local_key")
+        );
         problems += 1;
     } else {
-        println!("local auth  : configured");
+        println!("local auth  : {}", pal.green("configured"));
     }
     if !listens_on_loopback(&config.server.listen) {
         println!(
@@ -1568,7 +1655,7 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
 /// the same rule a restart follows. "accounts enable" means "try again", not
 /// "trust me" -- and it is the only thing that can undo an operator's disable,
 /// because a successful probe restores the credential, not the decision.
-fn cmd_accounts_enable(path: &Path, account_id: &str) -> Result<()> {
+fn cmd_accounts_enable(path: &Path, account_id: &str, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let provider = provider_of(&config, account_id)?;
     let qualified = crate::domain::qualified_id(&provider, account_id);
@@ -1605,9 +1692,15 @@ fn cmd_accounts_enable(path: &Path, account_id: &str) -> Result<()> {
     handle.save_account(&account);
     handle.flush_blocking()?;
 
-    println!("{provider}/{account_id}: ENABLED (probed before it serves again)");
     println!(
-        "note: restart lgw serve for this to take effect there, or run          'lgw accounts probe' to confirm it now"
+        "{provider}/{account_id}: {} (probed before it serves again)",
+        pal.green("ENABLED")
+    );
+    println!(
+        "{}",
+        pal.dim(
+            "note: restart lgw serve for this to take effect there, or run 'lgw accounts probe' to confirm it now"
+        )
     );
     Ok(())
 }
@@ -1616,7 +1709,7 @@ fn cmd_accounts_enable(path: &Path, account_id: &str) -> Result<()> {
 // keys
 // ---------------------------------------------------------------------------
 
-async fn cmd_keys(path: &Path, args: KeysArgs) -> Result<()> {
+async fn cmd_keys(path: &Path, args: KeysArgs, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
     let creds = credential_store();
     match args.command {
@@ -1624,12 +1717,12 @@ async fn cmd_keys(path: &Path, args: KeysArgs) -> Result<()> {
             provider,
             account,
             stdin,
-        } => cmd_keys_add(&config, &creds, &provider, &account, stdin),
-        KeysCommand::List => cmd_keys_list(&config, &creds),
+        } => cmd_keys_add(&config, &creds, &provider, &account, stdin, pal),
+        KeysCommand::List => cmd_keys_list(&config, &creds, pal),
         KeysCommand::Migrate { prune } => cmd_keys_migrate(path, prune),
         KeysCommand::Remove { provider, account } => cmd_keys_remove(&creds, &provider, &account),
         KeysCommand::Test { provider, account } => {
-            cmd_keys_test(&config, &creds, &provider, &account).await
+            cmd_keys_test(&config, &creds, &provider, &account, pal).await
         }
     }
 }
@@ -1662,6 +1755,7 @@ fn cmd_keys_add(
     provider: &str,
     account: &str,
     from_stdin: bool,
+    pal: &Palette,
 ) -> Result<()> {
     // The credential is looked up by provider/account, so both must exist in the
     // configuration or the entry could never be reached.
@@ -1691,7 +1785,8 @@ fn cmd_keys_add(
     match creds.get(provider, account)? {
         Some(stored) if stored.expose() == secret => {
             println!(
-                "stored  {provider}/{account} in {} ({})",
+                "{} {provider}/{account} in {} ({})",
+                pal.green("stored"),
                 creds.backend_name(),
                 crate::secrets::describe_secret(&secret)
             );
@@ -1714,6 +1809,9 @@ pub struct CredentialRow {
     /// Where the secret comes from, never the secret itself.
     pub source: String,
     pub status: String,
+    /// Whether the credential resolved. The status text is for the reader; this
+    /// is the same fact in a form the renderer can colour on without parsing it.
+    pub resolves: bool,
 }
 
 fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRow> {
@@ -1721,9 +1819,9 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
     for (provider, p) in &config.providers {
         for (id, a) in &p.accounts {
             let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
-            let status = match secret_ref.resolve(creds, provider, id) {
-                Ok(_) => "ok".to_string(),
-                Err(e) => format!("MISSING ({e})"),
+            let (status, resolves) = match secret_ref.resolve(creds, provider, id) {
+                Ok(_) => ("ok".to_string(), true),
+                Err(e) => (format!("MISSING ({e})"), false),
             };
             // Say which item the key came out of. An install that still keeps one
             // item per account pays one authorisation prompt per account on
@@ -1740,13 +1838,14 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
                 account: id.clone(),
                 source,
                 status,
+                resolves,
             });
         }
     }
     rows
 }
 
-fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
+fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Result<()> {
     println!("backend: {}", creds.backend_name());
     let rows = credential_rows(config, creds);
     let per_account = rows
@@ -1771,23 +1870,39 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
         ("STATUS", crate::table::Align::Left),
     ]);
     for row in &rows {
+        // A credential that resolves is the quiet case; one that does not is the
+        // reason anyone ran this command.
+        let status = if row.resolves {
+            pal.green(&row.status)
+        } else {
+            pal.red(&row.status)
+        };
         table.push(vec![
             row.provider.clone(),
             row.account.clone(),
             row.source.clone(),
-            row.status.clone(),
+            status,
         ]);
     }
-    print!("{}", table.render());
+    print!("{}", table.render(pal));
     println!();
     if per_account > 0 {
         println!(
-            "On macOS every separate item is a separate authorisation prompt for this binary."
+            "{}",
+            pal.yellow(
+                "On macOS every separate item is a separate authorisation prompt for this binary."
+            )
         );
-        println!("Fold them into one item with: lgw keys migrate --prune");
+        println!(
+            "{}",
+            pal.dim("Fold them into one item with: lgw keys migrate --prune")
+        );
         println!();
     }
-    println!("Register one with: lgw keys add <provider> <account>");
+    println!(
+        "{}",
+        pal.dim("Register one with: lgw keys add <provider> <account>")
+    );
     Ok(())
 }
 
@@ -1874,6 +1989,7 @@ async fn cmd_keys_test(
     creds: &CredentialStore,
     provider: &str,
     account: &str,
+    pal: &Palette,
 ) -> Result<()> {
     let p = config
         .providers
@@ -1928,15 +2044,19 @@ async fn cmd_keys_test(
     match probe.probe(&account_model, &client).await {
         Ok(outcome) => {
             println!(
-                "{provider}/{account}: ok - {} credentials accepted, {} gates read",
+                "{provider}/{account}: {} - {} credentials accepted, {} gates read",
+                pal.green("ok"),
                 probe.name(),
                 outcome.gates.len()
             );
-            println!("{}", gate_reading(&outcome.gates, &account_model.currency));
+            println!(
+                "{}",
+                gate_reading(&outcome.gates, &account_model.currency, pal)
+            );
             Ok(())
         }
         Err(e) => {
-            println!("{provider}/{account}: FAILED - {e}");
+            println!("{provider}/{account}: {} - {e}", pal.red("FAILED"));
             bail!("the stored credential was rejected or the probe endpoint is unreachable")
         }
     }
@@ -1949,7 +2069,7 @@ async fn cmd_keys_test(
 /// sitting where a balance goes is how an allowance gets read as money. The class
 /// is spelled out in the same words as the board's columns rather than as a Rust
 /// enum name.
-fn gate_reading(gates: &[Gate], currency: &str) -> String {
+fn gate_reading(gates: &[Gate], currency: &str, pal: &Palette) -> String {
     use crate::table::{Align, Table};
     use rust_decimal::prelude::ToPrimitive;
 
@@ -1979,7 +2099,7 @@ fn gate_reading(gates: &[Gate], currency: &str) -> String {
         ]);
     }
     table
-        .render()
+        .render(pal)
         .lines()
         .map(|l| format!("    {l}"))
         .collect::<Vec<_>>()
@@ -2162,7 +2282,7 @@ pub fn fallback_row() -> PricePanelRow {
     }
 }
 
-fn print_price_panel(config: &Config, table: &crate::meter::PriceTable) {
+fn print_price_panel(config: &Config, table: &crate::meter::PriceTable, pal: &Palette) {
     use crate::table::{Align, Table};
 
     /// The columns every panel shares, so a reader compares like with like across
@@ -2194,7 +2314,7 @@ fn print_price_panel(config: &Config, table: &crate::meter::PriceTable) {
         for r in rows {
             t.push(r);
         }
-        t.render()
+        t.render(pal)
             .lines()
             .map(|l| format!("  {l}"))
             .collect::<Vec<_>>()
@@ -2202,16 +2322,23 @@ fn print_price_panel(config: &Config, table: &crate::meter::PriceTable) {
     };
 
     let panels = price_panel(config, table);
-    println!("PRICES   rates in effect, USD per million tokens");
+    println!(
+        "{}",
+        pal.bold("PRICES   rates in effect, USD per million tokens")
+    );
     for (label, rows) in &panels {
         println!();
-        println!("{label}");
+        // The model is a heading: the rows under it are its answer.
+        println!("{}", pal.bold(label));
         println!("{}", block(rows.iter().map(row_cells).collect()));
     }
     let f = fallback_row();
     println!();
     println!("{}", block(vec![row_cells(&f)]));
-    println!("  deliberately high - under-estimating is what spends money");
+    println!(
+        "{}",
+        pal.dim("  deliberately high - under-estimating is what spends money")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2329,13 +2456,13 @@ pub fn price_rows(table: &crate::meter::PriceTable, names: &TierNames) -> Vec<Pr
     rows
 }
 
-fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
+fn cmd_prices(path: &Path, args: &PricesArgs, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
 
     // Configured prices come from the config file; learned prices come from the
     // ledger, so this works whether or not a gateway is running.
     let table = load_price_table(&config);
-    print_price_panel(&config, &table);
+    print_price_panel(&config, &table, pal);
     println!();
 
     let names = tier_names(&config);
@@ -2364,7 +2491,7 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
     }
 
     // One renderer for both commands, so they cannot disagree.
-    print!("{}", render_price_rows(&rows));
+    print!("{}", render_price_rows(&rows, pal));
 
     let drifted = rows.iter().filter(|r| r.significant).count();
     if drifted > 0 {
@@ -2605,7 +2732,7 @@ key = {{ key_file = "{key_file}" }}
         let config = keys_config("/nonexistent");
         let creds = CredentialStore::memory();
         // from_stdin is irrelevant: validation must fail first.
-        let err = cmd_keys_add(&config, &creds, "nope", "acc", true).unwrap_err();
+        let err = cmd_keys_add(&config, &creds, "nope", "acc", true, &Palette::off()).unwrap_err();
         assert!(err.to_string().contains("unknown provider"), "got: {err}");
     }
 
@@ -2613,7 +2740,8 @@ key = {{ key_file = "{key_file}" }}
     fn keys_add_rejects_an_unknown_account_and_lists_the_known_ones() {
         let config = keys_config("/nonexistent");
         let creds = CredentialStore::memory();
-        let err = cmd_keys_add(&config, &creds, "xkiro", "nope", true).unwrap_err();
+        let err =
+            cmd_keys_add(&config, &creds, "xkiro", "nope", true, &Palette::off()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown account"), "got: {msg}");
         assert!(
@@ -2751,8 +2879,8 @@ key = {{ key_file = "{key_file}" }}
             ],
         );
 
-        let covered = covered_cell(&acct);
-        let metered = metered_cell(&acct);
+        let covered = covered_cell(&acct, &Palette::off());
+        let metered = metered_cell(&acct, &Palette::off());
         assert_eq!(
             covered, "5h 40/100  7d 25/500  USD",
             "covered shows used/cap and its unit"
@@ -2763,7 +2891,7 @@ key = {{ key_file = "{key_file}" }}
         );
         assert_ne!(covered, metered);
 
-        let board = render_board(&[acct], t);
+        let board = render_board(&[acct], t, &Palette::off());
         assert!(board.contains("COVERED"));
         assert!(board.contains("METERED"));
         assert!(board.contains("5h 40/100  7d 25/500  USD"));
@@ -2855,7 +2983,7 @@ key = {{ key_file = "{key_file}" }}
             ],
         );
 
-        let board = render_board(&[short, long], t);
+        let board = render_board(&[short, long], t, &Palette::off());
         let rows: Vec<&str> = board
             .lines()
             .filter(|l| l.starts_with("xkiro") || l.starts_with("deepseek"))
@@ -2882,6 +3010,125 @@ key = {{ key_file = "{key_file}" }}
         );
         assert!(rows[0].contains("credits"), "the pot is labelled: {board}");
         assert!(rows[1].contains("wallet"), "the pot is labelled: {board}");
+    }
+
+    /// Colour changes what the output looks like, never what it says.
+    ///
+    /// Strip the escapes and the coloured board is exactly the plain one. That is
+    /// what makes it safe to colour a cell in a table that is also read through a
+    /// pipe, and it is why the palette is threaded through the renderers instead
+    /// of being read from a global.
+    #[test]
+    fn colour_changes_the_look_and_nothing_else() {
+        let t = now();
+        let rows = vec![
+            overview(
+                "xkiro",
+                "xk-1",
+                "USD",
+                AccountState::Draining,
+                vec![gate(
+                    GateKind::FiveHour,
+                    "200",
+                    "178",
+                    Some(600),
+                    Confidence::Estimated,
+                    false,
+                    t,
+                )],
+            ),
+            overview(
+                "xkiro",
+                "xk-2",
+                "USD",
+                AccountState::Disabled,
+                vec![gate(
+                    GateKind::FiveHour,
+                    "20",
+                    "0",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                )],
+            ),
+        ];
+        let colored = render_board(&rows, t, &Palette::on());
+        let plain = render_board(&rows, t, &Palette::off());
+
+        assert!(colored.contains("\x1b[33mDRAINING\x1b[0m"), "{colored:?}");
+        assert!(colored.contains("\x1b[31mDISABLED\x1b[0m"), "{colored:?}");
+        assert!(colored.contains("\x1b[33m ~EST\x1b[0m"), "{colored:?}");
+        assert!(!plain.contains('\x1b'), "no palette, no escapes: {plain:?}");
+        assert_eq!(
+            crate::ansi::strip(&colored),
+            plain,
+            "colour changed the text"
+        );
+    }
+
+    /// The flagged row is the reason the drift table exists, so it is the row
+    /// that gets the colour -- and only when it is flagged.
+    #[test]
+    fn colour_follows_the_drift_flag() {
+        let row = |drift: &str, significant: bool| PriceRow {
+            provider: "commandcode".into(),
+            model: "deepseek/deepseek-v4.1-flash".into(),
+            tier: 0,
+            tier_name: "default".into(),
+            source: "learned".into(),
+            mix: "1/1/98%".into(),
+            expected_per_million: "$0.008".into(),
+            actual_per_million: "$0.0169".into(),
+            drift: drift.to_string(),
+            significant,
+            samples: 24,
+        };
+        let rows = vec![row("+110.5%", true), row("-", false)];
+        let out = render_price_rows(&rows, &Palette::on());
+
+        assert!(out.contains("\x1b[31m+110.5% !\x1b[0m"), "{out:?}");
+        assert!(
+            !out.contains("\x1b[31m-\x1b[0m"),
+            "a row that did not drift is not coloured: {out:?}"
+        );
+        assert!(
+            out.starts_with("\x1b[1mDRIFT"),
+            "the title is bold: {out:?}"
+        );
+    }
+
+    /// In the tail, ok and covered are the expected case. Only the request that
+    /// went wrong, and the one that spent real money, are coloured.
+    #[test]
+    fn colour_marks_the_request_that_went_wrong_or_spent_money() {
+        let summary = |status: RequestStatus, coverage: GateClass| RequestSummary {
+            ts: now(),
+            request_id: "r1".into(),
+            provider: "xkiro".into(),
+            account_id: "xk-1".into(),
+            model: "deepseek/deepseek-v3.2".into(),
+            input_tokens: 1_200,
+            output_tokens: 300,
+            cached_tokens: 1_024,
+            ttft_ms: Some(850),
+            tps: Some(45.25),
+            coverage,
+            status,
+        };
+        let bad = render_tail(
+            &[summary(RequestStatus::Error, GateClass::Metered)],
+            &Palette::on(),
+        );
+        assert!(bad.contains("\x1b[31merror\x1b[0m"), "{bad:?}");
+        assert!(bad.contains("\x1b[33mmetered\x1b[0m"), "{bad:?}");
+
+        let good = render_tail(
+            &[summary(RequestStatus::Ok, GateClass::Covered)],
+            &Palette::on(),
+        );
+        assert!(!good.contains("\x1b[31m"), "nothing went wrong: {good:?}");
+        assert!(!good.contains("\x1b[33m"), "nothing was metered: {good:?}");
     }
 
     /// `lgw keys test` prints one row per gate. The unit column is the point: a
@@ -2928,7 +3175,7 @@ key = {{ key_file = "{key_file}" }}
                 t,
             ),
         ];
-        let out = gate_reading(&gates, "USD");
+        let out = gate_reading(&gates, "USD", &Palette::off());
         assert!(out.contains("30.0M"), "a token allowance is scaled: {out}");
         assert!(out.contains("tokens"), "{out}");
         assert!(out.contains("req/min"), "{out}");
@@ -2986,7 +3233,7 @@ key = {{ key_file = "{key_file}" }}
             ],
         );
 
-        let covered = covered_cell(&acct);
+        let covered = covered_cell(&acct, &Palette::off());
         assert_eq!(covered, "5h 0.5/20  USD");
         assert!(!covered.contains("free"), "no free allowance: {covered}");
         assert!(!covered.contains("tok"), "no token count: {covered}");
@@ -3011,7 +3258,7 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        assert_eq!(covered_cell(&acct), "-");
+        assert_eq!(covered_cell(&acct, &Palette::off()), "-");
     }
 
     #[test]
@@ -3032,9 +3279,16 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        assert_eq!(covered_cell(&acct), "-", "covered must be blank, not 0/0");
-        assert_eq!(metered_cell(&acct), "wallet 12.3 USD (unused)");
-        assert!(state_cell(&acct).contains("metered only"));
+        assert_eq!(
+            covered_cell(&acct, &Palette::off()),
+            "-",
+            "covered must be blank, not 0/0"
+        );
+        assert_eq!(
+            metered_cell(&acct, &Palette::off()),
+            "wallet 12.3 USD (unused)"
+        );
+        assert!(state_cell(&acct, &Palette::off()).contains("metered only"));
         assert_eq!(reset_cell(&acct, t), "-", "a wallet has no reset");
     }
 
@@ -3056,7 +3310,10 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        assert_eq!(metered_cell(&acct), "wallet 684 USD (16.1 spent)");
+        assert_eq!(
+            metered_cell(&acct, &Palette::off()),
+            "wallet 684 USD (16.1 spent)"
+        );
     }
 
     #[test]
@@ -3077,7 +3334,7 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        assert!(covered_cell(&estimated).ends_with(" ~EST"));
+        assert!(covered_cell(&estimated, &Palette::off()).ends_with(" ~EST"));
 
         let stale = overview(
             "xkiro",
@@ -3094,13 +3351,13 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        let cell = covered_cell(&stale);
+        let cell = covered_cell(&stale, &Palette::off());
         assert!(cell.ends_with(" STALE"), "got {cell}");
         assert!(
             !cell.contains("~EST"),
             "a stale reading is not presented as merely estimated"
         );
-        let board = render_board(&[stale], t);
+        let board = render_board(&[stale], t, &Palette::off());
         assert!(
             board
                 .lines()
@@ -3140,7 +3397,7 @@ key = {{ key_file = "{key_file}" }}
         );
         // The earliest reset wins.
         assert_eq!(reset_cell(&acct, t), "1h10m");
-        assert!(render_board(&[acct], t).contains("1h10m"));
+        assert!(render_board(&[acct], t, &Palette::off()).contains("1h10m"));
     }
 
     #[test]
@@ -3162,17 +3419,17 @@ key = {{ key_file = "{key_file}" }}
     #[test]
     fn account_with_no_gates_is_marked_as_having_no_reading() {
         let acct = overview("xkiro", "xk-1", "USD", AccountState::Unknown, vec![]);
-        assert_eq!(covered_cell(&acct), "-");
-        assert_eq!(metered_cell(&acct), "-");
-        assert!(state_cell(&acct).contains("no reading"));
-        assert!(!state_cell(&acct).contains("metered only"));
+        assert_eq!(covered_cell(&acct, &Palette::off()), "-");
+        assert_eq!(metered_cell(&acct, &Palette::off()), "-");
+        assert!(state_cell(&acct, &Palette::off()).contains("no reading"));
+        assert!(!state_cell(&acct, &Palette::off()).contains("metered only"));
     }
 
     #[test]
     fn disabled_account_shows_its_reason() {
         let mut acct = overview("xkiro", "xk-1", "USD", AccountState::Disabled, vec![]);
         acct.last_error = Some("auth".to_string());
-        assert_eq!(state_cell(&acct), "DISABLED (auth)");
+        assert_eq!(state_cell(&acct, &Palette::off()), "DISABLED (auth)");
     }
 
     // ------------------------------------------------------------------ usage
@@ -3244,7 +3501,7 @@ key = {{ key_file = "{key_file}" }}
                 currency: "CNY".into(),
             },
         ];
-        let text = render_usage(&rows, &[GroupBy::Provider], now());
+        let text = render_usage(&rows, &[GroupBy::Provider], now(), &Palette::off());
         assert!(text.contains("USAGE since"));
         assert!(text.contains("PROVIDER"));
         assert!(text.contains("0.75 USD"));
@@ -3280,7 +3537,7 @@ key = {{ key_file = "{key_file}" }}
                 currency: "CNY".into(),
             },
         ];
-        let text = render_usage(&rows, &[GroupBy::Model], now());
+        let text = render_usage(&rows, &[GroupBy::Model], now(), &Palette::off());
         assert!(text.contains("m [USD]"), "got: {text}");
         assert!(text.contains("m [CNY]"), "got: {text}");
 
@@ -3294,7 +3551,9 @@ key = {{ key_file = "{key_file}" }}
             cost: dec("0.1"),
             currency: "USD".into(),
         }];
-        assert!(!render_usage(&single, &[GroupBy::Model], now()).contains("m [USD]"));
+        assert!(
+            !render_usage(&single, &[GroupBy::Model], now(), &Palette::off()).contains("m [USD]")
+        );
     }
 
     // ------------------------------------------------------------------- tail
@@ -3315,7 +3574,7 @@ key = {{ key_file = "{key_file}" }}
             coverage: GateClass::Covered,
             status: RequestStatus::Ok,
         }];
-        let text = render_tail(&rows);
+        let text = render_tail(&rows, &Palette::off());
         assert!(text.contains("TIME"));
         assert!(text.contains("COVERAGE"));
         assert!(text.contains("xkiro"));

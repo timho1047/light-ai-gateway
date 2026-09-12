@@ -14,6 +14,7 @@ everything cost.
 - [Quick start](#quick-start)
 - [Credentials](#credentials)
 - [Commands](#commands)
+- [Reading the output](#reading-the-output)
 - [Account recovery](#account-recovery)
 - [Prices](#prices)
 - [The two pots of money](#the-two-pots-of-money)
@@ -196,6 +197,28 @@ for tests and dry runs and never touches your real keychain.
     lgw tail                           recent requests
     lgw doctor                         config, credentials, probe reachability
     lgw init                           write an example config
+
+## Reading the output
+
+Every table measures its own columns, so a model name that grows does not push
+the rest of the row out of line, and the numbers are printed at the scale they
+are read at: token counts as `921.4K` and `1.0M`, money with one decimal for a
+total and enough decimals for a per-request cost that a one-decimal rule would
+round away.
+
+Colour marks the few readings that need attention -- a state that is not ACTIVE, a
+reading that is STALE or only estimated, a price that has drifted, a request that
+spent metered money -- and nothing else. It never carries information on its own:
+the words say the same thing with the colours off. Colour is off whenever the
+output is not a terminal, so a pipe, a redirect and a log file get exactly the
+bytes they got before:
+
+    lgw --color always status     # colour a capture or an editor's run panel
+    lgw --color never status      # never colour, whatever the terminal says
+
+`NO_COLOR=1` turns it off and `CLICOLOR_FORCE=1` turns it on, which is how a
+terminal that cannot be detected (`docker run -t`, a CI that captures the stream)
+keeps its colours.
 
 ## Account recovery
 

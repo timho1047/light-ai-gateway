@@ -4,6 +4,7 @@
 //! See docs/DESIGN.md for the design this implements.
 
 pub mod accounts;
+pub mod ansi;
 pub mod cli;
 pub mod config;
 pub mod domain;

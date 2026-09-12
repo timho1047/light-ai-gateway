@@ -11,6 +11,7 @@
 //! only remaining question is how wide the content is, which is what tokens() and
 //! money() answer.
 
+use crate::ansi::{Palette, visible_width};
 use rust_decimal::Decimal;
 
 /// Which side a column's padding goes.
@@ -50,19 +51,26 @@ impl Table {
 
     /// Render the header, then every row, with each column padded to the width
     /// its widest cell needs. Trailing whitespace is never emitted.
-    pub fn render(&self) -> String {
-        let mut widths: Vec<usize> = self.headers.iter().map(|h| h.chars().count()).collect();
+    ///
+    /// The header is bold when the palette allows it, and a cell is measured by
+    /// its *visible* width: one that carries a colour is measured without its
+    /// escape codes, so styling a value can never push the columns apart.
+    pub fn render(&self, pal: &Palette) -> String {
+        let mut widths: Vec<usize> = self.headers.iter().map(|h| visible_width(h)).collect();
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i >= widths.len() {
                     break;
                 }
-                widths[i] = widths[i].max(cell.chars().count());
+                widths[i] = widths[i].max(visible_width(cell));
             }
         }
 
         let mut out = String::new();
-        out.push_str(&self.line(&self.headers, &widths));
+        // Bold the finished line rather than each cell: the padding then stays
+        // out of the escape sequence, and the line is trimmed before it is
+        // wrapped.
+        out.push_str(&pal.bold(&self.line(&self.headers, &widths)));
         out.push('\n');
         for row in &self.rows {
             out.push_str(&self.line(row, &widths));
@@ -75,7 +83,7 @@ impl Table {
         let mut parts: Vec<String> = Vec::with_capacity(self.headers.len());
         for (i, width) in widths.iter().enumerate() {
             let cell = cells.get(i).map(String::as_str).unwrap_or("");
-            let pad = width.saturating_sub(cell.chars().count());
+            let pad = width.saturating_sub(visible_width(cell));
             let blank = " ".repeat(pad);
             parts.push(match self.alignment.get(i) {
                 Some(Align::Right) => format!("{blank}{cell}"),
@@ -153,11 +161,15 @@ mod tests {
     use std::str::FromStr;
 
     fn t(rows: &[&[&str]], headers: &[(&str, Align)]) -> String {
+        t_styled(rows, headers, Palette::off())
+    }
+
+    fn t_styled(rows: &[&[&str]], headers: &[(&str, Align)], pal: Palette) -> String {
         let mut table = Table::new(headers);
         for r in rows {
             table.push(r.iter().map(|c| (*c).to_string()).collect());
         }
-        table.render()
+        table.render(&pal)
     }
 
     /// The whole point: a cell wider than its header must not move the columns.
@@ -193,6 +205,38 @@ mod tests {
         for line in out.lines() {
             assert_eq!(line, line.trim_end(), "trailing space in {line:?}");
         }
+    }
+
+    /// A coloured cell is measured without its escapes.
+    ///
+    /// This is the whole reason colour is safe to add: if a table counted the
+    /// escape codes, a styled value would be padded as if it were longer than it
+    /// looks and every column after it would move.
+    #[test]
+    fn colour_does_not_change_a_column_position() {
+        let pal = Palette::on();
+        let mut table = Table::new(&[("K", Align::Left), ("V", Align::Left)]);
+        table.push(vec!["a".to_string(), pal.green("ok")]);
+        table.push(vec![
+            "b".to_string(),
+            pal.red("DISABLED (insufficient_credit)"),
+        ]);
+        let out = table.render(&pal);
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(
+            lines[0].starts_with("\x1b[1m"),
+            "the header is bold: {out:?}"
+        );
+        let visible_offset = |line: &str, needle: &str| {
+            let at = line.find(needle).expect("the needle is on the line");
+            visible_width(&line[..at])
+        };
+        assert_eq!(
+            visible_offset(lines[1], "ok"),
+            visible_offset(lines[2], "DISABLED"),
+            "the value column moved: {out:?}"
+        );
     }
 
     /// Ragged rows are a bug in the caller, not a panic in the renderer.
