@@ -46,12 +46,39 @@ use time::OffsetDateTime;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     /// No account for this provider could satisfy the hard gate.
+    ///
+    /// The arithmetic that produced the refusal travels with the error. "No
+    /// eligible account" alone is unactionable: it cannot distinguish a spent
+    /// allowance from a request that was priced too high from a model with no
+    /// price at all, and those need three different responses. Answering that
+    /// question against a live gateway cost an hour of forensics, which is the
+    /// whole reason these fields exist.
     NoEligibleAccount {
         provider: ProviderId,
         /// How long until the earliest account becomes eligible again.
         retry_after: Option<Duration>,
+        /// Estimated cost plus the safety reserve: what the request needed.
+        needed: Decimal,
+        /// The account that came closest, and the headroom it could offer.
+        best_account: Option<AccountId>,
+        best_headroom: Option<Decimal>,
+        /// Why even that account was refused.
+        reason: Option<RejectReason>,
     },
     UnknownProvider(ProviderId),
+}
+
+impl std::fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RejectReason::Unknown => "not probed yet",
+            RejectReason::Parked => "parked after a quota error",
+            RejectReason::Disabled => "disabled",
+            RejectReason::InsufficientHeadroom => "headroom below the estimate",
+            RejectReason::MeteredNotAllowed => "only metered money left, and spending it is off",
+            RejectReason::NoGates => "no quota reading yet",
+        })
+    }
 }
 
 impl std::fmt::Display for PlanError {
@@ -60,14 +87,27 @@ impl std::fmt::Display for PlanError {
             PlanError::NoEligibleAccount {
                 provider,
                 retry_after,
-            } => match retry_after {
-                Some(d) => write!(
-                    f,
-                    "no eligible account for provider {provider}; earliest reset in {}s",
-                    d.as_secs()
-                ),
-                None => write!(f, "no eligible account for provider {provider}"),
-            },
+                needed,
+                best_account,
+                best_headroom,
+                reason,
+            } => {
+                write!(f, "no eligible account for provider {provider}")?;
+                if let (Some(acct), Some(head)) = (best_account, best_headroom) {
+                    write!(
+                        f,
+                        ": the request was estimated at {needed}, and {acct} has the most room, \
+                         with {head} left"
+                    )?;
+                    if let Some(r) = reason {
+                        write!(f, " ({r})")?;
+                    }
+                }
+                if let Some(d) = retry_after {
+                    write!(f, "; earliest reset in {}s", d.as_secs())?;
+                }
+                Ok(())
+            }
             PlanError::UnknownProvider(p) => write!(f, "unknown provider {p}"),
         }
     }
@@ -359,6 +399,9 @@ impl Pool {
         let mut covered_cands: Vec<Cand> = Vec::new();
         let mut metered_cands: Vec<Cand> = Vec::new();
         let mut earliest: Option<OffsetDateTime> = None;
+        // The account that came closest and why it still failed. Reported back
+        // through PlanError so the 429 can name the number that did not fit.
+        let mut best: Option<(String, Decimal, RejectReason)> = None;
 
         for acct in inner.accounts.iter() {
             if acct.provider != provider {
@@ -402,7 +445,16 @@ impl Pool {
                         draining: acct.state == AccountState::Draining,
                     });
                 }
-                GateDecision::Reject(_) => {}
+                GateDecision::Reject(reason) => {
+                    let headroom = self
+                        .covered_headroom(acct)
+                        .or_else(|| self.metered_headroom(acct));
+                    if let Some(h) = headroom
+                        && best.as_ref().is_none_or(|(_, best_h, _)| h > *best_h)
+                    {
+                        best = Some((acct.qualified(), h, reason));
+                    }
+                }
             }
         }
 
@@ -455,6 +507,10 @@ impl Pool {
             return Err(PlanError::NoEligibleAccount {
                 provider: provider.to_string(),
                 retry_after,
+                needed: est_cost + reserve,
+                best_account: best.as_ref().map(|(a, _, _)| a.clone()),
+                best_headroom: best.as_ref().map(|(_, h, _)| *h),
+                reason: best.as_ref().map(|(_, _, r)| *r),
             });
         };
 
@@ -956,6 +1012,47 @@ mod tests {
             p.account("commandcode/acc-1").unwrap().state,
             AccountState::Active
         );
+    }
+
+    /// A refusal must carry the arithmetic that produced it.
+    ///
+    /// Addressed against a live gateway: a 1.2 MB request was refused with a
+    /// bare "no eligible account" while the account still showed 12.67 USD of
+    /// headroom. Nothing in that message said whether the allowance was spent,
+    /// the request was priced above it, or the model had no price at all -- and
+    /// those three need three different answers.
+    #[test]
+    fn a_refusal_names_the_estimate_and_the_account_that_came_closest() {
+        let p = Pool::new(
+            vec![acct("xk-1", "xkiro", vec![cover(20, 7)], AccountState::Active)],
+            &policy(),
+        );
+
+        let err = p
+            .select("xkiro", "m", None, Decimal::from(40), "r", 1)
+            .expect_err("an estimate above the headroom must be refused");
+        let msg = err.to_string();
+
+        assert!(msg.contains("estimated at 40"), "{msg}");
+        assert!(msg.contains("xkiro/xk-1"), "{msg}");
+        assert!(msg.contains("13 left"), "20 - 7 = 13: {msg}");
+        assert!(msg.contains("headroom below the estimate"), "{msg}");
+    }
+
+    /// A refusal with nothing to compare against must still not read as if the
+    /// account had room: no candidate means no claim about headroom.
+    #[test]
+    fn a_refusal_without_any_headroom_claims_nothing() {
+        let p = Pool::new(
+            vec![acct("xk-1", "xkiro", vec![], AccountState::Active)],
+            &policy(),
+        );
+        let err = p
+            .select("xkiro", "m", None, Decimal::ONE, "r", 1)
+            .expect_err("an account with no gates cannot serve");
+        let msg = err.to_string();
+        assert!(msg.starts_with("no eligible account for provider xkiro"), "{msg}");
+        assert!(!msg.contains("most room"), "no headroom was measured: {msg}");
     }
 
     /// The free-token allowance must not gate paid traffic.

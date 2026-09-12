@@ -829,6 +829,7 @@ fn plan_error_response(err: &PlanError, backend: &dyn ProxyBackend) -> Response 
         PlanError::NoEligibleAccount {
             provider,
             retry_after,
+            ..
         } => {
             // No fall-through to another provider and no silent metered spend:
             // the client is told to come back when the earliest window resets.
@@ -1673,6 +1674,20 @@ key = "sk-a2"
             (1..=120).contains(&secs),
             "the earliest reset wins, got {secs}"
         );
+
+        // The body has to explain the refusal, not just name it. An operator
+        // reading "no eligible account" cannot tell a spent allowance from a
+        // request priced above it, and the two need different responses.
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("parked after a quota error"),
+            "the refusal must name the reason: {body}"
+        );
+        assert!(
+            body.contains("mock/a"),
+            "the refusal must name the account that came closest: {body}"
+        );
+
         assert!(fake.successes.lock().unwrap().is_empty());
         assert!(fake.failures.lock().unwrap().is_empty());
     }
