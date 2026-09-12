@@ -1845,6 +1845,30 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
     rows
 }
 
+/// What the vault line says, given how many keys still live in their own item.
+fn vault_status(per_account: usize) -> String {
+    if per_account == 0 {
+        "every key in one credential-store item".to_string()
+    } else {
+        format!("{per_account} key(s) still in separate per-account items")
+    }
+}
+
+/// The line under it: whether `lgw keys migrate` has anything to do.
+///
+/// A command that only ever runs when something is wrong has to say so when
+/// nothing is, or the only way to find out whether it is still needed is to run
+/// it and read the counts.
+fn migration_note(per_account: usize, pal: &Palette) -> String {
+    if per_account == 0 {
+        pal.dim("nothing to migrate: no account still uses its own item")
+    } else {
+        pal.yellow(&format!(
+            "{per_account} key(s) still use their own item; 'lgw keys migrate --prune' folds them in"
+        ))
+    }
+}
+
 fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Result<()> {
     println!("backend: {}", creds.backend_name());
     let rows = credential_rows(config, creds);
@@ -1853,14 +1877,8 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Res
         .filter(|r| r.source.contains("per-account"))
         .count();
     if creds.is_vaulted() {
-        println!(
-            "vault   : {}",
-            if per_account == 0 {
-                "every key in one credential-store item".to_string()
-            } else {
-                format!("{} key(s) still in separate per-account items", per_account)
-            }
-        );
+        println!("vault   : {}", vault_status(per_account));
+        println!("          {}", migration_note(per_account, pal));
     }
     println!();
     let mut table = crate::table::Table::new(&[
@@ -1892,10 +1910,6 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Res
             pal.yellow(
                 "On macOS every separate item is a separate authorisation prompt for this binary."
             )
-        );
-        println!(
-            "{}",
-            pal.dim("Fold them into one item with: lgw keys migrate --prune")
         );
         println!();
     }
@@ -3553,6 +3567,24 @@ key = {{ key_file = "{key_file}" }}
         }];
         assert!(
             !render_usage(&single, &[GroupBy::Model], now(), &Palette::off()).contains("m [USD]")
+        );
+    }
+
+    #[test]
+    fn the_vault_status_says_when_there_is_nothing_to_migrate() {
+        assert_eq!(vault_status(0), "every key in one credential-store item");
+        assert_eq!(
+            vault_status(2),
+            "2 key(s) still in separate per-account items"
+        );
+
+        let settled = migration_note(0, &Palette::off());
+        assert!(settled.contains("nothing to migrate"), "{settled}");
+        let pending = migration_note(2, &Palette::off());
+        assert!(pending.contains("--prune"), "{pending}");
+        assert!(
+            !pending.contains("nothing to migrate"),
+            "a key still in its own item is something to migrate: {pending}"
         );
     }
 

@@ -156,6 +156,13 @@ does. Both are optional -- without them the gateway behaves identically, it just
 keeps asking. `lgw keys list` shows which item each key came out of, and says
 so when per-account items are still in use.
 
+`lgw keys migrate` is for the install that predates the vault: `keys add` has
+written every key into the single vault item since, so a fresh install never
+needs it. It stays because the per-account read path stays -- an old install
+keeps working without migrating, and `--prune` is the only thing that deletes
+the leftover items once the vault holds them. On a settled install it reports
+"nothing to migrate" and touches nothing.
+
 Note that a plain `cargo install --path .` replaces the signed binary with an
 ad-hoc one and brings the prompts back; use `scripts/lgw-install.sh` instead.
 Re-signing restores the existing grant, so there is nothing to re-authorise.
