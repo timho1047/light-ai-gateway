@@ -9,7 +9,7 @@
 use crate::accounts::{AttemptPlan, PlanError, Pool};
 use crate::config::{Config, ResolvedRoute};
 use crate::domain::{
-    now, Account, AttemptRecord, GateClass, RequestRecord, TokenUsage,
+    now, Account, AttemptRecord, GateClass, GateKind, RequestRecord, TokenUsage,
 };
 use crate::error::UpstreamErrorClass;
 use crate::meter::PriceTable;
@@ -22,10 +22,53 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 
+/// Spend that appeared during one probe interval.
+///
+/// Sums across accounts, because two accounts are two separate pools of money.
+/// Within a single account it takes the LARGEST single-window increase rather
+/// than the sum, because the windows nest: a weekly window and the 5-hour window
+/// inside it both report the same cumulative spend, and adding them bills the
+/// same money once per window.
+///
+/// An account with no previous sample contributes nothing. Its whole historic
+/// spend would otherwise be charged to whatever tokens happened to pass through
+/// since it first appeared.
+fn interval_spend(
+    last: &HashMap<String, SpendSample>,
+    current: &HashMap<String, HashMap<GateKind, Decimal>>,
+) -> Decimal {
+    let mut delta = Decimal::ZERO;
+    for (account, gates) in current {
+        let Some(previous) = last.get(account).map(|s| &s.by_gate) else {
+            continue;
+        };
+        let largest = gates
+            .iter()
+            .filter_map(|(kind, used)| previous.get(kind).map(|before| *used - *before))
+            .filter(|increase| *increase > Decimal::ZERO)
+            .max();
+        if let Some(increase) = largest {
+            delta += increase;
+        }
+    }
+    delta
+}
+
 /// Provider spend observed at the last probe, for price learning.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Keyed by account, then by gate kind, and both levels are load-bearing.
+///
+/// Across ACCOUNTS the spend sums: two accounts are two separate pools of
+/// money. Within ONE account it must not. A weekly window and the 5-hour window
+/// nested inside it both report the same cumulative spend, so adding them bills
+/// the same money once per window. Measured on a live Command Code account, a 5h
+/// window and a weekly window both rose by exactly 0.036638504 credits over one
+/// interval while the summed delta reported 0.073277008 -- exactly double, and
+/// half of it invented. The interval's spend is therefore the largest increase
+/// any single window of that account saw.
+#[derive(Debug, Clone, Default)]
 struct SpendSample {
-    covered_spend: Decimal,
+    by_gate: HashMap<GateKind, Decimal>,
 }
 
 pub struct Gateway {
@@ -415,29 +458,32 @@ impl Gateway {
     /// and promotions) are learned from real numbers rather than maintained by
     /// hand.
     fn learn_from_probe(&self, provider: &str) {
-        let accounts = self.pool.accounts_of(provider);
-        let covered: Decimal = accounts
+        // One map per account: gate kind -> that window's cumulative spend.
+        let snapshot: HashMap<String, HashMap<GateKind, Decimal>> = self
+            .pool
+            .accounts_of(provider)
             .iter()
-            .flat_map(|a| a.covered_gates())
-            .filter(|g| !g.stale)
-            .map(|g| g.used)
-            .sum();
+            .map(|acct| {
+                let gates = acct
+                    .covered_gates()
+                    .filter(|g| !g.stale)
+                    .map(|g| (g.kind, g.used))
+                    .collect();
+                (acct.qualified(), gates)
+            })
+            .collect();
 
-        let previous = {
+        let delta = {
             let Ok(mut last) = self.last_spend.lock() else {
                 return;
             };
-            let prev = last.get(provider).copied().unwrap_or_default();
-            last.insert(
-                provider.to_string(),
-                SpendSample {
-                    covered_spend: covered,
-                },
-            );
-            prev
+            let delta = interval_spend(&last, &snapshot);
+            for (account, current) in snapshot {
+                last.insert(account, SpendSample { by_gate: current });
+            }
+            delta
         };
 
-        let delta = covered - previous.covered_spend;
         if delta <= Decimal::ZERO {
             return;
         }
@@ -594,5 +640,119 @@ impl Gateway {
         } else {
             GateClass::Metered
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d(mantissa: i64, scale: u32) -> Decimal {
+        Decimal::new(mantissa, scale)
+    }
+
+    fn gates(pairs: &[(GateKind, Decimal)]) -> HashMap<GateKind, Decimal> {
+        pairs.iter().copied().collect()
+    }
+
+    /// Measured live on a Command Code account.
+    ///
+    /// One probe interval moved the 5-hour window and the weekly window that
+    /// contains it by exactly 0.036638504 credits each, while the monthly window
+    /// did not move at all. Summing the three reported 0.073277008 -- double the
+    /// money that actually left the account. Because the learned price is a
+    /// RATE, every figure derived from that interval was inflated by the same
+    /// factor, and it is what turned 47 tokens into 1559 USD per million.
+    #[test]
+    fn nested_windows_are_counted_once_not_once_each() {
+        let previous = HashMap::from([(
+            "commandcode/acc-1".to_string(),
+            SpendSample {
+                by_gate: gates(&[
+                    (GateKind::FiveHour, d(1_328_079_011, 9)),
+                    (GateKind::Weekly, d(4_390_359_400, 9)),
+                    (GateKind::Monthly, d(4_399_661_385, 9)),
+                ]),
+            },
+        )]);
+        let current = HashMap::from([(
+            "commandcode/acc-1".to_string(),
+            gates(&[
+                (GateKind::FiveHour, d(1_364_717_515, 9)),
+                (GateKind::Weekly, d(4_426_997_904, 9)),
+                (GateKind::Monthly, d(4_399_661_385, 9)),
+            ]),
+        )]);
+
+        assert_eq!(
+            interval_spend(&previous, &current),
+            d(36_638_504, 9),
+            "the same spend seen by two nested windows is still one spend"
+        );
+    }
+
+    /// Accounts add; windows inside one account do not; a reset does not go
+    /// negative; an account seen for the first time contributes nothing.
+    #[test]
+    fn spend_adds_across_accounts_but_not_within_one() {
+        let previous = HashMap::from([
+            (
+                "p/a".to_string(),
+                SpendSample {
+                    by_gate: gates(&[
+                        (GateKind::FiveHour, d(1_000, 3)),
+                        (GateKind::Weekly, d(2_000, 3)),
+                    ]),
+                },
+            ),
+            (
+                "p/c".to_string(),
+                SpendSample {
+                    by_gate: gates(&[(GateKind::FiveHour, d(2_000, 3))]),
+                },
+            ),
+        ]);
+        let current = HashMap::from([
+            (
+                "p/a".to_string(),
+                gates(&[
+                    // The short window rolled over inside the interval, so its
+                    // reading dropped. Only the weekly window saw the spend.
+                    (GateKind::FiveHour, d(10, 3)),
+                    (GateKind::Weekly, d(2_800, 3)),
+                ]),
+            ),
+            (
+                // Never probed before: its entire history must not be charged
+                // to whatever tokens happen to have passed through.
+                "p/b".to_string(),
+                gates(&[(GateKind::FiveHour, d(9_000, 3))]),
+            ),
+            (
+                "p/c".to_string(),
+                gates(&[(GateKind::FiveHour, d(2_250, 3))]),
+            ),
+        ]);
+
+        // p/a: max(+800 from weekly, -990 ignored) = 0.800; p/c: +0.250.
+        assert_eq!(interval_spend(&previous, &current), d(1_050, 3));
+    }
+
+    /// Nothing moved: there is no interval spend to learn from.
+    #[test]
+    fn an_unchanged_interval_learns_nothing() {
+        let same = || {
+            HashMap::from([(
+                "p/a".to_string(),
+                SpendSample {
+                    by_gate: gates(&[(GateKind::FiveHour, d(1_000, 3))]),
+                },
+            )])
+        };
+        let current = HashMap::from([(
+            "p/a".to_string(),
+            gates(&[(GateKind::FiveHour, d(1_000, 3))]),
+        )]);
+        assert_eq!(interval_spend(&same(), &current), Decimal::ZERO);
     }
 }

@@ -145,6 +145,23 @@ actually costs. Providers apply per-model multipliers, promotions and credit
 rates, so observation is the more trustworthy figure, and it takes over for
 billing as soon as there is one. The configured value is kept unchanged.
 
+Two conditions have to hold before that difference means anything, and both fail
+easily in practice:
+
+- **The account must be used only through this gateway.** The provider reports
+  spend per account, not per client. Use the same account from an editor and its
+  spend lands in the interval and gets charged to the gateway's own tokens.
+- **The interval must carry a real token volume.** A spend figure divided by a
+  handful of tokens is a fixed per-request charge wearing a rate's clothes. One
+  live Command Code interval turned 47 tokens and 0.073 credits into 1559 USD
+  per million, which then refused every request over ~5,400 tokens. Rates above
+  1000 USD per million are now rejected rather than stored, and so is any such
+  row read back from an older ledger.
+
+When either condition is doubtful, write the price down instead of waiting for it
+to be learned. A configured price is never overwritten by a bad interval, and one
+plausible number is worth more than a table that quietly wedges the hard gate.
+
     ai-gw prices
 
     PROVIDER  MODEL                SOURCE   MIX in/out/cr  EXPECTED  ACTUAL   DRIFT   SAMPLES

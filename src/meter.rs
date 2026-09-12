@@ -57,6 +57,25 @@ impl ModelPrice {
         self.samples > 0
     }
 
+    /// Whether every component is a rate a provider could actually charge.
+    ///
+    /// Used both when a rate is learned and when one is restored from disk, so
+    /// that a figure produced by an older build cannot come back on every
+    /// restart. Decimal cannot hold a NaN or an infinity, so the range check is
+    /// the whole story: a negative rate or one past the ceiling is an arithmetic
+    /// accident, and a single one in the table sizes the hard gate -- and so
+    /// refuses or admits every request that follows.
+    pub fn is_plausible(&self) -> bool {
+        let ceiling = max_plausible_per_token();
+        [
+            self.input_per_token,
+            self.output_per_token,
+            self.cache_read_per_token,
+        ]
+        .iter()
+        .all(|p| *p >= Decimal::ZERO && *p <= ceiling)
+    }
+
     /// Estimated cost of one usage sample, before the account multiplier.
     ///
     /// `cached_tokens` is a SUBSET of `prompt_tokens` in the OpenAI dialect,
@@ -372,9 +391,12 @@ impl PriceTable {
         }
 
         let observed = cost / weighted;
-        // A rate above one dollar per token is nonsense (a million USD per
-        // million tokens) and would wedge the hard gate. Ignore it rather than
-        // let one bad probe poison the table.
+        // A rate past MAX_PLAUSIBLE_PER_MILLION is nonsense and would wedge the
+        // hard gate -- refusing every request for the life of the ledger.
+        // Ignore it rather than let one bad interval poison the table.
+        // A zero rate is deliberately NOT refused: a model that really is free
+        // must fall out at rate 0 and never trigger a rotation. Only the
+        // ceiling is.
         if observed > max_plausible_per_token() {
             return;
         }
@@ -478,10 +500,20 @@ impl PriceTable {
     /// Without this, every restart falls back to the conservative default until
     /// the next probe, and that default was measured against live providers to
     /// be off by an order of magnitude in both directions.
+    ///
+    /// Rows are re-checked against the plausibility ceiling on the way in. A
+    /// ceiling is a property of a price, not of the path that produced it, and a
+    /// rate written by an older build would otherwise be restored at every
+    /// startup for the life of the ledger -- with no way back except deleting
+    /// the row by hand. Skipping it here also repairs a ledger that already
+    /// carries one.
     pub fn load_learned(&mut self, rows: Vec<PersistedPrice>) -> usize {
         let mut loaded = 0;
         for row in rows {
             if row.model.is_empty() || row.provider.is_empty() {
+                continue;
+            }
+            if !row.price.is_plausible() {
                 continue;
             }
             let entry = self
@@ -848,8 +880,19 @@ fn default_cached_discount() -> Decimal {
     Decimal::new(1, 1)
 }
 
+/// Ceiling on a learnable rate, in USD per million tokens.
+///
+/// Above this a figure is not a price, it is a mis-attribution: a fixed
+/// per-request charge, or another client's traffic on a shared account, divided
+/// by an interval that happened to carry almost no tokens. The bound used to be
+/// one dollar per TOKEN -- a million dollars per million -- which nothing could
+/// reach, so it never guarded anything. The dearest production models bill
+/// around 150 USD/M, so 1000 leaves an order of magnitude of room and still
+/// catches a rate like the 1559 USD/M that a 47-token interval produced once.
+pub const MAX_PLAUSIBLE_PER_MILLION: u64 = 1000;
+
 fn max_plausible_per_token() -> Decimal {
-    Decimal::ONE
+    per_token(MAX_PLAUSIBLE_PER_MILLION)
 }
 
 fn per_token(per_million: u64) -> Decimal {
@@ -1038,17 +1081,76 @@ mod tests {
     #[test]
     fn observe_averages_repeated_observations() {
         let mut table = PriceTable::new();
-        table.observe(P, "m", 0, Decimal::from(1), &usage(1_000, 0, 0)); // rate 0.001
-        table.observe(P, "m", 0, Decimal::from(3), &usage(1_000, 0, 0)); // rate 0.003
+        // 0.002 and 0.006 over 1000-token intervals: 2 and 6 USD per million.
+        // These used to be 1 and 3, which are 1000 and 3000 USD per million --
+        // the averaging was being proved on rates no provider charges.
+        table.observe(P, "m", 0, Decimal::new(2, 3), &usage(1_000, 0, 0));
+        table.observe(P, "m", 0, Decimal::new(6, 3), &usage(1_000, 0, 0));
         let learned = table.get(P, "m", 0).unwrap();
         assert_eq!(learned.samples, 2);
-        assert_eq!(learned.input_per_token, Decimal::new(2, 3)); // mean 0.002
+        assert_eq!(learned.input_per_token, Decimal::new(4, 6)); // mean 4 USD/M
         assert_eq!(
             table
                 .estimate(P, "m", 0, &usage(1_000, 0, 0), Decimal::ONE)
                 .unwrap(),
-            Decimal::from(2)
+            Decimal::new(4, 3)
         );
+    }
+
+    /// A rate derived from an interval with almost no tokens is not a price.
+    ///
+    /// Measured live: one probe interval on a Command Code account carried 47
+    /// tokens and reported 0.073277008 credits of spend, which reads as 1559 USD
+    /// per million. The old ceiling was one dollar per TOKEN -- a million per
+    /// million -- so no observation could ever exceed it. The table took the
+    /// rate, and from then on every request larger than roughly 5,400 estimated
+    /// tokens was refused by the hard gate, for the life of the ledger.
+    #[test]
+    fn a_rate_that_would_wedge_the_hard_gate_is_refused() {
+        let mut table = PriceTable::new();
+        table.observe(P, "m", 0, Decimal::new(73_277_008, 9), &usage(31, 16, 0));
+        assert!(
+            table.get(P, "m", 0).is_none(),
+            "an implausible rate must not be learned"
+        );
+        assert_eq!(table.known_models(), 0);
+        // ... and the gate falls back to the deliberately conservative default.
+        let est = crate::meter::conservative_estimate(&usage(31, 16, 0), Decimal::ONE);
+        assert!(est > Decimal::ZERO);
+        assert!(
+            table.estimate(P, "m", 0, &usage(31, 16, 0), Decimal::ONE).is_none(),
+            "with nothing learned the caller must use the conservative estimate"
+        );
+    }
+
+    /// The same ceiling has to apply on the way in from disk.
+    ///
+    /// Otherwise a rate written by an older build is restored at every startup
+    /// for the life of the ledger, and the only way back is deleting the row by
+    /// hand. Checking here also means a ledger that already carries one heals
+    /// itself on the next restart.
+    #[test]
+    fn a_poisoned_price_on_disk_is_skipped_rather_than_restored() {
+        let poisoned: Decimal = "0.0015590852765957446808510638".parse().unwrap();
+        let rows = vec![PersistedPrice {
+            provider: P.to_string(),
+            model: "m".to_string(),
+            tier: 0,
+            price: ModelPrice {
+                input_per_token: poisoned,
+                output_per_token: poisoned,
+                cache_read_per_token: poisoned,
+                samples: 1,
+            },
+            observed_prompt_tokens: 31,
+            observed_completion_tokens: 16,
+            observed_cached_tokens: 0,
+        }];
+
+        let mut table = PriceTable::new();
+        assert_eq!(table.load_learned(rows), 0);
+        assert!(table.get(P, "m", 0).is_none());
+        assert_eq!(table.known_models(), 0);
     }
 
     #[test]
@@ -1425,8 +1527,10 @@ mod tests {
     #[test]
     fn prices_are_scoped_per_provider() {
         let mut table = PriceTable::new();
-        table.observe("cheap", "m", 0, Decimal::from(1), &usage(1_000, 0, 0));
-        table.observe("dear", "m", 0, Decimal::from(10), &usage(1_000, 0, 0));
+        // 2 USD/M and 20 USD/M: same shape as before, but priced like a model
+        // rather than like the old ceiling test that let anything through.
+        table.observe("cheap", "m", 0, Decimal::new(2, 3), &usage(1_000, 0, 0));
+        table.observe("dear", "m", 0, Decimal::new(2, 2), &usage(1_000, 0, 0));
         assert_ne!(
             table.get("cheap", "m", 0).unwrap().input_per_token,
             table.get("dear", "m", 0).unwrap().input_per_token,
