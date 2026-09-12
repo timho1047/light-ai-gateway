@@ -586,9 +586,28 @@ fn save_prices_tx(tx: &Transaction<'_>, prices: &[crate::meter::PersistedPrice])
     Ok(())
 }
 
+/// Whether a table exists in this database.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Read the learned price table back.
+///
+/// A ledger written by a build that predates price learning simply has no such
+/// table. That is a normal state, not a failure, so it reads as "nothing learned
+/// yet" rather than surfacing an error the operator can do nothing about. Any
+/// other read failure still propagates.
 pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice>> {
     use crate::meter::{ModelPrice, PersistedPrice};
+
+    if !table_exists(conn, "prices")? {
+        return Ok(Vec::new());
+    }
 
     /// provider, model, prompt, completion, discount, samples, prompt_tok, completion_tok, cached_tok
     type PriceRowTuple = (String, String, String, String, String, i64, i64, i64, i64);
@@ -1330,6 +1349,18 @@ mod tests {
     /// Learned prices must survive a restart: without them every start falls
     /// back to the conservative default, which was measured against live
     /// providers to be off by an order of magnitude in both directions.
+    #[test]
+    fn reading_prices_from_a_ledger_that_predates_them_is_empty_not_an_error() {
+        // A database created before price learning has no prices table. Reading
+        // it must yield "nothing learned yet", not an error the operator cannot
+        // act on.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE requests (id TEXT PRIMARY KEY);")
+            .unwrap();
+        let loaded = load_prices(&conn).expect("a missing prices table is not a failure");
+        assert!(loaded.is_empty());
+    }
+
     #[test]
     fn learned_prices_round_trip_through_the_writer() {
         let tmp = TempDb::new("prices");
