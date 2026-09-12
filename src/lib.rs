@@ -20,3 +20,18 @@ pub mod tier;
 pub use config::Config;
 pub use domain::{Account, Gate, GateClass, GateKind, TokenUsage};
 pub use error::{ErrorSignals, UpstreamErrorClass};
+
+/// Read an environment variable, falling back to the spelling it had before the
+/// command was renamed from ai-gw to lgw.
+///
+/// An AI_GW_* exported in a shell profile or a CI job keeps working rather than
+/// silently losing its meaning, and the warning names the replacement. Returns
+/// None when neither spelling is set.
+pub fn env_preferring(current: &str, legacy: &str) -> Option<String> {
+    if let Some(value) = std::env::var_os(current) {
+        return Some(value.to_string_lossy().into_owned());
+    }
+    let value = std::env::var_os(legacy)?;
+    tracing::warn!("{legacy} is deprecated; use {current} instead");
+    Some(value.to_string_lossy().into_owned())
+}

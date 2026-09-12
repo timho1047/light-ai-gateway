@@ -8,7 +8,7 @@
 listen = "127.0.0.1:8787"
 db_path = "~/.light-ai-gateway/gateway.db"
 # Strongly recommended. Without it any local process can spend your quota.
-# The value is a token you invent; register it with: ai-gw keys add local gateway
+# The value is a token you invent; register it with: lgw keys add local gateway
 # local_key = { keychain = true }
 
 [policy]
@@ -53,7 +53,7 @@ currency = "USD"
 # Accounts need no key here. Omitting it means "read from the OS credential
 # store", which you fill in once:
 #
-#     ai-gw keys add xkiro acc-1
+#     lgw keys add xkiro acc-1
 #
 # The key is handed to the operating system's own credential store (macOS
 # Keychain, Windows Credential Manager, freedesktop Secret Service), so it is
@@ -137,7 +137,7 @@ label = "deepseek"
 # These prices are a STARTING POINT, not just a fallback. On the first probe
 # that observes real spend for a model, the learned rate takes over for billing,
 # and the configured value is kept unchanged as the expectation to compare
-# against. Run  ai-gw prices  to see the two side by side; a persistent gap means
+# against. Run  lgw prices  to see the two side by side; a persistent gap means
 # the upstream changed its rates, quietly or otherwise.
 #
 # Models with no entry here and no observation yet are priced at a deliberately

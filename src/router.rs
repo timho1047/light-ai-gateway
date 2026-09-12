@@ -120,7 +120,7 @@ impl Gateway {
         }
         if accounts.is_empty() {
             anyhow::bail!(
-                "no account could be loaded: every configured account is missing a credential.                  Run ai-gw keys list to see which ones, then ai-gw keys add <provider> <account>"
+                "no account could be loaded: every configured account is missing a credential.                  Run lgw keys list to see which ones, then lgw keys add <provider> <account>"
             );
         }
         accounts.extend(unusable);
@@ -414,7 +414,7 @@ impl Gateway {
     async fn probe_one(&self, provider: &str, account: &Account) {
         // Never probe an account we have no credential for. The request would be
         // sent unauthenticated and return 401, overwriting the far more useful
-        // "no credential, run ai-gw keys add ..." message that is already on the
+        // "no credential, run lgw keys add ..." message that is already on the
         // account, and burning a round trip to say nothing.
         if account.api_key.is_empty() {
             tracing::debug!(

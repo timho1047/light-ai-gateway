@@ -106,7 +106,7 @@ N   规则            切换次数
 
 ~~~text
 默认 20 分钟；有请求在跑 → 5 分钟；空闲 → 60 分钟
-手动: ai-gw status --refresh
+手动: lgw status --refresh
 切换前: 强制探测目标账号一次（便宜的保险，避免切到已满的号）
 失败: 保留上次值 + 标 stale，绝不显示成 0（否则会误判额度耗尽）
 ~~~
@@ -267,7 +267,7 @@ SQLite（`rusqlite` bundled + WAL + `busy_timeout`，单写者 actor 批量提�
 4. soft(80%) / hard(成本式) 双层阈值 + covered/metered 分层
 5. 429/402/5xx 分类 + 未交付前的有界重试
 6. 事件驱动的重新决策 + sticky（防抖动，§2）
-7. SQLite 落库 + `ai-gw status` / `usage`
+7. SQLite 落库 + `lgw status` / `usage`
 
 **Phase 1**：价格自学习（Δspent/Δtokens）+ 切换前强制探测 + `tail` TUI + `doctor`。
 
@@ -298,7 +298,7 @@ SQLite（`rusqlite` bundled + WAL + `busy_timeout`，单写者 actor 批量提�
 | **reap** | 一个窗口到点就清空所有窗口 | 只清真正滚动的窗口；`available_at` 只代表它当时停用的那一个 |
 | **measured=false** | 估算 token 进入价格自学习的分母 | 只累计真实测量 |
 | **credit_multiplier** | 对「已学到的价格」重复施加 | 只作用于 configured 价格（learned 已是账号计费单位） |
-| **留存（§10）** | 无任何删除 | 启动时清理超过 30 天的 attempts；`requests` 保留，因为 `ai-gw usage` 直接聚合它，删掉会让长期报表静默变小 |
+| **留存（§10）** | 无任何删除 | 启动时清理超过 30 天的 attempts；`requests` 保留，因为 `lgw usage` 直接聚合它，删掉会让长期报表静默变小 |
 | **adapter = "none"** | 校验放行，doctor 显示为「local ledger only」 | 校验期告警 + doctor 计为问题：无探测源的账号永远出不了 Unknown |
 | **Command Code monthlyCredits** | 当 cap 用（used = 周期花费） | 它是**剩余余额**：cap = period_spend + monthlyCredits，used = period_spend。依据 opencodex e6354c2/4e07fed 的 limit = used + remaining 与其夹具 |
 

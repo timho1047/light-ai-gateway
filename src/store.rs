@@ -325,7 +325,7 @@ pub const DETAIL_RETENTION_DAYS: i64 = 30;
 /// Delete per-attempt telemetry older than the retention window.
 ///
 /// Only the attempts table is pruned, and the reason is worth writing down:
-/// "ai-gw usage" aggregates the LIVE requests table, not usage_daily (the daily
+/// "lgw usage" aggregates the LIVE requests table, not usage_daily (the daily
 /// rollup is keyed by provider and day, so it cannot answer the model and
 /// account groupings the command offers). Deleting request rows would therefore
 /// make a 90-day report quietly return less than the truth, and a number that
@@ -370,7 +370,7 @@ impl StoreHandle {
         let failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let writer_failures = std::sync::Arc::clone(&failures);
         std::thread::Builder::new()
-            .name("lai-gw-store-writer".to_string())
+            .name("lgw-store-writer".to_string())
             .spawn(move || writer_loop(conn, rx, writer_failures))
             .context("spawning store writer thread")?;
         Ok(StoreHandle { tx, failures })
@@ -1257,7 +1257,7 @@ mod tests {
     impl TempDb {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "lai-gw-store-{}-{}-{}",
+                "lgw-store-{}-{}-{}",
                 std::process::id(),
                 tag,
                 uuid::Uuid::new_v4()
@@ -1941,7 +1941,7 @@ mod tests {
     /// Old attempt telemetry goes; reported history does not move.
     ///
     /// Nothing ever deleted anything, so the ledger grew for the life of the
-    /// machine. Request rows are deliberately kept: "ai-gw usage" reads them
+    /// machine. Request rows are deliberately kept: "lgw usage" reads them
     /// directly, so trimming them would shrink a 90-day report without saying so.
     #[test]
     fn pruning_drops_old_attempts_and_leaves_reported_history_intact() {

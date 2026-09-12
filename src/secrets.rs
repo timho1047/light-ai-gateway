@@ -28,7 +28,7 @@
 //! access-control grant is bound to the calling binary's code signature, and an
 //! ad-hoc signed binary is identified by the hash of its code, so it can never be
 //! remembered across a rebuild. Fewer items means fewer things to authorise, and
-//! "ai-gw keys migrate --prune" is what folds them together.
+//! "lgw keys migrate --prune" is what folds them together.
 
 use crate::domain::ApiKey;
 use anyhow::{Context, Result};
@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 pub const SERVICE: &str = "light-ai-gateway";
 
 /// Reserved provider/account pair for the gateway's own local access token.
-/// Register it with: ai-gw keys add local gateway
+/// Register it with: lgw keys add local gateway
 pub const LOCAL_KEY_PROVIDER: &str = "local";
 pub const LOCAL_KEY_ACCOUNT: &str = "gateway";
 
@@ -101,7 +101,7 @@ pub fn entry_user(provider: &str, account: &str) -> String {
 /// restarting with an empty environment and guessing.
 pub fn missing_credential_message(provider: &str, account: &str) -> String {
     format!(
-        "no credential for {provider}/{account}. Run: ai-gw keys add {provider} {account}"
+        "no credential for {provider}/{account}. Run: lgw keys add {provider} {account}"
     )
 }
 
@@ -412,15 +412,16 @@ pub struct CredentialStore {
 impl CredentialStore {
     /// The backend this process should use, from the environment.
     ///
-    /// AI_GW_CREDENTIAL_BACKEND=memory forces an ephemeral store, so dry runs and
+    /// LGW_CREDENTIAL_BACKEND=memory forces an ephemeral store, so dry runs and
     /// CI never touch the operator's real keychain. EVERY caller has to come
     /// through here. When only doctor and keys honoured the setting, "serve"
     /// read the real keychain anyway -- so the documented promise was false
     /// exactly where it mattered, and a dry run that believed it was isolated
     /// still raised authorisation prompts.
     pub fn from_env() -> Self {
-        match std::env::var("AI_GW_CREDENTIAL_BACKEND").as_deref() {
-            Ok("memory") => Self::memory(),
+        match crate::env_preferring("LGW_CREDENTIAL_BACKEND", "AI_GW_CREDENTIAL_BACKEND").as_deref()
+        {
+            Some("memory") => Self::memory(),
             _ => Self::keychain(),
         }
     }
@@ -592,7 +593,7 @@ mod tests {
     #[test]
     fn the_missing_credential_message_names_the_fix() {
         let msg = missing_credential_message("xkiro", "acc-1");
-        assert!(msg.contains("ai-gw keys add xkiro acc-1"), "got: {msg}");
+        assert!(msg.contains("lgw keys add xkiro acc-1"), "got: {msg}");
     }
 
     #[test]

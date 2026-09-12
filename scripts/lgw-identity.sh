@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create, and trust, the self-signed code-signing identity ai-gw is signed with.
+# Create, and trust, the self-signed code-signing identity lgw is signed with.
 #
 # Why this exists
 # ---------------
@@ -13,8 +13,8 @@
 # and the certificate does not change when the code does.
 set -euo pipefail
 
-IDENTITY="${AIGW_SIGN_IDENTITY:-aigw-dev}"
-KEYCHAIN="${AIGW_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
+IDENTITY="${LGW_SIGN_IDENTITY:-aigw-dev}"
+KEYCHAIN="${LGW_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
 
 valid() {
   security find-identity -v -p codesigning 2>/dev/null | grep -qF "\"$IDENTITY\""
@@ -28,7 +28,7 @@ report() {
   echo "identity \"$IDENTITY\" is ready:"
   security find-identity -v -p codesigning | grep -F "\"$IDENTITY\""
   echo
-  echo "Next: scripts/aigw-install.sh builds, signs and installs the binary."
+  echo "Next: scripts/lgw-install.sh builds, signs and installs the binary."
 }
 
 if valid; then

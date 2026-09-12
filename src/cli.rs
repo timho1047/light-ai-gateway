@@ -10,11 +10,11 @@
 //!
 //! Configuration path resolution, in order:
 //!   1. --config PATH
-//!   2. $AI_GW_CONFIG
-//!   3. ./ai-gw.toml, when it exists
+//!   2. $LGW_CONFIG
+//!   3. ./lgw.toml, when it exists
 //!   4. ~/.light-ai-gateway/config.toml
 //!
-//! `ai-gw init` writes to exactly the path this resolution picks, so the file
+//! `lgw init` writes to exactly the path this resolution picks, so the file
 //! it creates is the file the other commands read back.
 //!
 //! Read-only commands consult the persisted ledger (src/store.rs) rather than
@@ -44,9 +44,9 @@ use time::OffsetDateTime;
 pub enum ConfigOrigin {
     /// --config PATH
     Flag,
-    /// $AI_GW_CONFIG
+    /// $LGW_CONFIG
     Env,
-    /// ./ai-gw.toml
+    /// ./lgw.toml
     Local,
     /// ~/.light-ai-gateway/config.toml
     Home,
@@ -56,8 +56,8 @@ impl ConfigOrigin {
     fn label(self) -> &'static str {
         match self {
             ConfigOrigin::Flag => "--config",
-            ConfigOrigin::Env => "$AI_GW_CONFIG",
-            ConfigOrigin::Local => "./ai-gw.toml",
+            ConfigOrigin::Env => "$LGW_CONFIG",
+            ConfigOrigin::Local => "./lgw.toml",
             ConfigOrigin::Home => "~/.light-ai-gateway/config.toml",
         }
     }
@@ -65,7 +65,7 @@ impl ConfigOrigin {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ai-gw",
+    name = "lgw",
     version,
     about = "Light AI gateway: pool provider accounts and route around exhausted quota"
 )]
@@ -222,7 +222,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Serve => {
             let config = load_config(&path)?;
             println!(
-                "ai-gw: starting proxy from {} ({})",
+                "lgw: starting proxy from {} ({})",
                 path.display(),
                 origin.label()
             );
@@ -252,10 +252,10 @@ fn init_tracing() {
 // ---------------------------------------------------------------------------
 
 fn resolve_config_path(flag: Option<PathBuf>) -> (PathBuf, ConfigOrigin) {
-    let env = std::env::var_os("AI_GW_CONFIG")
+    let env = crate::env_preferring("LGW_CONFIG", "AI_GW_CONFIG")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty());
-    let local = PathBuf::from("ai-gw.toml");
+    let local = PathBuf::from("lgw.toml");
     let local_exists = local.is_file();
     pick_config_path(flag, env, local, local_exists, home_config_path())
 }
@@ -288,7 +288,7 @@ fn home_config_path() -> PathBuf {
 fn load_config(path: &Path) -> Result<Config> {
     if !path.is_file() {
         bail!(
-            "no config file at {}. Run `ai-gw init` to write a starter, or pass --config PATH.",
+            "no config file at {}. Run `lgw init` to write a starter, or pass --config PATH.",
             path.display()
         );
     }
@@ -303,7 +303,7 @@ fn load_config(path: &Path) -> Result<Config> {
 fn open_ledger(db: &Path) -> Result<Connection> {
     if !store::db_exists(db) {
         bail!(
-            "no ledger at {} yet. Run `ai-gw serve` once (or `ai-gw status --refresh`) \
+            "no ledger at {} yet. Run `lgw serve` once (or `lgw status --refresh`) \
              so accounts are probed and persisted.",
             db.display()
         );
@@ -331,7 +331,7 @@ async fn cmd_status(path: &Path, refresh: bool) -> Result<()> {
     let rows = store::load_accounts(&conn)?;
     if rows.is_empty() {
         println!(
-            "no accounts in the ledger yet at {}; run ai-gw status --refresh",
+            "no accounts in the ledger yet at {}; run lgw status --refresh",
             config.db_path().display()
         );
         return Ok(());
@@ -1130,7 +1130,7 @@ fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
 
     println!("{provider}/{account_id}: DISABLED (persisted to {})", db.display());
     println!(
-        "note: a running ai-gw process keeps its own in-memory pool; restart ai-gw serve \
+        "note: a running lgw process keeps its own in-memory pool; restart lgw serve \
          for this to take effect there"
     );
     Ok(())
@@ -1201,7 +1201,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     // The account list used to be built twice -- once here to report, once in
     // the probe section -- so every key was read twice. On macOS each read of an
     // item the app is not already trusted for is another authorisation prompt,
-    // which made "ai-gw doctor" ask twice per account for a read-only check.
+    // which made "lgw doctor" ask twice per account for a read-only check.
     let (usable, unusable) = config.build_accounts_lenient(&creds)?;
     for (provider, p) in &config.providers {
         if p.accounts.is_empty() {
@@ -1284,7 +1284,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
             "local auth  : MISSING - anything that can reach {} can spend the pooled quota.",
             config.server.listen
         );
-        println!("              fix: ai-gw keys add local gateway, then set local_key");
+        println!("              fix: lgw keys add local gateway, then set local_key");
         problems += 1;
     } else {
         println!("local auth  : configured");
@@ -1345,7 +1345,7 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     std::fs::write(path, crate::config::sample_toml())
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote example config to {}", path.display());
-    println!("next: set the credentials it references, then run ai-gw doctor");
+    println!("next: set the credentials it references, then run lgw doctor");
     Ok(())
 }
 
@@ -1396,7 +1396,7 @@ fn cmd_accounts_enable(path: &Path, account_id: &str) -> Result<()> {
 
     println!("{provider}/{account_id}: ENABLED (probed before it serves again)");
     println!(
-        "note: restart ai-gw serve for this to take effect there, or run          'ai-gw accounts probe' to confirm it now"
+        "note: restart lgw serve for this to take effect there, or run          'lgw accounts probe' to confirm it now"
     );
     Ok(())
 }
@@ -1521,7 +1521,7 @@ fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRo
             };
             // Say which item the key came out of. An install that still keeps one
             // item per account pays one authorisation prompt per account on
-            // macOS, and "ai-gw keys migrate" is how that stops.
+            // macOS, and "lgw keys migrate" is how that stops.
             let mut source = secret_ref.describe();
             if matches!(secret_ref, SecretRef::Keychain) {
                 let origin = creds.origin(provider, id);
@@ -1573,10 +1573,10 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
         println!(
             "On macOS every separate item is a separate authorisation prompt for this binary."
         );
-        println!("Fold them into one item with: ai-gw keys migrate --prune");
+        println!("Fold them into one item with: lgw keys migrate --prune");
         println!();
     }
-    println!("Register one with: ai-gw keys add <provider> <account>");
+    println!("Register one with: lgw keys add <provider> <account>");
     Ok(())
 }
 
@@ -1641,7 +1641,7 @@ fn cmd_keys_migrate(path: &Path, prune: bool) -> Result<()> {
     } else if report.merged > 0 {
         println!();
         println!("The old items are still there. Run the same command with --prune once");
-        println!("'ai-gw doctor' resolves every account, and they will be deleted.");
+        println!("'lgw doctor' resolves every account, and they will be deleted.");
     }
     println!();
     println!("Backend: {}", creds.backend_name());
@@ -2228,7 +2228,7 @@ key = {{ key_file = "{key_file}" }}
     }
 
     fn temp_key_file(contents: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("lai-gw-key-{}.txt", uuid::Uuid::new_v4()));
+        let p = std::env::temp_dir().join(format!("lgw-key-{}.txt", uuid::Uuid::new_v4()));
         std::fs::write(&p, contents).unwrap();
         p
     }
@@ -2267,7 +2267,7 @@ key = {{ key_file = "{key_file}" }}
         let stored = rows.iter().find(|r| r.account == "from-store").unwrap();
         assert!(stored.status.starts_with("MISSING"), "got {}", stored.status);
         // And it names the exact command that fixes it.
-        assert!(stored.status.contains("ai-gw keys add xkiro from-store"));
+        assert!(stored.status.contains("lgw keys add xkiro from-store"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2351,7 +2351,7 @@ key = {{ key_file = "{key_file}" }}
     fn config_path_precedence_is_flag_env_local_home() {
         let flag = PathBuf::from("/tmp/flag.toml");
         let env = PathBuf::from("/tmp/env.toml");
-        let local = PathBuf::from("ai-gw.toml");
+        let local = PathBuf::from("lgw.toml");
         let home = PathBuf::from("/tmp/home/config.toml");
 
         assert_eq!(
@@ -2366,7 +2366,7 @@ key = {{ key_file = "{key_file}" }}
             pick_config_path(None, None, local.clone(), true, home.clone()),
             (local.clone(), ConfigOrigin::Local)
         );
-        // A ./ai-gw.toml that does not exist must not win over the home default.
+        // A ./lgw.toml that does not exist must not win over the home default.
         assert_eq!(
             pick_config_path(None, None, local.clone(), false, home.clone()),
             (home.clone(), ConfigOrigin::Home)
@@ -2760,7 +2760,7 @@ key = {{ key_file = "{key_file}" }}
     #[test]
     fn init_writes_the_sample_and_refuses_to_clobber() {
         let dir = std::env::temp_dir().join(format!(
-            "lai-gw-cli-{}-{}",
+            "lgw-cli-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -2793,8 +2793,8 @@ key = {{ key_file = "{key_file}" }}
     #[test]
     fn config_origin_labels_name_the_source() {
         assert_eq!(ConfigOrigin::Flag.label(), "--config");
-        assert_eq!(ConfigOrigin::Env.label(), "$AI_GW_CONFIG");
-        assert_eq!(ConfigOrigin::Local.label(), "./ai-gw.toml");
+        assert_eq!(ConfigOrigin::Env.label(), "$LGW_CONFIG");
+        assert_eq!(ConfigOrigin::Local.label(), "./lgw.toml");
         assert_eq!(ConfigOrigin::Home.label(), "~/.light-ai-gateway/config.toml");
     }
 

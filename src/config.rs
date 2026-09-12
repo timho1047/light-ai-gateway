@@ -46,7 +46,7 @@ pub enum SecretRef {
     /// Read from a file (mode 0600 recommended).
     File { key_file: String },
     /// Read from the operating system credential store, registered with
-    /// ai-gw keys add. This is the recommended form.
+    /// lgw keys add. This is the recommended form.
     Keychain,
     /// Inline literal. Supported but discouraged.
     Literal(String),
@@ -306,7 +306,7 @@ pub struct AccountConfig {
     /// Where this account's credential comes from.
     ///
     /// Omitting it means "use the OS credential store", which is the form the
-    /// ai-gw keys add command registers. Requiring a key here would force the
+    /// lgw keys add command registers. Requiring a key here would force the
     /// operator to prepare secrets before every start, which is the friction
     /// this whole mechanism exists to remove.
     #[serde(default)]
@@ -349,7 +349,7 @@ impl ProviderConfig {
     /// The bare host every quota adapter appends its documented path to.
     ///
     /// This is the single source of truth: it was previously duplicated, and the
-    /// copy in the CLI bypassed the version-suffix normalisation, so ai-gw keys
+    /// copy in the CLI bypassed the version-suffix normalisation, so lgw keys
     /// test kept calling https://api.xkiro.com/v1/v1/usage after the gateway
     /// itself had been fixed.
     pub fn probe_base(&self) -> String {
@@ -914,7 +914,7 @@ const SAMPLE: &str = r#"
 listen = "127.0.0.1:8787"
 db_path = "~/.light-ai-gateway/gateway.db"
 # Strongly recommended: without it any local process can spend your quota.
-# local_key = { env = "AI_GW_LOCAL_KEY" }
+# local_key = { env = "LGW_LOCAL_KEY" }
 
 [policy]
 soft_threshold = 0.80
@@ -930,7 +930,7 @@ currency = "USD"
 
 # Accounts need no key here: omitting it means "read from the OS credential
 # store", registered once with:
-#     ai-gw keys add xkiro acc-1
+#     lgw keys add xkiro acc-1
 # Explicit alternatives, if you prefer them:
 #     key = { env = "XKIRO_KEY_1" }
 #     key = { key_file = "/run/secrets/xkiro-1" }
@@ -1190,7 +1190,7 @@ output = 15.0
 
     /// The bug this guard exists for.
     ///
-    /// "ai-gw init" writes db_path = "~/.light-ai-gateway/gateway.db", and the
+    /// "lgw init" writes db_path = "~/.light-ai-gateway/gateway.db", and the
     /// real config kept that line. PathBuf has no idea what "~" means, so it
     /// resolved against the working directory: the live ledger ended up in
     /// <cwd>/~/.light-ai-gateway/gateway.db and the file named by the config was
@@ -1465,7 +1465,7 @@ base_url = "https://api.xkiro.com/v1"
         let store = crate::secrets::CredentialStore::memory();
         let err = format!("{:#}", cfg.build_accounts(&store).unwrap_err());
         assert!(
-            err.contains("ai-gw keys add deepseek d1"),
+            err.contains("lgw keys add deepseek d1"),
             "the error must tell the operator what to run; got: {err}"
         );
     }

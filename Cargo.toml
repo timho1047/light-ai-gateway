@@ -11,11 +11,11 @@ description = "OpenAI-compatible gateway that pools provider accounts and routes
 # dependency versions that still work.
 rust-version = "1.88"
 # The crate is light-ai-gateway, but the command every document, help text and
-# error message refers to is ai-gw. Declaring the binary explicitly is what makes
-# "cargo install" put a working ai-gw on PATH instead of a binary whose name
+# error message refers to is lgw. Declaring the binary explicitly is what makes
+# "cargo install" put a working lgw on PATH instead of a binary whose name
 # appears nowhere in the documentation.
 [[bin]]
-name = "ai-gw"
+name = "lgw"
 path = "src/main.rs"
 
 [dependencies]

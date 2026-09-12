@@ -54,24 +54,24 @@ nothing to install alongside it.
 
     cargo install --path . --locked
 
-That builds in release mode and puts ai-gw on your PATH (~/.cargo/bin), which is
+That builds in release mode and puts lgw on your PATH (~/.cargo/bin), which is
 already there if you installed Rust with rustup. Check it:
 
-    ai-gw --version
+    lgw --version
 
 **On macOS, use the wrapper instead:**
 
-    scripts/aigw-install.sh
+    scripts/lgw-install.sh
 
 It runs the same `cargo install` and then signs the result with a stable identity.
 Skip it and the keychain asks for your password once per stored key, on every run,
 forever -- see [Credentials](#credentials). The first time you need
-`scripts/aigw-identity.sh`, which creates the certificate.
+`scripts/lgw-identity.sh`, which creates the certificate.
 
 Other ways to get the same binary:
 
     # build it and copy it wherever you like; it has no dependencies
-    cargo build --release && cp target/release/ai-gw /usr/local/bin/
+    cargo build --release && cp target/release/lgw /usr/local/bin/
 
     # straight from a git remote, once this is pushed somewhere
     cargo install --git <repo-url> --locked
@@ -84,25 +84,25 @@ Re-run cargo install after pulling changes; it replaces the binary in place.
 
 ## Quick start
 
-    ai-gw init                                      # writes ~/.light-ai-gateway/config.toml
+    lgw init                                      # writes ~/.light-ai-gateway/config.toml
     $EDITOR ~/.light-ai-gateway/config.toml         # add providers, accounts, routes
 
-    ai-gw keys add xkiro acc-1                      # hidden prompt; once per account
-    ai-gw keys add xkiro acc-2
-    ai-gw keys list                                 # check everything resolves
+    lgw keys add xkiro acc-1                      # hidden prompt; once per account
+    lgw keys add xkiro acc-2
+    lgw keys list                                 # check everything resolves
 
-    ai-gw doctor                                    # config, credentials, probe reachability
-    ai-gw serve
+    lgw doctor                                    # config, credentials, probe reachability
+    lgw serve
 
 Where things live:
 
-    ~/.cargo/bin/ai-gw                          the binary
+    ~/.cargo/bin/lgw                          the binary
     ~/.light-ai-gateway/config.toml             configuration
     ~/.light-ai-gateway/gateway.db              usage ledger (SQLite)
     the OS credential store                     API keys
 
-Config resolution order: --config PATH, then $AI_GW_CONFIG, then ./ai-gw.toml,
-then ~/.light-ai-gateway/config.toml. ai-gw doctor prints which one it used.
+Config resolution order: --config PATH, then $LGW_CONFIG, then ./lgw.toml,
+then ~/.light-ai-gateway/config.toml. lgw doctor prints which one it used.
 
 Then point your client at it:
 
@@ -116,11 +116,11 @@ Windows Credential Manager, freedesktop Secret Service) via the keyring crate.
 Accounts in the config need no key field at all; omitting it looks the account up
 by provider/account name.
 
-    ai-gw keys add <provider> <account>     # hidden prompt, never an argv flag
-    ai-gw keys add <provider> <account> --stdin
-    ai-gw keys list                         # source and status, never the secret
-    ai-gw keys test <provider> <account>    # prove it by probing the provider
-    ai-gw keys remove <provider> <account>
+    lgw keys add <provider> <account>     # hidden prompt, never an argv flag
+    lgw keys add <provider> <account> --stdin
+    lgw keys list                         # source and status, never the secret
+    lgw keys test <provider> <account>    # prove it by probing the provider
+    lgw keys remove <provider> <account>
 
 The key is read from a hidden prompt rather than a command-line argument, because
 arguments are visible to every process on the machine and land in shell history.
@@ -144,19 +144,19 @@ three prompts.
 
 Two things fix it:
 
-    ai-gw keys migrate --prune     # N items -> 1: one authorisation covers all
+    lgw keys migrate --prune     # N items -> 1: one authorisation covers all
 
-    scripts/aigw-identity.sh       # once: creates and trusts the certificate
-    scripts/aigw-install.sh        # cargo install, then signs the result
+    scripts/lgw-identity.sh       # once: creates and trusts the certificate
+    scripts/lgw-install.sh        # cargo install, then signs the result
 
 The first is a command; the second makes the grant stick, because the
 access-control entry then names a certificate that does not change when the code
 does. Both are optional -- without them the gateway behaves identically, it just
-keeps asking. `ai-gw keys list` shows which item each key came out of, and says
+keeps asking. `lgw keys list` shows which item each key came out of, and says
 so when per-account items are still in use.
 
 Note that a plain `cargo install --path .` replaces the signed binary with an
-ad-hoc one and brings the prompts back; use `scripts/aigw-install.sh` instead.
+ad-hoc one and brings the prompts back; use `scripts/lgw-install.sh` instead.
 Re-signing restores the existing grant, so there is nothing to re-authorise.
 
 If you would rather not use the credential store at all:
@@ -180,22 +180,22 @@ is obfuscation rather than encryption, so it is deliberately not implemented. If
 you need the credentials to travel between machines, export them from the OS
 store rather than committing a ciphertext.
 
-Set AI_GW_CREDENTIAL_BACKEND=memory to force an ephemeral store, which is useful
+Set LGW_CREDENTIAL_BACKEND=memory to force an ephemeral store, which is useful
 for tests and dry runs and never touches your real keychain.
 
 ## Commands
 
-    ai-gw serve                          start the proxy
-    ai-gw status [--refresh]             account board
-    ai-gw usage --since 7d --group-by provider,model,account
-    ai-gw prices [--drift-only]          configured price vs the price learned from real spend
-    ai-gw keys add|list|remove|test      provider credentials
-    ai-gw keys migrate [--prune]         fold per-account key items into one
-    ai-gw accounts list|probe|disable    account maintenance
-    ai-gw accounts enable <id>           put a disabled account back
-    ai-gw tail                           recent requests
-    ai-gw doctor                         config, credentials, probe reachability
-    ai-gw init                           write an example config
+    lgw serve                          start the proxy
+    lgw status [--refresh]             account board
+    lgw usage --since 7d --group-by provider,model,account
+    lgw prices [--drift-only]          configured price vs the price learned from real spend
+    lgw keys add|list|remove|test      provider credentials
+    lgw keys migrate [--prune]         fold per-account key items into one
+    lgw accounts list|probe|disable    account maintenance
+    lgw accounts enable <id>           put a disabled account back
+    lgw tail                           recent requests
+    lgw doctor                         config, credentials, probe reachability
+    lgw init                           write an example config
 
 ## Account recovery
 
@@ -205,18 +205,18 @@ answers.
 **A failure disables it** -- a 401, 403 or 402. The pool stops using it until a
 probe shows it is both reachable and funded:
 
-    ai-gw keys add <provider> <account>    # first, if the credential was the problem
-    ai-gw accounts probe <id>
+    lgw keys add <provider> <account>    # first, if the credential was the problem
+    lgw accounts probe <id>
 
 A probe that comes back with headroom puts the account back on its own. One that
 succeeds but still shows nothing left does not, deliberately: an account that is
 out of money would otherwise re-enter rotation once per poll and fail every time.
 
-**An operator disables it** -- `ai-gw accounts disable <id>`. That is a decision,
+**An operator disables it** -- `lgw accounts disable <id>`. That is a decision,
 and a probe will not undo it: a probe proves the credential works, not that you
 changed your mind. The way back is explicit:
 
-    ai-gw accounts enable <id>
+    lgw accounts enable <id>
 
 That sets the account to UNKNOWN rather than ACTIVE, so a probe has to confirm it
 before it takes traffic -- the same rule a restart follows.
@@ -263,7 +263,7 @@ When either condition is doubtful, write the price down instead of waiting for i
 to be learned. A configured price is never overwritten by a bad interval, and one
 plausible number is worth more than a table that quietly wedges the hard gate.
 
-    ai-gw prices
+    lgw prices
 
     PROVIDER  MODEL                SOURCE   MIX in/out/cr  EXPECTED  ACTUAL   DRIFT   SAMPLES
     xkiro     z-ai/glm-5.3-flash   learned  79/1/20%       $0.2554   $0.9000  +252.3% !  12
@@ -369,17 +369,17 @@ is what account switching destroys.
 
 ## When it does not work
 
-Start with `ai-gw doctor`. It parses the config, resolves every credential, probes
+Start with `lgw doctor`. It parses the config, resolves every credential, probes
 every provider, flags a port other machines can reach, and exits non-zero with a
 count of what is wrong.
 
 | Symptom | Where to look |
 |---|---|
-| `no eligible account` on every request | `ai-gw status` -- every account may be parked, disabled, or under the hard gate. The 429 body names the account with the most room, how much it has left, and the estimate that did not fit |
+| `no eligible account` on every request | `lgw status` -- every account may be parked, disabled, or under the hard gate. The 429 body names the account with the most room, how much it has left, and the estimate that did not fit |
 | An account stays DISABLED after you fixed the key | a probe only restores an account that also shows headroom, and an operator disable is never undone by one -- see [Account recovery](#account-recovery) |
-| A password prompt on every run (macOS) | two independent causes, both fixable: `ai-gw keys migrate --prune` and `scripts/aigw-install.sh` |
-| A price looks wrong | `ai-gw prices --drift-only`. A learned rate is an observation, not the truth, and a configured price is never overwritten by one |
-| Every request is 429 with a Retry-After of weeks | a covered window is spent and the earliest reset is that far away. `ai-gw status` shows a countdown per gate |
+| A password prompt on every run (macOS) | two independent causes, both fixable: `lgw keys migrate --prune` and `scripts/lgw-install.sh` |
+| A price looks wrong | `lgw prices --drift-only`. A learned rate is an observation, not the truth, and a configured price is never overwritten by one |
+| Every request is 429 with a Retry-After of weeks | a covered window is spent and the earliest reset is that far away. `lgw status` shows a countdown per gate |
 | The board is empty after moving the database | the ledger path is `server.db_path` in the config. An empty board means "not probed yet", never "no accounts" |
 
 ## Non-goals
@@ -412,7 +412,7 @@ no warranty, and it spends real money when you configure it to.
 ## Safety notes
 
 - Binds to loopback by default and holds paid credentials; set a local key if
-  anything else can reach the port. `ai-gw doctor` reports both a missing
+  anything else can reach the port. `lgw doctor` reports both a missing
   `local_key` and a non-loopback listen address as problems.
 - Keys come from the environment or a dedicated file, are never logged, and are
   redacted in every debug or display path.

@@ -374,7 +374,7 @@ pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
             tracing::warn!(
                 listen = %backend.config().server.listen,
                 "server.local_key is not configured: anything able to reach this address \
-                 can spend the pooled quota. Set one with 'ai-gw keys add local gateway', \
+                 can spend the pooled quota. Set one with 'lgw keys add local gateway', \
                  then local_key = {{ keychain = true }}"
             );
             LocalAuth::Open

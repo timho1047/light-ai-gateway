@@ -240,7 +240,7 @@ fn forget_sticky(inner: &mut PoolInner, qualified: &str) {
 /// and read back by apply_probe: a successful probe proves the CREDENTIAL works
 /// again, which is not the same thing as the operator changing their mind.
 /// The only way back is the operator saying so, with "accounts enable".
-pub const OPERATOR_DISABLED: &str = "disabled by operator (ai-gw accounts disable)";
+pub const OPERATOR_DISABLED: &str = "disabled by operator (lgw accounts disable)";
 
 /// The window an account's rpm_limit is measured over.
 const RATE_WINDOW: Duration = Duration::from_secs(60);
