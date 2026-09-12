@@ -23,22 +23,22 @@
 use crate::accounts::{AttemptPlan, PlanError};
 use crate::config::{Config, ResolvedRoute};
 use crate::domain::{
-    now, Account, ApiKey, AttemptRecord, GateClass, RequestRecord, RequestStatus, TokenUsage,
+    Account, ApiKey, AttemptRecord, GateClass, RequestRecord, RequestStatus, TokenUsage, now,
 };
-use crate::error::{parse_error_body, parse_retry_after, ErrorSignals, UpstreamErrorClass};
+use crate::error::{ErrorSignals, UpstreamErrorClass, parse_error_body, parse_retry_after};
 use crate::router::Gateway;
-use crate::sse::{inject_include_usage, MeterMode, StreamMeter};
+use crate::sse::{MeterMode, StreamMeter, inject_include_usage};
 use anyhow::{Context, Result};
+use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
-use axum::Router;
 use futures_util::Stream;
 use rust_decimal::Decimal;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -291,8 +291,7 @@ impl ProxyBackend for GatewayBackend {
     }
 
     fn tier_at(&self, provider: &str, model: &str) -> u32 {
-        self.gateway
-            .tier_at(provider, model, crate::domain::now())
+        self.gateway.tier_at(provider, model, crate::domain::now())
     }
 
     fn estimate_cost(
@@ -500,7 +499,10 @@ async fn chat_completions(
             "request must carry a non-empty \"model\"",
         );
     };
-    let stream = value.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let stream = value
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let session_key = session_key(&headers, &value);
     let request_id = uuid::Uuid::new_v4().to_string();
     // Captured outside the retry loop so a total failure can still be recorded.
@@ -518,16 +520,22 @@ async fn chat_completions(
     };
 
     let estimated_prompt_tokens = crate::meter::estimate_prompt_tokens(&value);
-    let est_cost =
-        estimate_request_cost(state.backend.as_ref(), &route.provider, &route.model, &value);
+    let est_cost = estimate_request_cost(
+        state.backend.as_ref(),
+        &route.provider,
+        &route.model,
+        &value,
+    );
 
     // Without this flag the upstream never emits a usage frame and the local
     // ledger records zero forever, which silently disables cost control.
     let mut upstream_body = body.clone();
-    if stream && inject_include_usage(&mut value)
-        && let Ok(bytes) = serde_json::to_vec(&value) {
-            upstream_body = Bytes::from(bytes);
-        }
+    if stream
+        && inject_include_usage(&mut value)
+        && let Ok(bytes) = serde_json::to_vec(&value)
+    {
+        upstream_body = Bytes::from(bytes);
+    }
 
     let max_attempts = state.backend.config().policy.max_retries.max(1);
     // How long we wait for the upstream to START answering.
@@ -537,14 +545,8 @@ async fn chat_completions(
     // generated the entire completion, so any legitimate non-streaming request
     // slower than ten seconds was cancelled, marked unbilled, and retried --
     // possibly paying for the same completion twice.
-    let header_timeout = Duration::from_secs(
-        state
-            .backend
-            .config()
-            .policy
-            .ttft_timeout_secs
-            .max(1),
-    );
+    let header_timeout =
+        Duration::from_secs(state.backend.config().policy.ttft_timeout_secs.max(1));
 
     let mut attempt_no: u32 = 1;
     let mut last_failure: Option<Failure> = None;
@@ -616,7 +618,10 @@ async fn chat_completions(
             );
         };
 
-        let url = format!("{}/chat/completions", account.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            account.base_url.trim_end_matches('/')
+        );
         let started_at = now();
         let started = Instant::now();
         let request = state
@@ -627,7 +632,11 @@ async fn chat_completions(
             .header(header::CONTENT_TYPE, "application/json")
             .header(
                 header::ACCEPT,
-                if stream { "text/event-stream" } else { "application/json" },
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
             )
             .body(upstream_body.clone());
 
@@ -768,7 +777,8 @@ async fn chat_completions(
             } else {
                 status_for_class(class)
             };
-            let client_retry = retry_after.or_else(|| state.backend.retry_after_for(&plan.provider));
+            let client_retry =
+                retry_after.or_else(|| state.backend.retry_after_for(&plan.provider));
             last_failure = Some(Failure {
                 status: client_status,
                 kind: class,
@@ -861,33 +871,34 @@ async fn chat_completions(
             // Every attempt failed. Record the request itself so failures show
             // up in history instead of existing only as orphaned attempt rows.
             if let Some(plan) = last_plan.as_ref()
-                && let Some(account) = state.backend.account(&plan.qualified_account()) {
-                    let total_ms = (now() - request_started).whole_milliseconds().max(0) as u64;
-                    state.backend.record_failed_request(RequestRecord {
-                        request_id: request_id.clone(),
-                        ts: request_started,
-                        session_key: session_key.clone(),
-                        client_model: client_model.clone(),
-                        provider: plan.provider.clone(),
-                        account_id: plan.account_id.clone(),
-                        model: plan.model.clone(),
-                        usage: TokenUsage::default(),
-                        ttft_ms: None,
-                        total_ms,
-                        tps: None,
-                        cost: Decimal::ZERO,
-                        currency: account.currency.clone(),
-                        credit_multiplier: account.credit_multiplier,
-                        coverage: plan.coverage,
-                        status: RequestStatus::Error,
-                        // attempt_no is already one past the last attempt: every
-                        // failure path increments it before deciding whether to
-                        // retry. Reporting it directly counted the first attempt
-                        // as a retry.
-                        retries: attempt_no.saturating_sub(2),
-                        provider_request_id: None,
-                    });
-                }
+                && let Some(account) = state.backend.account(&plan.qualified_account())
+            {
+                let total_ms = (now() - request_started).whole_milliseconds().max(0) as u64;
+                state.backend.record_failed_request(RequestRecord {
+                    request_id: request_id.clone(),
+                    ts: request_started,
+                    session_key: session_key.clone(),
+                    client_model: client_model.clone(),
+                    provider: plan.provider.clone(),
+                    account_id: plan.account_id.clone(),
+                    model: plan.model.clone(),
+                    usage: TokenUsage::default(),
+                    ttft_ms: None,
+                    total_ms,
+                    tps: None,
+                    cost: Decimal::ZERO,
+                    currency: account.currency.clone(),
+                    credit_multiplier: account.credit_multiplier,
+                    coverage: plan.coverage,
+                    status: RequestStatus::Error,
+                    // attempt_no is already one past the last attempt: every
+                    // failure path increments it before deciding whether to
+                    // retry. Reporting it directly counted the first attempt
+                    // as a retry.
+                    retries: attempt_no.saturating_sub(2),
+                    provider_request_id: None,
+                });
+            }
             error_response_retry(
                 failure.status,
                 failure.kind.as_str(),
@@ -1286,8 +1297,7 @@ impl RelayStream {
             // so the estimate never contaminates real statistics.
             result.usage.prompt_tokens = result.usage.prompt_tokens.max(f.estimated_prompt_tokens);
             let completion_hint = self.meter.content_chars() / 4;
-            result.usage.completion_tokens =
-                result.usage.completion_tokens.max(completion_hint);
+            result.usage.completion_tokens = result.usage.completion_tokens.max(completion_hint);
             result.usage.measured = false;
         }
 
@@ -1304,11 +1314,7 @@ impl RelayStream {
                 crate::meter::conservative_estimate(&result.usage, f.credit_multiplier)
             });
 
-        let total_ms = self
-            .started
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let total_ms = self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         let ttft_ms = self.first_content_at.map(|t| {
             t.saturating_duration_since(self.started)
                 .as_millis()
@@ -1422,12 +1428,12 @@ impl Drop for RelayStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{gate, Pool};
+    use crate::accounts::{Pool, gate};
     use crate::config::{Config, SecretRef};
     use crate::domain::GateKind;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ------------------------------------------------------------ mock upstream
 
@@ -1803,7 +1809,10 @@ key = "sk-a2"
         );
         assert_eq!(success.usage.prompt_tokens, 12);
         assert_eq!(success.usage.completion_tokens, 3);
-        assert!(success.usage.measured, "usage must come from the usage frame");
+        assert!(
+            success.usage.measured,
+            "usage must come from the usage frame"
+        );
         assert!(success.cost > Decimal::ZERO);
         assert!(success.attempt.billed);
         assert!(

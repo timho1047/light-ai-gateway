@@ -18,7 +18,7 @@
 //! per currency entry and the amounts are never summed across currencies -- CNY
 //! and USD are not the same number.
 
-use super::{get_body, json_money, sat_add, ProbeError, ProbeOutcome, QuotaProbe};
+use super::{ProbeError, ProbeOutcome, QuotaProbe, get_body, json_money, sat_add};
 use crate::accounts::gate;
 use crate::domain::{Account, GateKind};
 use async_trait::async_trait;
@@ -44,16 +44,14 @@ impl DeepseekProbe {
 pub(crate) fn outcome_from_body(body: &str) -> Result<ProbeOutcome, ProbeError> {
     let value: Value = serde_json::from_str(body)
         .map_err(|_| ProbeError::new("deepseek /user/balance: response is not valid JSON"))?;
-    let object = value.as_object().ok_or_else(|| {
-        ProbeError::new("deepseek /user/balance: response is not a JSON object")
-    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProbeError::new("deepseek /user/balance: response is not a JSON object"))?;
 
     let infos = object
         .get("balance_infos")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            ProbeError::new("deepseek /user/balance: response has no balance_infos")
-        })?;
+        .ok_or_else(|| ProbeError::new("deepseek /user/balance: response has no balance_infos"))?;
 
     let mut gates = Vec::new();
     let mut currency = None;
@@ -128,11 +126,7 @@ impl QuotaProbe for DeepseekProbe {
         account: &Account,
         client: &reqwest::Client,
     ) -> Result<ProbeOutcome, ProbeError> {
-        let url = format!(
-            "{}{}",
-            self.base_url.trim_end_matches('/'),
-            BALANCE_PATH
-        );
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), BALANCE_PATH);
         let body = get_body(client, &url, &account.api_key, "deepseek /user/balance").await?;
         outcome_from_body(&body)
     }
@@ -141,8 +135,8 @@ impl QuotaProbe for DeepseekProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{parse_money, GateClass};
-    use crate::quota::testutil::{strict_client, test_account, Reply, TestServer};
+    use crate::domain::{GateClass, parse_money};
+    use crate::quota::testutil::{Reply, TestServer, strict_client, test_account};
 
     /// Recorded /user/balance response.
     const BALANCE_BODY: &str = r#"{
@@ -234,13 +228,25 @@ mod tests {
         // this must be a probe failure.
         let body = r#"{ "balance_infos": [ { "currency": "USD" } ] }"#;
         let err = outcome_from_body(body).expect_err("must not invent a balance");
-        assert!(err.message.contains("no usable balance"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("no usable balance"),
+            "got {:?}",
+            err.message
+        );
 
         let err = outcome_from_body(r#"{ "balance_infos": [] }"#).expect_err("empty list");
-        assert!(err.message.contains("no usable balance"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("no usable balance"),
+            "got {:?}",
+            err.message
+        );
 
         let err = outcome_from_body(r#"{ "is_available": true }"#).expect_err("missing key");
-        assert!(err.message.contains("no balance_infos"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("no balance_infos"),
+            "got {:?}",
+            err.message
+        );
     }
 
     #[test]
@@ -253,13 +259,25 @@ mod tests {
     #[test]
     fn deepseek_rejects_a_malformed_body() {
         let err = outcome_from_body("<html>502</html>").expect_err("non-JSON must fail");
-        assert!(err.message.contains("not valid JSON"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not valid JSON"),
+            "got {:?}",
+            err.message
+        );
 
         let err = outcome_from_body("{}").expect_err("non-object must fail");
-        assert!(err.message.contains("no balance_infos"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("no balance_infos"),
+            "got {:?}",
+            err.message
+        );
 
         let err = outcome_from_body(r#"[{"currency":"USD"}]"#).expect_err("array");
-        assert!(err.message.contains("not a JSON object"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not a JSON object"),
+            "got {:?}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -269,13 +287,20 @@ mod tests {
         let account = test_account("deepseek", "sk-ds-test-key");
 
         let probe = DeepseekProbe::new(server.base_url.clone());
-        let outcome = probe.probe(&account, &client).await.expect("probe must succeed");
+        let outcome = probe
+            .probe(&account, &client)
+            .await
+            .expect("probe must succeed");
 
         assert_eq!(outcome.gates.len(), 1);
         assert_eq!(outcome.currency.as_deref(), Some("USD"));
         assert_eq!(server.call_count(), 1);
         let request = server.requests()[0].to_ascii_lowercase();
-        assert!(request.starts_with("get /user/balance http/1.1"), "got {:?}", request);
+        assert!(
+            request.starts_with("get /user/balance http/1.1"),
+            "got {:?}",
+            request
+        );
         assert!(
             request.contains("authorization: bearer sk-ds-test-key"),
             "the bearer key must be sent: {request:?}"
@@ -317,6 +342,10 @@ mod tests {
             .probe(&account, &client)
             .await
             .expect_err("malformed body must fail");
-        assert!(err.message.contains("not valid JSON"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not valid JSON"),
+            "got {:?}",
+            err.message
+        );
     }
 }

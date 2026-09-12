@@ -13,7 +13,7 @@
 //! half-open, the weekday is evaluated in the schedule's own timezone, and a
 //! range that wraps past midnight belongs to the day it STARTED on.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use time::{OffsetDateTime, UtcOffset, Weekday};
 
 /// A set of weekdays, as a bitmask with Monday as the low bit.
@@ -106,9 +106,7 @@ impl Schedule {
                 if minute_of_day >= range.start_min && tier.days.contains(local.weekday()) {
                     return Some(i);
                 }
-                if minute_of_day < range.end_min
-                    && tier.days.contains(local.weekday().previous())
-                {
+                if minute_of_day < range.end_min && tier.days.contains(local.weekday().previous()) {
                     return Some(i);
                 }
             }
@@ -218,7 +216,10 @@ pub fn parse_tz(input: &str) -> Result<i32> {
     let hours: i32 = h.trim().parse().with_context(|| {
         format!("timezone {input:?} is not UTC, a fixed offset like +08:00, or a bare offset")
     })?;
-    let minutes: i32 = m.trim().parse().context("timezone minutes must be a number")?;
+    let minutes: i32 = m
+        .trim()
+        .parse()
+        .context("timezone minutes must be a number")?;
     if hours > 23 || minutes > 59 {
         bail!("timezone {input:?} is out of range");
     }
@@ -250,10 +251,30 @@ mod tests {
     fn the_real_command_code_window_is_applied_hour_by_hour() {
         let s = commandcode();
         let expected: [(u8, bool); 24] = [
-            (0, false), (1, true), (2, true), (3, true), (4, false), (5, false),
-            (6, true), (7, true), (8, true), (9, true), (10, false), (11, false),
-            (12, false), (13, false), (14, false), (15, false), (16, false), (17, false),
-            (18, false), (19, false), (20, false), (21, false), (22, false), (23, false),
+            (0, false),
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, false),
+            (5, false),
+            (6, true),
+            (7, true),
+            (8, true),
+            (9, true),
+            (10, false),
+            (11, false),
+            (12, false),
+            (13, false),
+            (14, false),
+            (15, false),
+            (16, false),
+            (17, false),
+            (18, false),
+            (19, false),
+            (20, false),
+            (21, false),
+            (22, false),
+            (23, false),
         ];
         for (hour, want) in expected {
             let at = datetime!(2026-09-09 0:00 UTC) + time::Duration::hours(i64::from(hour));
@@ -268,12 +289,21 @@ mod tests {
         let s = commandcode();
         let base = datetime!(2026-09-09 0:00 UTC);
         assert!(!peak_at(&s, base + time::Duration::minutes(59)), "00:59");
-        assert!(peak_at(&s, base + time::Duration::hours(1)), "01:00 exactly");
         assert!(
-            peak_at(&s, base + time::Duration::hours(3) + time::Duration::minutes(59)),
+            peak_at(&s, base + time::Duration::hours(1)),
+            "01:00 exactly"
+        );
+        assert!(
+            peak_at(
+                &s,
+                base + time::Duration::hours(3) + time::Duration::minutes(59)
+            ),
             "03:59"
         );
-        assert!(!peak_at(&s, base + time::Duration::hours(4)), "04:00 exactly");
+        assert!(
+            !peak_at(&s, base + time::Duration::hours(4)),
+            "04:00 exactly"
+        );
     }
 
     #[test]
@@ -324,8 +354,14 @@ mod tests {
             }],
         };
         assert!(peak_at(&s, datetime!(2026-09-11 23:30 UTC)), "Friday 23:30");
-        assert!(peak_at(&s, datetime!(2026-09-12 1:00 UTC)), "Saturday 01:00");
-        assert!(!peak_at(&s, datetime!(2026-09-12 2:00 UTC)), "Saturday 02:00");
+        assert!(
+            peak_at(&s, datetime!(2026-09-12 1:00 UTC)),
+            "Saturday 01:00"
+        );
+        assert!(
+            !peak_at(&s, datetime!(2026-09-12 2:00 UTC)),
+            "Saturday 02:00"
+        );
         assert!(!peak_at(&s, datetime!(2026-09-13 1:00 UTC)), "Sunday 01:00");
     }
 
@@ -365,7 +401,11 @@ mod tests {
         assert!(!parse_days("mon-fri").unwrap().contains(Weekday::Saturday));
         assert_eq!(parse_days("*").unwrap(), Days::all());
         assert!(parse_days("sat,sun").unwrap().contains(Weekday::Sunday));
-        assert!(parse_days("WEDNESDAY").unwrap().contains(Weekday::Wednesday));
+        assert!(
+            parse_days("WEDNESDAY")
+                .unwrap()
+                .contains(Weekday::Wednesday)
+        );
     }
 
     #[test]
@@ -376,7 +416,10 @@ mod tests {
         assert!(parse_hours("01:00").is_err());
         assert!(parse_hours("01:00-01:00").is_err(), "an empty window");
         assert!(parse_hours("25:00-26:00").is_err());
-        assert!(parse_tz("Asia/Shanghai").is_err(), "named zones are rejected");
+        assert!(
+            parse_tz("Asia/Shanghai").is_err(),
+            "named zones are rejected"
+        );
         assert!(parse_tz("+99:00").is_err());
     }
 

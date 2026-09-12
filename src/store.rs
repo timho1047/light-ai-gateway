@@ -37,7 +37,7 @@
 //! fsync per commit while still checkpointing on clean shutdown.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, params};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -271,10 +271,12 @@ fn configure(conn: &Connection) -> Result<()> {
 /// Open (creating if needed) the database and apply the schema.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating database directory {}", parent.display()))?;
-        }
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating database directory {}", parent.display()))?;
+    }
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     configure(&conn)?;
     init_schema(&conn)?;
@@ -395,11 +397,7 @@ impl StoreHandle {
     /// Must be called after every probe and every settle; see the module docs
     /// for why the ledger is written eagerly while telemetry is batched.
     pub fn save_accounts(&self, accounts: &[Account]) {
-        if self
-            .tx
-            .send(WriteMsg::Accounts(accounts.to_vec()))
-            .is_err()
-        {
+        if self.tx.send(WriteMsg::Accounts(accounts.to_vec())).is_err() {
             tracing::error!("store writer is gone; dropping account ledger snapshot");
         }
     }
@@ -617,11 +615,7 @@ fn bump_usage_daily(tx: &Transaction<'_>, r: &RequestRecord) -> Result<()> {
             |row| row.get(0),
         )
         .optional()?;
-    let total = previous
-        .as_deref()
-        .map(parse_dec)
-        .unwrap_or(Decimal::ZERO)
-        + r.cost;
+    let total = previous.as_deref().map(parse_dec).unwrap_or(Decimal::ZERO) + r.cost;
 
     tx.execute(
         "INSERT INTO usage_daily
@@ -731,7 +725,18 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
 
     /// provider, model, tier, input, output, cache_read, samples, prompt_tok,
     /// completion_tok, cached_tok
-    type PriceRowTuple = (String, String, i64, String, String, String, i64, i64, i64, i64);
+    type PriceRowTuple = (
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+    );
     let rows: Vec<PriceRowTuple> = {
         let mut stmt = conn.prepare(
             "SELECT provider, model, tier, input_per_token, output_per_token,
@@ -757,7 +762,8 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
     };
 
     let mut out = Vec::with_capacity(rows.len());
-    for (provider, model, tier, input, output, cache_read, samples, p_tok, c_tok, cached_tok) in rows
+    for (provider, model, tier, input, output, cache_read, samples, p_tok, c_tok, cached_tok) in
+        rows
     {
         // A row we cannot parse is skipped, never defaulted: a price that
         // silently became zero would make a paid model look free.
@@ -1073,7 +1079,9 @@ pub fn recent_requests(conn: &Connection, limit: u32) -> Result<Vec<RequestSumma
 
 /// True when the database file exists and is non-empty.
 pub fn db_exists(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Default database location.
@@ -1453,7 +1461,11 @@ mod tests {
 
         let conn = open(&tmp.path).expect("reopen");
         let loaded = load_accounts(&conn).expect("load");
-        assert_eq!(loaded.len(), 2, "both accounts must survive, got {loaded:?}");
+        assert_eq!(
+            loaded.len(),
+            2,
+            "both accounts must survive, got {loaded:?}"
+        );
 
         let xk_row = loaded.iter().find(|a| a.provider == "xkiro").unwrap();
         assert_eq!(xk_row.gates.len(), 1);
@@ -1723,7 +1735,10 @@ mod tests {
             &request("r3", DAY2, "deepseek", "d1", "m1", "0.000356"),
         );
         // Outside the window: must never appear in a filtered result.
-        insert_req(&mut conn, &request("r4", BEFORE, "ghost", "ghost", "m0", "9"));
+        insert_req(
+            &mut conn,
+            &request("r4", BEFORE, "ghost", "ghost", "m0", "9"),
+        );
         let since = ts(DAY1);
 
         let by_provider = usage_rows(&conn, since, GroupBy::Provider).expect("provider");
@@ -1844,7 +1859,15 @@ mod tests {
 
         let conn = open(&tmp.path).expect("open");
         /// attempt_no, ttft_ms, error_class, error_code, retry_after_ms, billed, bytes_sent
-        type AttemptRow = (i64, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, i64);
+        type AttemptRow = (
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            i64,
+            i64,
+        );
         let row: AttemptRow = conn
             .query_row(
                 "SELECT attempt_no, ttft_ms, error_class, error_code, retry_after_ms, billed, bytes_sent

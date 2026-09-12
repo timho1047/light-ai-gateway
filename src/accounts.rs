@@ -32,8 +32,8 @@
 
 use crate::config::PolicyConfig;
 use crate::domain::{
-    now, Account, AccountId, AccountState, Confidence, Gate, GateClass, GateKind, GateSource,
-    ProviderId,
+    Account, AccountId, AccountState, Confidence, Gate, GateClass, GateKind, GateSource,
+    ProviderId, now,
 };
 use crate::error::UpstreamErrorClass;
 use rust_decimal::Decimal;
@@ -201,7 +201,10 @@ fn bind_sticky(inner: &mut PoolInner, key: &str, qualified: &str) {
         sticky_order,
         ..
     } = inner;
-    if sticky.insert(key.to_string(), qualified.to_string()).is_some() {
+    if sticky
+        .insert(key.to_string(), qualified.to_string())
+        .is_some()
+    {
         // Refresh recency: this session is live, so it evicts last.
         if let Some(pos) = sticky_order.iter().position(|k| k == key) {
             sticky_order.remove(pos);
@@ -501,46 +504,47 @@ impl Pool {
         for acct in inner.accounts.iter_mut() {
             if acct.state == AccountState::Parked
                 && let Some(when) = acct.available_at
-                    && when <= at {
-                        acct.state = AccountState::Active;
-                        acct.available_at = None;
-                        acct.window_started_at = None;
-                        // Reset ONLY the windows that have actually rolled over.
-                        //
-                        // Zeroing every window because one of them came due was
-                        // a systematic under-count: a 5-hour reset wiped the
-                        // 7-day and monthly usage that was still very much live,
-                        // and the account then looked empty for up to a poll
-                        // interval -- long enough to spend past a cap the
-                        // provider still enforces.
-                        //
-                        // available_at speaks for exactly one window: the one
-                        // that was spent when the account was parked. A window
-                        // with a reset time still in the future has NOT rolled
-                        // over and keeps its usage. A window with no reset time
-                        // at all is cleared only when it is the spent one, so an
-                        // unknown-but-live weekly reading is not thrown away on
-                        // the strength of a 5-hour timer.
-                        for g in acct.gates.iter_mut() {
-                            if !g.kind.is_window() {
-                                continue;
-                            }
-                            // A window is known to have rolled over only when
-                            // the provider said when it resets AND that time has
-                            // passed. An unknown reset time is not evidence:
-                            // note_error marks EVERY window spent when an account
-                            // is parked, so a saturated window with no reset time
-                            // may simply be collateral damage, and clearing it
-                            // erased usage the provider still enforces. Leaving it
-                            // costs at most one poll interval before the next
-                            // probe replaces the whole reading.
-                            if g.resets_at.is_some_and(|r| r <= at) {
-                                g.used = Decimal::ZERO;
-                                g.resets_at = None;
-                                g.stale = false;
-                            }
-                        }
+                && when <= at
+            {
+                acct.state = AccountState::Active;
+                acct.available_at = None;
+                acct.window_started_at = None;
+                // Reset ONLY the windows that have actually rolled over.
+                //
+                // Zeroing every window because one of them came due was
+                // a systematic under-count: a 5-hour reset wiped the
+                // 7-day and monthly usage that was still very much live,
+                // and the account then looked empty for up to a poll
+                // interval -- long enough to spend past a cap the
+                // provider still enforces.
+                //
+                // available_at speaks for exactly one window: the one
+                // that was spent when the account was parked. A window
+                // with a reset time still in the future has NOT rolled
+                // over and keeps its usage. A window with no reset time
+                // at all is cleared only when it is the spent one, so an
+                // unknown-but-live weekly reading is not thrown away on
+                // the strength of a 5-hour timer.
+                for g in acct.gates.iter_mut() {
+                    if !g.kind.is_window() {
+                        continue;
                     }
+                    // A window is known to have rolled over only when
+                    // the provider said when it resets AND that time has
+                    // passed. An unknown reset time is not evidence:
+                    // note_error marks EVERY window spent when an account
+                    // is parked, so a saturated window with no reset time
+                    // may simply be collateral damage, and clearing it
+                    // erased usage the provider still enforces. Leaving it
+                    // costs at most one poll interval before the next
+                    // probe replaces the whole reading.
+                    if g.resets_at.is_some_and(|r| r <= at) {
+                        g.used = Decimal::ZERO;
+                        g.resets_at = None;
+                        g.stale = false;
+                    }
+                }
+            }
         }
     }
 
@@ -841,13 +845,10 @@ impl Pool {
     /// for a caller to forget.
     fn commit(&self, inner: &mut PoolInner, plan: &AttemptPlan) {
         let qualified = plan.qualified_account();
-        let e = inner
-            .inflight
-            .entry(qualified.clone())
-            .or_insert(Inflight {
-                committed: Decimal::ZERO,
-                count: 0,
-            });
+        let e = inner.inflight.entry(qualified.clone()).or_insert(Inflight {
+            committed: Decimal::ZERO,
+            count: 0,
+        });
         e.committed += plan.estimated_cost;
         e.count += 1;
         if let Some(acct) = find_mut(&mut inner.accounts, &qualified)
@@ -940,10 +941,11 @@ impl Pool {
         let soft = self.soft_threshold;
         if let Some(acct) = find_mut(&mut inner.accounts, &qualified)
             && acct.state == AccountState::Active
-                && let Some(u) = acct.peak_covered_utilization()
-                    && u >= soft {
-                        acct.state = AccountState::Draining;
-                    }
+            && let Some(u) = acct.peak_covered_utilization()
+            && u >= soft
+        {
+            acct.state = AccountState::Draining;
+        }
 
         self.maybe_forget_sticky(&mut inner, plan);
     }
@@ -1083,9 +1085,10 @@ impl Pool {
         // Reflect the soft threshold against freshly probed numbers.
         if acct.state == AccountState::Active
             && let Some(u) = acct.peak_covered_utilization()
-                && u >= soft {
-                    acct.state = AccountState::Draining;
-                }
+            && u >= soft
+        {
+            acct.state = AccountState::Draining;
+        }
     }
 
     /// Mark a probe as failed: keep the last reading and flag it stale.
@@ -1217,7 +1220,12 @@ impl Pool {
 }
 
 /// Build a gate from a probe reading, normalising the common shapes.
-pub fn gate(kind: GateKind, cap: Decimal, used: Decimal, resets_at: Option<OffsetDateTime>) -> Gate {
+pub fn gate(
+    kind: GateKind,
+    cap: Decimal,
+    used: Decimal,
+    resets_at: Option<OffsetDateTime>,
+) -> Gate {
     Gate {
         kind,
         cap,
@@ -1263,11 +1271,21 @@ mod tests {
     }
 
     fn cover(cap: i64, used: i64) -> Gate {
-        gate(GateKind::FiveHour, Decimal::from(cap), Decimal::from(used), None)
+        gate(
+            GateKind::FiveHour,
+            Decimal::from(cap),
+            Decimal::from(used),
+            None,
+        )
     }
 
     fn wallet(cap: i64, used: i64) -> Gate {
-        gate(GateKind::Wallet, Decimal::from(cap), Decimal::from(used), None)
+        gate(
+            GateKind::Wallet,
+            Decimal::from(cap),
+            Decimal::from(used),
+            None,
+        )
     }
 
     fn policy() -> PolicyConfig {
@@ -1297,12 +1315,11 @@ mod tests {
         );
 
         // A probe for one provider must land only on that provider's account.
-        p.apply_probe(
-            "xkiro/acc-1",
-            vec![cover(200, 55)],
-            crate::domain::now(),
+        p.apply_probe("xkiro/acc-1", vec![cover(200, 55)], crate::domain::now());
+        assert_eq!(
+            p.account("xkiro/acc-1").unwrap().gates[0].used,
+            Decimal::from(55)
         );
-        assert_eq!(p.account("xkiro/acc-1").unwrap().gates[0].used, Decimal::from(55));
         assert_eq!(
             p.account("commandcode/acc-1").unwrap().gates[0].used,
             Decimal::from(1),
@@ -1310,7 +1327,9 @@ mod tests {
         );
 
         // Selection is scoped to the requested provider.
-        let xk = p.select("xkiro", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
+        let xk = p
+            .select("xkiro", "m", None, Decimal::ONE, "r", 1, &[])
+            .unwrap();
         assert_eq!(xk.account_id, "acc-1");
         assert_eq!(xk.qualified_account(), "xkiro/acc-1");
         let cc = p
@@ -1325,7 +1344,10 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(p.account("xkiro/acc-1").unwrap().state, AccountState::Parked);
+        assert_eq!(
+            p.account("xkiro/acc-1").unwrap().state,
+            AccountState::Parked
+        );
         assert_eq!(
             p.account("commandcode/acc-1").unwrap().state,
             AccountState::Active
@@ -1342,7 +1364,12 @@ mod tests {
     #[test]
     fn a_refusal_names_the_estimate_and_the_account_that_came_closest() {
         let p = Pool::new(
-            vec![acct("xk-1", "xkiro", vec![cover(20, 7)], AccountState::Active)],
+            vec![acct(
+                "xk-1",
+                "xkiro",
+                vec![cover(20, 7)],
+                AccountState::Active,
+            )],
             &policy(),
         );
 
@@ -1369,8 +1396,14 @@ mod tests {
             .select("xkiro", "m", None, Decimal::ONE, "r", 1, &[])
             .expect_err("an account with no gates cannot serve");
         let msg = err.to_string();
-        assert!(msg.starts_with("no eligible account for provider xkiro"), "{msg}");
-        assert!(!msg.contains("most room"), "no headroom was measured: {msg}");
+        assert!(
+            msg.starts_with("no eligible account for provider xkiro"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("most room"),
+            "no headroom was measured: {msg}"
+        );
     }
 
     /// The free-token allowance must not gate paid traffic.
@@ -1383,7 +1416,12 @@ mod tests {
     #[test]
     fn a_nearly_spent_free_allowance_does_not_retire_the_account() {
         let p = Pool::new(
-            vec![acct("xk-1", "xkiro", vec![cover(200, 20)], AccountState::Active)],
+            vec![acct(
+                "xk-1",
+                "xkiro",
+                vec![cover(200, 20)],
+                AccountState::Active,
+            )],
             &policy(),
         );
 
@@ -1446,7 +1484,9 @@ mod tests {
 
         // Consume-first picks the MOST utilised account, and now only the paid
         // windows count: 60/100 beats 10/100 regardless of the free bucket.
-        let plan = p.select("xkiro", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
+        let plan = p
+            .select("xkiro", "m", None, Decimal::ONE, "r", 1, &[])
+            .unwrap();
         assert_eq!(plan.qualified_account(), "xkiro/no-free");
     }
 
@@ -1491,9 +1531,15 @@ mod tests {
             &policy(),
         );
         // 2.0 of cost against 1.0 of headroom must be refused...
-        assert!(p.select("p", "m", None, Decimal::from(2), "r", 1, &[]).is_err());
+        assert!(
+            p.select("p", "m", None, Decimal::from(2), "r", 1, &[])
+                .is_err()
+        );
         // ...while a cost that exactly fits is still affordable.
-        assert!(p.select("p", "m", None, Decimal::from(1), "r", 1, &[]).is_ok());
+        assert!(
+            p.select("p", "m", None, Decimal::from(1), "r", 1, &[])
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1533,7 +1579,9 @@ mod tests {
             .expect_err("a spent window must not be selected");
         match err {
             PlanError::NoEligibleAccount { retry_after, .. } => {
-                let secs = retry_after.expect("spent window must yield a retry hint").as_secs();
+                let secs = retry_after
+                    .expect("spent window must yield a retry hint")
+                    .as_secs();
                 assert!(
                     (1700..=1800).contains(&secs),
                     "retry hint should point at the window reset, got {secs}s"
@@ -1568,7 +1616,9 @@ mod tests {
             ],
             &policy(),
         );
-        let first = p.select("p", "m", Some("sess"), Decimal::ONE, "r", 1, &[]).unwrap();
+        let first = p
+            .select("p", "m", Some("sess"), Decimal::ONE, "r", 1, &[])
+            .unwrap();
         assert_eq!(first.account_id, "a");
         // Account a is now the busiest, but the session must not move: moving
         // it would discard the prompt cache.
@@ -1590,9 +1640,10 @@ mod tests {
             )],
             &policy(),
         );
-        assert!(p
-            .select("deepseek", "m", None, Decimal::ONE, "r", 1, &[])
-            .is_err());
+        assert!(
+            p.select("deepseek", "m", None, Decimal::ONE, "r", 1, &[])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1626,7 +1677,12 @@ mod tests {
                     vec![cover(100, 70), wallet(100, 0)],
                     AccountState::Active,
                 ),
-                acct("walletonly", "p", vec![wallet(100, 0)], AccountState::Active),
+                acct(
+                    "walletonly",
+                    "p",
+                    vec![wallet(100, 0)],
+                    AccountState::Active,
+                ),
             ],
             &pol,
         );
@@ -1664,11 +1720,16 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
             &policy(),
         );
-        let _ = p.select("p", "m", Some("s"), Decimal::ONE, "r", 1, &[]).unwrap();
+        let _ = p
+            .select("p", "m", Some("s"), Decimal::ONE, "r", 1, &[])
+            .unwrap();
         p.note_error("p/a", UpstreamErrorClass::QuotaExhausted, None, None);
         let a = p.account("p/a").unwrap();
         assert_eq!(a.state, AccountState::Parked);
-        assert!(p.select("p", "m", Some("s"), Decimal::ONE, "r2", 1, &[]).is_err());
+        assert!(
+            p.select("p", "m", Some("s"), Decimal::ONE, "r2", 1, &[])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1808,7 +1869,8 @@ mod tests {
             .select("p", "m", None, Decimal::from(4), "r2", 1, &[])
             .unwrap();
         assert!(
-            p.select("p", "m", None, Decimal::from(4), "r3", 1, &[]).is_err(),
+            p.select("p", "m", None, Decimal::from(4), "r3", 1, &[])
+                .is_err(),
             "8 of 10 already committed, so another 4 cannot fit"
         );
 
@@ -1816,7 +1878,8 @@ mod tests {
         p.settle(&second, Decimal::from(4), true);
         assert_eq!(p.account("p/a").unwrap().gates[0].used, Decimal::from(8));
         assert!(
-            p.select("p", "m", None, Decimal::from(4), "r4", 1, &[]).is_err(),
+            p.select("p", "m", None, Decimal::from(4), "r4", 1, &[])
+                .is_err(),
             "and the money is spent now, not merely reserved"
         );
     }
@@ -1835,9 +1898,7 @@ mod tests {
             ],
             &policy(),
         );
-        let first = p
-            .select("p", "m", None, Decimal::ONE, "r", 1, &[])
-            .unwrap();
+        let first = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         let second = p
             .select(
                 "p",
@@ -1862,9 +1923,7 @@ mod tests {
             vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
             &policy(),
         );
-        let first = p
-            .select("p", "m", None, Decimal::ONE, "r", 1, &[])
-            .unwrap();
+        let first = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         let second = p
             .select(
                 "p",
@@ -1912,11 +1971,7 @@ mod tests {
         let _ = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]);
 
         let a = p.account("p/a").unwrap();
-        let weekly = a
-            .gates
-            .iter()
-            .find(|g| g.kind == GateKind::Weekly)
-            .unwrap();
+        let weekly = a.gates.iter().find(|g| g.kind == GateKind::Weekly).unwrap();
         assert_eq!(
             weekly.used,
             Decimal::from(100),
@@ -1981,12 +2036,7 @@ mod tests {
                 "a",
                 "p",
                 vec![
-                    gate(
-                        GateKind::FiveHour,
-                        Decimal::from(1),
-                        Decimal::from(1),
-                        None,
-                    ),
+                    gate(GateKind::FiveHour, Decimal::from(1), Decimal::from(1), None),
                     gate(
                         GateKind::FreeTokens,
                         Decimal::from(10_000),
@@ -2064,13 +2114,15 @@ mod tests {
             .select("p", "m", None, Decimal::ZERO, "r1", 1, &[])
             .unwrap();
         assert!(
-            p.select("p", "m", None, Decimal::ZERO, "r2", 1, &[]).is_err(),
+            p.select("p", "m", None, Decimal::ZERO, "r2", 1, &[])
+                .is_err(),
             "the account is already serving one request"
         );
 
         p.settle(&first, Decimal::ZERO, false);
         assert!(
-            p.select("p", "m", None, Decimal::ZERO, "r3", 1, &[]).is_ok(),
+            p.select("p", "m", None, Decimal::ZERO, "r3", 1, &[])
+                .is_ok(),
             "and it frees up when that request finishes"
         );
     }
@@ -2088,7 +2140,8 @@ mod tests {
             p.settle(&plan, Decimal::ZERO, false);
         }
         assert!(
-            p.select("p", "m", None, Decimal::ZERO, "r3", 1, &[]).is_err(),
+            p.select("p", "m", None, Decimal::ZERO, "r3", 1, &[])
+                .is_err(),
             "two requests inside the window is the limit"
         );
     }

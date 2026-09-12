@@ -52,10 +52,9 @@ pub enum GateKind {
 impl GateKind {
     pub fn class(self) -> GateClass {
         match self {
-            GateKind::FiveHour
-            | GateKind::Weekly
-            | GateKind::Monthly
-            | GateKind::FreeTokens => GateClass::Covered,
+            GateKind::FiveHour | GateKind::Weekly | GateKind::Monthly | GateKind::FreeTokens => {
+                GateClass::Covered
+            }
             GateKind::Wallet | GateKind::PurchasedCredits => GateClass::Metered,
             GateKind::Rpm => GateClass::RateLimit,
         }
@@ -255,12 +254,16 @@ impl Account {
 
     /// Covered gates only.
     pub fn covered_gates(&self) -> impl Iterator<Item = &Gate> {
-        self.gates.iter().filter(|g| g.class() == GateClass::Covered)
+        self.gates
+            .iter()
+            .filter(|g| g.class() == GateClass::Covered)
     }
 
     /// Metered gates only.
     pub fn metered_gates(&self) -> impl Iterator<Item = &Gate> {
-        self.gates.iter().filter(|g| g.class() == GateClass::Metered)
+        self.gates
+            .iter()
+            .filter(|g| g.class() == GateClass::Metered)
     }
 
     /// Covered gates that gate the ACCOUNT itself, which means the
@@ -271,7 +274,8 @@ impl Account {
     /// threshold would retire an account from paid traffic because an allowance
     /// nobody was using ran out, which is not what that limit means.
     pub fn account_gates(&self) -> impl Iterator<Item = &Gate> {
-        self.covered_gates().filter(|g| g.kind != GateKind::FreeTokens)
+        self.covered_gates()
+            .filter(|g| g.kind != GateKind::FreeTokens)
     }
 
     /// Highest utilization across the gates that actually gate the account.

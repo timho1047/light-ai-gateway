@@ -7,7 +7,7 @@
 //! scope by design (see docs/DESIGN.md section 1).
 
 use crate::domain::{Account, AccountState, ApiKey, ProviderId};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -442,9 +442,8 @@ impl ModelPriceConfig {
     /// The default tier first, then each schedule in the order they are tested.
     /// Index 0 is always the default tier.
     pub fn tiers(&self) -> Vec<TierPrices> {
-        let cache_read = |input: f64, given: Option<f64>| {
-            given.unwrap_or(input * default_cache_read_ratio())
-        };
+        let cache_read =
+            |input: f64, given: Option<f64>| given.unwrap_or(input * default_cache_read_ratio());
         let mut out = vec![TierPrices {
             name: "default".to_string(),
             input: self.input,
@@ -478,8 +477,7 @@ impl ModelPriceConfig {
             let ctx = format!("[prices.{provider}.{model}] {label}");
             tiers.push(crate::tier::Tier {
                 name: label.clone(),
-                days: crate::tier::parse_days(&s.days)
-                    .with_context(|| format!("{ctx}: days"))?,
+                days: crate::tier::parse_days(&s.days).with_context(|| format!("{ctx}: days"))?,
                 hours: crate::tier::parse_hours(&s.hours)
                     .with_context(|| format!("{ctx}: hours"))?,
                 offset_minutes: crate::tier::parse_tz(s.tz.as_deref().unwrap_or("UTC"))
@@ -541,8 +539,8 @@ impl Config {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -568,7 +566,10 @@ impl Config {
             );
         }
         if self.policy.max_retries > 8 {
-            bail!("policy.max_retries must be <= 8, got {}", self.policy.max_retries);
+            bail!(
+                "policy.max_retries must be <= 8, got {}",
+                self.policy.max_retries
+            );
         }
         // Every unknown in this file is resolved in the direction that cannot
         // spend money. A negative or non-finite margin silently shrinks the
@@ -638,14 +639,13 @@ impl Config {
                     bail!("provider {name}: {field} {url:?} names no host");
                 }
             }
-            for multiplier in [p.credit_multiplier].into_iter().chain(
-                p.accounts.values().map(|a| a.credit_multiplier),
-            ) {
+            for multiplier in [p.credit_multiplier]
+                .into_iter()
+                .chain(p.accounts.values().map(|a| a.credit_multiplier))
+            {
                 let Some(m) = multiplier else { continue };
                 if !m.is_finite() || m <= 0.0 {
-                    bail!(
-                        "provider {name}: credit_multiplier must be finite and > 0, got {m}"
-                    );
+                    bail!("provider {name}: credit_multiplier must be finite and > 0, got {m}");
                 }
             }
             if p.accounts.is_empty() {
@@ -707,13 +707,14 @@ impl Config {
         // Optional provider-prefix escape hatch for name collisions.
         if !self.provider_prefix_aliases.is_empty()
             && let Some((head, rest)) = client_model.split_once('/')
-                && let Some(provider) = self.provider_prefix_aliases.get(head)
-                    && !rest.is_empty() {
-                        return Ok(ResolvedRoute {
-                            provider: provider.clone(),
-                            model: rest.to_string(),
-                        });
-                    }
+            && let Some(provider) = self.provider_prefix_aliases.get(head)
+            && !rest.is_empty()
+        {
+            return Ok(ResolvedRoute {
+                provider: provider.clone(),
+                model: rest.to_string(),
+            });
+        }
 
         let mut known: Vec<&str> = self.routes.keys().map(String::as_str).collect();
         known.sort_unstable();
@@ -729,10 +730,7 @@ impl Config {
     /// Every account starts in AccountState::Unknown with no gates. It must be
     /// probed before it serves traffic: restoring from disk and assuming zero
     /// spend is exactly how a gateway silently spends real money.
-    pub fn build_accounts(
-        &self,
-        store: &crate::secrets::CredentialStore,
-    ) -> Result<Vec<Account>> {
+    pub fn build_accounts(&self, store: &crate::secrets::CredentialStore) -> Result<Vec<Account>> {
         let mut out = Vec::new();
         for (provider_name, p) in &self.providers {
             for (account_id, a) in &p.accounts {
@@ -742,10 +740,7 @@ impl Config {
                 let key = secret_ref
                     .resolve(store, provider_name, account_id)
                     .with_context(|| format!("provider {provider_name} account {account_id}"))?;
-                let currency = a
-                    .currency
-                    .clone()
-                    .unwrap_or_else(|| p.currency.clone());
+                let currency = a.currency.clone().unwrap_or_else(|| p.currency.clone());
                 let multiplier = a
                     .credit_multiplier
                     .or(p.credit_multiplier)
@@ -796,13 +791,7 @@ impl Config {
                 match secret_ref.resolve(store, provider_name, account_id) {
                     Ok(key) => usable.push(build_one(provider_name, p, account_id, a, key)),
                     Err(e) => {
-                        let mut acct = build_one(
-                            provider_name,
-                            p,
-                            account_id,
-                            a,
-                            ApiKey::new(""),
-                        );
+                        let mut acct = build_one(provider_name, p, account_id, a, ApiKey::new(""));
                         acct.state = AccountState::Disabled;
                         acct.last_error = Some(format!("{e:#}"));
                         unusable.push(acct);
@@ -1187,7 +1176,6 @@ output = 15.0
         assert_eq!(p.cache_read_per_token, rust_decimal::Decimal::new(3, 7));
     }
 
-
     /// The bug this guard exists for.
     ///
     /// "lgw init" writes db_path = "~/.light-ai-gateway/gateway.db", and the
@@ -1211,7 +1199,11 @@ output = 15.0
             "no literal ~ component: {}",
             p.display()
         );
-        assert!(p.ends_with(".light-ai-gateway/gateway.db"), "{}", p.display());
+        assert!(
+            p.ends_with(".light-ai-gateway/gateway.db"),
+            "{}",
+            p.display()
+        );
     }
 
     #[test]
@@ -1228,7 +1220,10 @@ output = 15.0
             expand_tilde("~someone/gw.db"),
             PathBuf::from("~someone/gw.db")
         );
-        assert_eq!(expand_tilde("/var/lib/gw.db"), PathBuf::from("/var/lib/gw.db"));
+        assert_eq!(
+            expand_tilde("/var/lib/gw.db"),
+            PathBuf::from("/var/lib/gw.db")
+        );
         assert_eq!(expand_tilde("rel/gw.db"), PathBuf::from("rel/gw.db"));
     }
 
@@ -1274,7 +1269,9 @@ output = 1.20
         assert_eq!(tiers[1].input, 0.30);
         assert_eq!(tiers[1].cache_read, 0.006);
 
-        let schedule = m.schedule("commandcode", "deepseek/deepseek-v4.1-flash").unwrap();
+        let schedule = m
+            .schedule("commandcode", "deepseek/deepseek-v4.1-flash")
+            .unwrap();
         assert_eq!(schedule.tiers.len(), 1);
         assert_eq!(schedule.tiers[0].hours.len(), 2);
 
@@ -1386,7 +1383,10 @@ output = 2.0
             cfg.resolve("deepseek/deepseek-v3.2").unwrap().provider,
             "xkiro"
         );
-        assert!(!cfg.policy.allow_metered, "default must not spend metered credit");
+        assert!(
+            !cfg.policy.allow_metered,
+            "default must not spend metered credit"
+        );
     }
 
     #[test]
@@ -1432,7 +1432,10 @@ output = 2.0
         assert_eq!(accts.len(), 2);
         for a in &accts {
             assert_eq!(a.state, AccountState::Unknown);
-            assert!(a.gates.is_empty(), "must not assume zero spend before probing");
+            assert!(
+                a.gates.is_empty(),
+                "must not assume zero spend before probing"
+            );
         }
         let d1 = accts.iter().find(|a| a.id == "d1").unwrap();
         assert_eq!(d1.api_key.expose(), "sk-from-store");
@@ -1473,18 +1476,17 @@ base_url = "https://api.xkiro.com/v1"
     #[test]
     fn slashes_are_rejected_because_they_would_alias_credentials() {
         let mut cfg = cfg_with_two_providers();
-        cfg.providers
-            .get_mut("deepseek")
-            .unwrap()
-            .accounts
-            .insert("bad/id".into(), AccountConfig {
+        cfg.providers.get_mut("deepseek").unwrap().accounts.insert(
+            "bad/id".into(),
+            AccountConfig {
                 key: None,
                 label: None,
                 currency: None,
                 credit_multiplier: None,
                 concurrency_limit: None,
                 rpm_limit: None,
-            });
+            },
+        );
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("slash"), "got: {err}");
     }

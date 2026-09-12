@@ -309,10 +309,9 @@ pub(crate) fn json_truthy(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Bool(b) => *b,
         serde_json::Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-        serde_json::Value::String(s) => matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes"
-        ),
+        serde_json::Value::String(s) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+        }
         _ => false,
     }
 }
@@ -351,10 +350,7 @@ fn parse_timestamp_str(raw: &str) -> Option<OffsetDateTime> {
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(t) = OffsetDateTime::parse(
-        trimmed,
-        &time::format_description::well_known::Rfc3339,
-    ) {
+    if let Ok(t) = OffsetDateTime::parse(trimmed, &time::format_description::well_known::Rfc3339) {
         return Some(t);
     }
     trimmed.parse::<i64>().ok().and_then(epoch)
@@ -638,7 +634,7 @@ pub(crate) mod testutil {
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{test_account, Reply, TestServer};
+    use super::testutil::{Reply, TestServer, test_account};
     use super::*;
     use crate::config::QuotaAdapter;
 
@@ -705,8 +701,8 @@ mod tests {
             (QuotaAdapter::CommandCode, "command-code"),
             (QuotaAdapter::Deepseek, "deepseek"),
         ] {
-            let probe = probe_for(adapter, "https://api.example.invalid/")
-                .expect("adapter must exist");
+            let probe =
+                probe_for(adapter, "https://api.example.invalid/").expect("adapter must exist");
             assert_eq!(probe.name(), name);
         }
         assert!(probe_for(QuotaAdapter::None, "https://api.example.invalid").is_none());

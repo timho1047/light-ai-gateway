@@ -23,18 +23,18 @@
 //! out to providers.
 
 use crate::config::{Config, QuotaAdapter, SecretRef};
-use crate::secrets::CredentialStore;
 use crate::domain::{
     Account, AccountOverview, AccountState, Confidence, Gate, GateClass, GateKind, GroupBy,
     RequestStatus, RequestSummary, UsageRow,
 };
 use crate::quota::probe_for;
 use crate::router::Gateway;
+use crate::secrets::CredentialStore;
 use crate::store;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use rust_decimal::Decimal;
 use rusqlite::Connection;
+use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
@@ -354,7 +354,9 @@ fn overview_of(a: &Account) -> AccountOverview {
     }
 }
 
-const BOARD_HEADERS: [&str; 6] = ["PROVIDER", "ACCOUNT", "COVERED", "METERED", "RESETS", "STATE"];
+const BOARD_HEADERS: [&str; 6] = [
+    "PROVIDER", "ACCOUNT", "COVERED", "METERED", "RESETS", "STATE",
+];
 const BOARD_WIDTHS: [usize; 5] = [14, 18, 26, 26, 8];
 
 /// Render the account board.
@@ -385,7 +387,9 @@ fn render_board(rows: &[AccountOverview], now: OffsetDateTime) -> String {
         "covered = prepaid allowance consumed (used/cap, forfeited at reset)   \
          metered = real money remaining (spending it is permanent)\n",
     );
-    out.push_str("~ = estimated reading   STALE = last probe failed, previous value carried over\n");
+    out.push_str(
+        "~ = estimated reading   STALE = last probe failed, previous value carried over\n",
+    );
     out
 }
 
@@ -713,10 +717,14 @@ fn render_price_rows(rows: &[PriceRow]) -> String {
         ));
     }
     out.push('\n');
-    out.push_str("EXPECTED is your configured rates applied to the observed usage for that tier.\n");
+    out.push_str(
+        "EXPECTED is your configured rates applied to the observed usage for that tier.\n",
+    );
     out.push_str("ACTUAL is what the observed spend works out to over the same usage.\n");
     out.push_str("MIX is your input / output / cache-read share of tokens, per tier.\n");
-    out.push_str("DRIFT is ACTUAL against EXPECTED; ! marks 20% or more, meaning the upstream is\n");
+    out.push_str(
+        "DRIFT is ACTUAL against EXPECTED; ! marks 20% or more, meaning the upstream is\n",
+    );
     out.push_str("no longer charging what you configured - for that tier in particular.\n");
     out
 }
@@ -759,7 +767,9 @@ fn parse_since(spec: &str, now: OffsetDateTime) -> Result<OffsetDateTime> {
         return Ok(date.midnight().assume_utc());
     }
 
-    bail!("could not parse --since {spec:?}; use 7d, 24h, 90m, 2w, an RFC3339 timestamp, or YYYY-MM-DD")
+    bail!(
+        "could not parse --since {spec:?}; use 7d, 24h, 90m, 2w, an RFC3339 timestamp, or YYYY-MM-DD"
+    )
 }
 
 /// Parse "7d" / "24h" / "90m" / "45s" / "2w" into a duration.
@@ -790,7 +800,11 @@ fn parse_relative(spec: &str) -> Option<time::Duration> {
 /// Every dimension expression is NOT NULL in practice (provider, model and
 /// account_id are NOT NULL columns; day is derived), but COALESCE keeps a
 /// surprising NULL from collapsing the whole concatenated key.
-fn usage_rows_multi(conn: &Connection, since: OffsetDateTime, dims: &[GroupBy]) -> Result<Vec<UsageRow>> {
+fn usage_rows_multi(
+    conn: &Connection,
+    since: OffsetDateTime,
+    dims: &[GroupBy],
+) -> Result<Vec<UsageRow>> {
     let key_expr = dims
         .iter()
         .map(|d| format!("COALESCE({}, '')", d.as_sql_expr()))
@@ -881,8 +895,13 @@ fn render_usage(rows: &[UsageRow], dims: &[GroupBy], since: OffsetDateTime) -> S
     for r in rows {
         out.push_str(&format!(
             "{:<key_width$}  {:>9}  {:>8}  {:>8}  {:>8}  {} {}\n",
-            display_key(r), r.requests, r.input_tokens, r.output_tokens, r.cached_tokens,
-            short(r.cost), r.currency
+            display_key(r),
+            r.requests,
+            r.input_tokens,
+            r.output_tokens,
+            r.cached_tokens,
+            short(r.cost),
+            r.currency
         ));
     }
 
@@ -929,7 +948,17 @@ fn render_tail(rows: &[RequestSummary]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{:<8}  {:<9}  {:<12}  {:<10}  {:<28}  {:>7}  {:>7}  {:>7}  {:>8}  {:>7}  {}\n",
-        "TIME", "STATUS", "PROVIDER", "ACCOUNT", "MODEL", "IN", "OUT", "CACHED", "TTFT", "TPS", "COVERAGE"
+        "TIME",
+        "STATUS",
+        "PROVIDER",
+        "ACCOUNT",
+        "MODEL",
+        "IN",
+        "OUT",
+        "CACHED",
+        "TTFT",
+        "TPS",
+        "COVERAGE"
     ));
     for r in rows {
         let ttft = r
@@ -968,7 +997,9 @@ fn stamp(t: OffsetDateTime) -> String {
 fn clock(t: OffsetDateTime) -> String {
     const HMS: &[time::format_description::FormatItem<'_>] =
         time::macros::format_description!("[hour]:[minute]:[second]");
-    t.time().format(HMS).unwrap_or_else(|_| "--:--:--".to_string())
+    t.time()
+        .format(HMS)
+        .unwrap_or_else(|_| "--:--:--".to_string())
 }
 
 fn status_label(s: RequestStatus) -> &'static str {
@@ -1128,7 +1159,10 @@ fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
     handle.save_account(&account);
     handle.flush_blocking()?;
 
-    println!("{provider}/{account_id}: DISABLED (persisted to {})", db.display());
+    println!(
+        "{provider}/{account_id}: DISABLED (persisted to {})",
+        db.display()
+    );
     println!(
         "note: a running lgw process keeps its own in-memory pool; restart lgw serve \
          for this to take effect there"
@@ -1317,10 +1351,12 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
         );
     }
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     // 0600 from the moment it exists. The template carries no secret, but it is
     // the file people then put credentials-adjacent settings in, and a config
     // written world-readable is world-readable for the rest of its life.
@@ -1348,7 +1384,6 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     println!("next: set the credentials it references, then run lgw doctor");
     Ok(())
 }
-
 
 /// Put a disabled account back in the pool.
 ///
@@ -1435,10 +1470,8 @@ fn read_secret(provider: &str, account: &str, from_stdin: bool) -> Result<String
             .context("reading the key from stdin")?;
         line
     } else {
-        rpassword::prompt_password(format!(
-            "API key for {provider}/{account} (input hidden): "
-        ))
-        .context("reading the key from the terminal")?
+        rpassword::prompt_password(format!("API key for {provider}/{account} (input hidden): "))
+            .context("reading the key from the terminal")?
     };
     let trimmed = secret.trim().to_string();
     if trimmed.is_empty() {
@@ -1456,16 +1489,13 @@ fn cmd_keys_add(
 ) -> Result<()> {
     // The credential is looked up by provider/account, so both must exist in the
     // configuration or the entry could never be reached.
-    let p = config
-        .providers
-        .get(provider)
-        .with_context(|| {
-            let known: Vec<&str> = config.providers.keys().map(String::as_str).collect();
-            format!(
-                "unknown provider {provider:?}. Configured providers: [{}]",
-                known.join(", ")
-            )
-        })?;
+    let p = config.providers.get(provider).with_context(|| {
+        let known: Vec<&str> = config.providers.keys().map(String::as_str).collect();
+        format!(
+            "unknown provider {provider:?}. Configured providers: [{}]",
+            known.join(", ")
+        )
+    })?;
     if !p.accounts.contains_key(account) {
         let known: Vec<&str> = p.accounts.keys().map(String::as_str).collect();
         bail!(
@@ -1553,15 +1583,15 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
             if per_account == 0 {
                 "every key in one credential-store item".to_string()
             } else {
-                format!(
-                    "{} key(s) still in separate per-account items",
-                    per_account
-                )
+                format!("{} key(s) still in separate per-account items", per_account)
             }
         );
     }
     println!();
-    println!("{:<16} {:<20} {:<32} STATUS", "PROVIDER", "ACCOUNT", "SOURCE");
+    println!(
+        "{:<16} {:<20} {:<32} STATUS",
+        "PROVIDER", "ACCOUNT", "SOURCE"
+    );
     for row in &rows {
         println!(
             "{:<16} {:<20} {:<32} {}",
@@ -1681,15 +1711,20 @@ async fn cmd_keys_test(
         .with_context(|| format!("resolving the credential for {provider}/{account}"))?;
 
     let Some(probe) = crate::quota::probe_for(p.adapter, &p.probe_base()) else {
-        println!("{provider}/{account}: credential found ({} chars), but this provider has no quota probe to test against",
-            key.expose().len());
+        println!(
+            "{provider}/{account}: credential found ({} chars), but this provider has no quota probe to test against",
+            key.expose().len()
+        );
         return Ok(());
     };
 
     let account_model = crate::domain::Account {
         id: account.to_string(),
         provider: provider.to_string(),
-        label: account_cfg.label.clone().unwrap_or_else(|| account.to_string()),
+        label: account_cfg
+            .label
+            .clone()
+            .unwrap_or_else(|| account.to_string()),
         base_url: p.base_url.trim_end_matches('/').to_string(),
         api_key: key,
         currency: account_cfg
@@ -1734,8 +1769,6 @@ async fn cmd_keys_test(
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // prices panel
 // ---------------------------------------------------------------------------
@@ -1779,7 +1812,11 @@ fn window_label(days: &str, hours: &str, tz: Option<&str>) -> String {
         "*" => "Every day".to_string(),
         other => other.to_string(),
     };
-    let hours = hours.split(',').map(str::trim).collect::<Vec<_>>().join(" ");
+    let hours = hours
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
     let tz = tz.unwrap_or("UTC");
     format!("{days} {hours} {tz}")
 }
@@ -1843,7 +1880,9 @@ pub fn price_panel(
                 if p != provider.as_str() || m != model.as_str() {
                     continue;
                 }
-                let Some(learned) = entry.learned else { continue };
+                let Some(learned) = entry.learned else {
+                    continue;
+                };
                 let name = tiers
                     .get(tier as usize)
                     .map(|t| t.name.clone())
@@ -2039,7 +2078,9 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
         } else {
             println!("no prices are configured or learned yet.");
             println!();
-            println!("Set a starting price in the config file, and the gateway learns the real one");
+            println!(
+                "Set a starting price in the config file, and the gateway learns the real one"
+            );
             println!("from the spend difference between quota probes:");
             println!();
             println!("  [prices.xkiro.\"z-ai/glm-5.3-flash\"]");
@@ -2145,9 +2186,15 @@ mod tests {
         let rows = price_rows(&priced_table(), &TierNames::new());
         assert_eq!(rows.len(), 2);
 
-        let glm = rows.iter().find(|r| r.model == "z-ai/glm-5.3-flash").unwrap();
+        let glm = rows
+            .iter()
+            .find(|r| r.model == "z-ai/glm-5.3-flash")
+            .unwrap();
         assert_eq!(glm.provider, "xkiro");
-        assert_eq!(glm.source, "learned", "an observed price outranks the expectation");
+        assert_eq!(
+            glm.source, "learned",
+            "an observed price outranks the expectation"
+        );
         // 1M input tokens, nothing else: the mix says so.
         assert_eq!(glm.mix, "100/0/0%");
         // Configured $0.30/M input applied to that mix, against the $0.90/M the
@@ -2165,7 +2212,10 @@ mod tests {
             .find(|r| r.model == "deepseek/deepseek-v4.1-flash")
             .unwrap();
         assert_eq!(ds.expected_per_million, "-");
-        assert_ne!(ds.actual_per_million, "-", "the observed cost is still shown");
+        assert_ne!(
+            ds.actual_per_million, "-",
+            "the observed cost is still shown"
+        );
         assert_eq!(ds.drift, "-");
         assert!(!ds.significant);
     }
@@ -2204,7 +2254,6 @@ mod tests {
         assert_eq!(rows[0].drift, "-");
         assert_eq!(rows[0].samples, 0);
     }
-
 
     // -- credentials ---------------------------------------------------------
 
@@ -2265,7 +2314,11 @@ key = {{ key_file = "{key_file}" }}
         let creds = CredentialStore::memory();
         let rows = credential_rows(&config, &creds);
         let stored = rows.iter().find(|r| r.account == "from-store").unwrap();
-        assert!(stored.status.starts_with("MISSING"), "got {}", stored.status);
+        assert!(
+            stored.status.starts_with("MISSING"),
+            "got {}",
+            stored.status
+        );
         // And it names the exact command that fixes it.
         assert!(stored.status.contains("lgw keys add xkiro from-store"));
         let _ = std::fs::remove_file(&path);
@@ -2287,7 +2340,10 @@ key = {{ key_file = "{key_file}" }}
         let err = cmd_keys_add(&config, &creds, "xkiro", "nope", true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown account"), "got: {msg}");
-        assert!(msg.contains("from-store"), "should list known accounts: {msg}");
+        assert!(
+            msg.contains("from-store"),
+            "should list known accounts: {msg}"
+        );
     }
 
     #[test]
@@ -2298,7 +2354,6 @@ key = {{ key_file = "{key_file}" }}
         assert!(cmd_keys_remove(&creds, "xkiro", "acc").is_ok());
         assert!(creds.get("xkiro", "acc").unwrap().is_none());
     }
-
 
     fn gate(
         kind: GateKind,
@@ -2355,7 +2410,13 @@ key = {{ key_file = "{key_file}" }}
         let home = PathBuf::from("/tmp/home/config.toml");
 
         assert_eq!(
-            pick_config_path(Some(flag.clone()), Some(env.clone()), local.clone(), true, home.clone()),
+            pick_config_path(
+                Some(flag.clone()),
+                Some(env.clone()),
+                local.clone(),
+                true,
+                home.clone()
+            ),
             (flag.clone(), ConfigOrigin::Flag)
         );
         assert_eq!(
@@ -2384,8 +2445,24 @@ key = {{ key_file = "{key_file}" }}
             "USD",
             AccountState::Draining,
             vec![
-                gate(GateKind::FiveHour, "100", "40", Some(4_200), Confidence::Exact, false, t),
-                gate(GateKind::Weekly, "500", "25", None, Confidence::Exact, false, t),
+                gate(
+                    GateKind::FiveHour,
+                    "100",
+                    "40",
+                    Some(4_200),
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+                gate(
+                    GateKind::Weekly,
+                    "500",
+                    "25",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
                 gate(
                     GateKind::PurchasedCredits,
                     "12",
@@ -2400,7 +2477,10 @@ key = {{ key_file = "{key_file}" }}
 
         let covered = covered_cell(&acct);
         let metered = metered_cell(&acct);
-        assert_eq!(covered, "5h 40/100  7d 25/500  USD", "covered shows used/cap and its unit");
+        assert_eq!(
+            covered, "5h 40/100  7d 25/500  USD",
+            "covered shows used/cap and its unit"
+        );
         assert_eq!(
             metered, "credits 12 USD(unused)",
             "metered shows the money left and says it is untouched"
@@ -2434,7 +2514,15 @@ key = {{ key_file = "{key_file}" }}
             "USD",
             AccountState::Active,
             vec![
-                gate(GateKind::FiveHour, "20", "0.5", None, Confidence::Exact, false, t),
+                gate(
+                    GateKind::FiveHour,
+                    "20",
+                    "0.5",
+                    None,
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
                 gate(
                     GateKind::FreeTokens,
                     "30000000",
@@ -2563,7 +2651,9 @@ key = {{ key_file = "{key_file}" }}
         );
         let board = render_board(&[stale], t);
         assert!(
-            board.lines().any(|l| l.starts_with("xkiro") && l.contains("STALE")),
+            board
+                .lines()
+                .any(|l| l.starts_with("xkiro") && l.contains("STALE")),
             "the stale row itself must carry the marker: {board}"
         );
     }
@@ -2577,8 +2667,24 @@ key = {{ key_file = "{key_file}" }}
             "USD",
             AccountState::Active,
             vec![
-                gate(GateKind::FiveHour, "200", "178", Some(4_200), Confidence::Exact, false, t),
-                gate(GateKind::Weekly, "1000", "100", Some(90_000), Confidence::Exact, false, t),
+                gate(
+                    GateKind::FiveHour,
+                    "200",
+                    "178",
+                    Some(4_200),
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
+                gate(
+                    GateKind::Weekly,
+                    "1000",
+                    "100",
+                    Some(90_000),
+                    Confidence::Exact,
+                    false,
+                    t,
+                ),
             ],
         );
         // The earliest reset wins.
@@ -2591,8 +2697,14 @@ key = {{ key_file = "{key_file}" }}
         let t = now();
         assert_eq!(format_countdown(t, t + time::Duration::seconds(45)), "45s");
         assert_eq!(format_countdown(t, t + time::Duration::seconds(600)), "10m");
-        assert_eq!(format_countdown(t, t + time::Duration::seconds(4_200)), "1h10m");
-        assert_eq!(format_countdown(t, t + time::Duration::seconds(93_600)), "1d2h");
+        assert_eq!(
+            format_countdown(t, t + time::Duration::seconds(4_200)),
+            "1h10m"
+        );
+        assert_eq!(
+            format_countdown(t, t + time::Duration::seconds(93_600)),
+            "1d2h"
+        );
         assert_eq!(format_countdown(t, t - time::Duration::seconds(5)), "now");
     }
 
@@ -2634,8 +2746,14 @@ key = {{ key_file = "{key_file}" }}
     fn since_accepts_durations_timestamps_and_dates() {
         let t = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         assert_eq!(parse_since("7d", t).unwrap(), t - time::Duration::days(7));
-        assert_eq!(parse_since("24h", t).unwrap(), t - time::Duration::hours(24));
-        assert_eq!(parse_since("90m", t).unwrap(), t - time::Duration::minutes(90));
+        assert_eq!(
+            parse_since("24h", t).unwrap(),
+            t - time::Duration::hours(24)
+        );
+        assert_eq!(
+            parse_since("90m", t).unwrap(),
+            t - time::Duration::minutes(90)
+        );
         assert_eq!(parse_since("2w", t).unwrap(), t - time::Duration::weeks(2));
 
         assert_eq!(
@@ -2795,7 +2913,10 @@ key = {{ key_file = "{key_file}" }}
         assert_eq!(ConfigOrigin::Flag.label(), "--config");
         assert_eq!(ConfigOrigin::Env.label(), "$LGW_CONFIG");
         assert_eq!(ConfigOrigin::Local.label(), "./lgw.toml");
-        assert_eq!(ConfigOrigin::Home.label(), "~/.light-ai-gateway/config.toml");
+        assert_eq!(
+            ConfigOrigin::Home.label(),
+            "~/.light-ai-gateway/config.toml"
+        );
     }
 
     #[test]

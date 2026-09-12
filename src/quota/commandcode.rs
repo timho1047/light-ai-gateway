@@ -25,8 +25,8 @@
 //! over-reporting it spends real money without any error to notice.
 
 use super::{
-    get_body, get_json, json_money, json_scalar_string, json_timestamp, json_truthy, sat_add,
-    ProbeError, ProbeOutcome, QuotaProbe,
+    ProbeError, ProbeOutcome, QuotaProbe, get_body, get_json, json_money, json_scalar_string,
+    json_timestamp, json_truthy, sat_add,
 };
 use crate::accounts::gate;
 use crate::domain::{Account, Gate, GateKind};
@@ -132,14 +132,15 @@ pub(crate) fn outcome_from_credits_body(
     // window is spend-so-far plus what is left; `used` stays the real spend so
     // the router keeps seeing true utilisation.
     if let (Some(credits), Some(spend)) = (credits, period_spend)
-        && let Some(monthly_remaining) = credits.get("monthlyCredits").and_then(json_money) {
-            gates.push(gate(
-                GateKind::Monthly,
-                sat_add(spend, monthly_remaining),
-                spend,
-                period_end,
-            ));
-        }
+        && let Some(monthly_remaining) = credits.get("monthlyCredits").and_then(json_money)
+    {
+        gates.push(gate(
+            GateKind::Monthly,
+            sat_add(spend, monthly_remaining),
+            spend,
+            period_end,
+        ));
+    }
 
     // Purchased credits never expire and are real money (Metered). They are a
     // bearer balance: the cap is what is left, nothing has been drawn from it
@@ -258,7 +259,9 @@ fn current_period(value: &Value) -> Option<Period> {
         .and_then(Value::as_object)
         .unwrap_or(object);
 
-    let start = data.get("currentPeriodStart").and_then(json_scalar_string)?;
+    let start = data
+        .get("currentPeriodStart")
+        .and_then(json_scalar_string)?;
     let end = data.get("currentPeriodEnd").and_then(json_timestamp);
     Some(Period { start, end })
 }
@@ -290,8 +293,9 @@ fn append_query(url: &str, key: &str, value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b':'
-            | b'/' => encoded.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b':' | b'/' => {
+                encoded.push(byte as char)
+            }
             _ => encoded.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -371,14 +375,7 @@ impl QuotaProbe for CommandCodeProbe {
         let period_spend = match &period {
             Some(period) => {
                 let url = append_query(&format!("{base}{SUMMARY_PATH}"), "since", &period.start);
-                match get_json(
-                    client,
-                    &url,
-                    key,
-                    "command-code /alpha/usage/summary",
-                )
-                .await
-                {
+                match get_json(client, &url, key, "command-code /alpha/usage/summary").await {
                     Ok(value) => match total_cost(&value) {
                         Some(cost) => Some(cost),
                         None => {
@@ -412,7 +409,9 @@ impl QuotaProbe for CommandCodeProbe {
 mod tests {
     use super::*;
     use crate::domain::parse_money;
-    use crate::quota::testutil::{capture_warnings, strict_client, test_account, Reply, TestServer};
+    use crate::quota::testutil::{
+        Reply, TestServer, capture_warnings, strict_client, test_account,
+    };
 
     /// Recorded /alpha/billing/credits response for a pro account mid-cycle.
     const CREDITS_BODY: &str = r#"{
@@ -455,8 +454,7 @@ mod tests {
         assert_eq!(weekly.cap, parse_money("100").unwrap());
         assert_eq!(weekly.used, parse_money("20").unwrap());
 
-        let purchased =
-            gate_of(&outcome, GateKind::PurchasedCredits).expect("purchased credits");
+        let purchased = gate_of(&outcome, GateKind::PurchasedCredits).expect("purchased credits");
         assert_eq!(purchased.cap, parse_money("12.5").unwrap());
         assert_eq!(purchased.used, Decimal::ZERO);
         assert_eq!(purchased.class(), crate::domain::GateClass::Metered);
@@ -493,7 +491,8 @@ mod tests {
     /// cycle and then refused every request with a Retry-After at period_end.
     #[test]
     fn commandcode_monthly_credits_is_the_remaining_balance_not_the_cap() {
-        let body = r#"{ "credits": { "monthlyCredits": 20, "purchasedCredits": 5, "freeCredits": 1 } }"#;
+        let body =
+            r#"{ "credits": { "monthlyCredits": 20, "purchasedCredits": 5, "freeCredits": 1 } }"#;
         let spend = parse_money("11").unwrap();
         let outcome = outcome_from_credits_body(body, Some(spend), None).expect("must parse");
 
@@ -583,7 +582,11 @@ mod tests {
         let outcome = outcome_from_credits_body(body, None, None).expect("must parse");
 
         let five = gate_of(&outcome, GateKind::FiveHour).expect("exceeded window must survive");
-        assert_eq!(five.used, parse_money("10").unwrap(), "used = cap when none was reported");
+        assert_eq!(
+            five.used,
+            parse_money("10").unwrap(),
+            "used = cap when none was reported"
+        );
         assert_eq!(five.remaining(), Decimal::ZERO);
         assert!(five.resets_at.is_some());
 
@@ -619,14 +622,15 @@ mod tests {
         let client = strict_client();
         let account = test_account("commandcode", "sk-cc-test-key");
         let probe = CommandCodeProbe::new(server.base_url.clone());
-        let (warnings, outcome) =
-            capture_warnings(probe.probe(&account, &client)).await;
+        let (warnings, outcome) = capture_warnings(probe.probe(&account, &client)).await;
         let outcome = outcome.expect("the windows must survive a lost summary");
 
         assert!(gate_of(&outcome, GateKind::Monthly).is_none());
         assert!(
-            warnings.iter().any(|line| line.contains("monthly allowance was not evaluated")
-                && line.contains("headroom may be overstated")),
+            warnings
+                .iter()
+                .any(|line| line.contains("monthly allowance was not evaluated")
+                    && line.contains("headroom may be overstated")),
             "a missing monthly reading must be a warning, got {warnings:?}"
         );
 
@@ -641,14 +645,15 @@ mod tests {
         ])
         .await;
         let probe = CommandCodeProbe::new(server.base_url.clone());
-        let (warnings, outcome) =
-            capture_warnings(probe.probe(&account, &client)).await;
+        let (warnings, outcome) = capture_warnings(probe.probe(&account, &client)).await;
         let outcome = outcome.expect("the windows must survive a bare summary");
 
         assert!(gate_of(&outcome, GateKind::Monthly).is_none());
         assert!(
-            warnings.iter().any(|line| line.contains("no totalCost")
-                && line.contains("headroom may be overstated")),
+            warnings
+                .iter()
+                .any(|line| line.contains("no totalCost")
+                    && line.contains("headroom may be overstated")),
             "a summary without totalCost must warn, got {warnings:?}"
         );
     }
@@ -750,11 +755,18 @@ mod tests {
     fn commandcode_rejects_a_malformed_body() {
         let err = outcome_from_credits_body("<html>nope</html>", None, None)
             .expect_err("non-JSON must fail");
-        assert!(err.message.contains("not valid JSON"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not valid JSON"),
+            "got {:?}",
+            err.message
+        );
 
-        let err = outcome_from_credits_body("[]", None, None)
-            .expect_err("non-object must fail");
-        assert!(err.message.contains("not a JSON object"), "got {:?}", err.message);
+        let err = outcome_from_credits_body("[]", None, None).expect_err("non-object must fail");
+        assert!(
+            err.message.contains("not a JSON object"),
+            "got {:?}",
+            err.message
+        );
     }
 
     #[test]
@@ -800,7 +812,11 @@ mod tests {
     #[test]
     fn commandcode_query_params_are_appended_and_encoded() {
         assert_eq!(
-            append_query("https://api.commandcode.ai/alpha/usage/summary", "since", "2025-06-01T00:00:00Z"),
+            append_query(
+                "https://api.commandcode.ai/alpha/usage/summary",
+                "since",
+                "2025-06-01T00:00:00Z"
+            ),
             "https://api.commandcode.ai/alpha/usage/summary?since=2025-06-01T00:00:00Z"
         );
         assert_eq!(
@@ -837,7 +853,10 @@ mod tests {
         let client = strict_client();
         let account = test_account("commandcode", "sk-cc-test-key");
         let probe = CommandCodeProbe::new(server.base_url.clone());
-        let outcome = probe.probe(&account, &client).await.expect("probe must succeed");
+        let outcome = probe
+            .probe(&account, &client)
+            .await
+            .expect("probe must succeed");
 
         let requests: Vec<String> = server
             .requests()
@@ -845,7 +864,11 @@ mod tests {
             .map(|r| r.to_ascii_lowercase())
             .collect();
         assert_eq!(requests.len(), 4, "whoami, credits, subscriptions, summary");
-        assert!(requests[0].starts_with("get /alpha/whoami "), "got {:?}", requests[0]);
+        assert!(
+            requests[0].starts_with("get /alpha/whoami "),
+            "got {:?}",
+            requests[0]
+        );
         assert!(
             requests[1].starts_with("get /alpha/billing/credits?orgid=org_123 "),
             "credits must carry the org id: {:?}",
@@ -869,8 +892,14 @@ mod tests {
         assert_eq!(monthly.cap, parse_money("131.75").unwrap());
         assert_eq!(monthly.remaining(), parse_money("100").unwrap());
         assert!(monthly.resets_at.is_some());
-        assert_eq!(gate_of(&outcome, GateKind::FiveHour).unwrap().used, parse_money("2.5").unwrap());
-        assert_eq!(gate_of(&outcome, GateKind::Weekly).unwrap().used, parse_money("20").unwrap());
+        assert_eq!(
+            gate_of(&outcome, GateKind::FiveHour).unwrap().used,
+            parse_money("2.5").unwrap()
+        );
+        assert_eq!(
+            gate_of(&outcome, GateKind::Weekly).unwrap().used,
+            parse_money("20").unwrap()
+        );
         assert_eq!(
             gate_of(&outcome, GateKind::PurchasedCredits).unwrap().cap,
             parse_money("12.5").unwrap()
@@ -895,7 +924,10 @@ mod tests {
         let client = strict_client();
         let account = test_account("commandcode", "sk-cc-test-key");
         let probe = CommandCodeProbe::new(server.base_url.clone());
-        let outcome = probe.probe(&account, &client).await.expect("windows must survive");
+        let outcome = probe
+            .probe(&account, &client)
+            .await
+            .expect("windows must survive");
 
         assert!(gate_of(&outcome, GateKind::FiveHour).is_some());
         assert!(
@@ -949,6 +981,10 @@ mod tests {
             .probe(&account, &client)
             .await
             .expect_err("malformed credits body must fail");
-        assert!(err.message.contains("not valid JSON"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not valid JSON"),
+            "got {:?}",
+            err.message
+        );
     }
 }

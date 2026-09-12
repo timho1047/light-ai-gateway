@@ -121,8 +121,16 @@ impl ErrorSignals {
             return UpstreamErrorClass::QuotaExhausted;
         }
 
-        let code = self.error_code.as_deref().unwrap_or("").to_ascii_lowercase();
-        let ty = self.error_type.as_deref().unwrap_or("").to_ascii_lowercase();
+        let code = self
+            .error_code
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let ty = self
+            .error_type
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
 
         // A few upstreams use their own vocabularies for the same conditions.
         let known_quota = matches!(
@@ -299,11 +307,15 @@ mod tests {
 
     #[test]
     fn parses_openai_and_anthropic_error_envelopes() {
-        let (t, c) = parse_error_body(r#"{"error":{"message":"x","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#);
+        let (t, c) = parse_error_body(
+            r#"{"error":{"message":"x","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
+        );
         assert_eq!(t.as_deref(), Some("rate_limit_error"));
         assert_eq!(c.as_deref(), Some("rate_limit_exceeded"));
 
-        let (t2, _) = parse_error_body(r#"{"type":"error","error":{"type":"invalid_request_error","message":"y"}}"#);
+        let (t2, _) = parse_error_body(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"y"}}"#,
+        );
         assert_eq!(t2.as_deref(), Some("invalid_request_error"));
     }
 

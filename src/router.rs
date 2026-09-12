@@ -8,12 +8,10 @@
 
 use crate::accounts::{AttemptPlan, PlanError, Pool};
 use crate::config::{Config, ResolvedRoute};
-use crate::domain::{
-    now, Account, AttemptRecord, GateClass, GateKind, RequestRecord, TokenUsage,
-};
+use crate::domain::{Account, AttemptRecord, GateClass, GateKind, RequestRecord, TokenUsage, now};
 use crate::error::UpstreamErrorClass;
 use crate::meter::PriceTable;
-use crate::quota::{probe_for, QuotaProbe};
+use crate::quota::{QuotaProbe, probe_for};
 use crate::store::StoreHandle;
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
@@ -280,7 +278,9 @@ impl Gateway {
     /// the tier price instead, and getting this wrong is off by the peak
     /// multiplier -- toward spending when the peak rate is higher.
     pub fn tier_at(&self, provider: &str, model: &str, at: time::OffsetDateTime) -> u32 {
-        let Some(schedule) = self.schedules.get(&(provider.to_string(), model.to_string()))
+        let Some(schedule) = self
+            .schedules
+            .get(&(provider.to_string(), model.to_string()))
         else {
             return 0;
         };
@@ -580,9 +580,7 @@ impl Gateway {
                 .map(|(tier, usage)| {
                     prices
                         .estimate(provider, &model, *tier, usage, Decimal::ONE)
-                        .unwrap_or_else(|| {
-                            crate::meter::conservative_estimate(usage, Decimal::ONE)
-                        })
+                        .unwrap_or_else(|| crate::meter::conservative_estimate(usage, Decimal::ONE))
                 })
                 .collect();
             let total_expected: Decimal = expected.iter().copied().sum();

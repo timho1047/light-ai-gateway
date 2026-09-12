@@ -88,7 +88,10 @@ impl ModelPrice {
 
         let input = sat_mul(Decimal::from(uncached), self.input_per_token);
         let cache_read = sat_mul(Decimal::from(cached), self.cache_read_per_token);
-        let output = sat_mul(Decimal::from(usage.completion_tokens), self.output_per_token);
+        let output = sat_mul(
+            Decimal::from(usage.completion_tokens),
+            self.output_per_token,
+        );
 
         sat_add(input, sat_add(cache_read, output))
     }
@@ -484,9 +487,7 @@ impl PriceTable {
         entry.observed_completion_tokens = entry
             .observed_completion_tokens
             .saturating_add(usage.completion_tokens);
-        entry.observed_cached_tokens = entry
-            .observed_cached_tokens
-            .saturating_add(cached);
+        entry.observed_cached_tokens = entry.observed_cached_tokens.saturating_add(cached);
     }
 
     /// Install prices from the [prices] config table (USD per million tokens).
@@ -743,7 +744,10 @@ pub fn conservative_estimate(usage: &TokenUsage, multiplier: Decimal) -> Decimal
         sat_add(
             sat_mul(Decimal::from(uncached), prompt),
             sat_add(
-                sat_mul(sat_mul(Decimal::from(cached), prompt), default_cached_discount()),
+                sat_mul(
+                    sat_mul(Decimal::from(cached), prompt),
+                    default_cached_discount(),
+                ),
                 sat_mul(Decimal::from(usage.completion_tokens), completion),
             ),
         ),
@@ -1093,7 +1097,12 @@ mod tests {
         // A zero or negative multiplier must not make a request look free: the
         // hard gate would then admit everything.
         assert_eq!(table.estimate(P, "m", 0, &u, Decimal::ZERO).unwrap(), one);
-        assert_eq!(table.estimate(P, "m", 0, &u, Decimal::NEGATIVE_ONE).unwrap(), one);
+        assert_eq!(
+            table
+                .estimate(P, "m", 0, &u, Decimal::NEGATIVE_ONE)
+                .unwrap(),
+            one
+        );
     }
 
     /// DESIGN section 3 charges price(model, tokens) x credit_multiplier, and
@@ -1121,7 +1130,11 @@ mod tests {
         assert_eq!(learned.input_per_token, Decimal::new(5, 5));
 
         let once = table.estimate(P, "m", 0, &u, Decimal::ONE).unwrap();
-        assert_eq!(once, learned.base_cost(&u), "learned rate x tokens, nothing else");
+        assert_eq!(
+            once,
+            learned.base_cost(&u),
+            "learned rate x tokens, nothing else"
+        );
         assert_eq!(once, Decimal::new(1, 1), "2000 tokens x 0.00005 = 0.10");
         assert_eq!(
             table.estimate(P, "m", 0, &u, Decimal::from(2)).unwrap(),
@@ -1134,7 +1147,10 @@ mod tests {
     fn unknown_model_estimates_none_not_zero() {
         let table = PriceTable::new();
         let u = usage(5_000, 500, 0);
-        assert_eq!(table.estimate(P, "nobody/knows-this", 0, &u, Decimal::ONE), None);
+        assert_eq!(
+            table.estimate(P, "nobody/knows-this", 0, &u, Decimal::ONE),
+            None
+        );
         assert!(!table.is_known(P, "nobody/knows-this", 0));
         // ... and the explicit fallback is strictly positive, never free.
         assert!(conservative_estimate(&u, Decimal::ONE) > Decimal::ZERO);
@@ -1248,7 +1264,9 @@ mod tests {
         let est = crate::meter::conservative_estimate(&usage(31, 16, 0), Decimal::ONE);
         assert!(est > Decimal::ZERO);
         assert!(
-            table.estimate(P, "m", 0, &usage(31, 16, 0), Decimal::ONE).is_none(),
+            table
+                .estimate(P, "m", 0, &usage(31, 16, 0), Decimal::ONE)
+                .is_none(),
             "with nothing learned the caller must use the conservative estimate"
         );
     }
@@ -1288,7 +1306,13 @@ mod tests {
         // DESIGN section 3: free models must fall out as a zero rate so they
         // never look like they are burning quota.
         let mut table = PriceTable::new();
-        table.observe(P, "laguna-s-2.1-free", 0, Decimal::ZERO, &usage(500, 100, 0));
+        table.observe(
+            P,
+            "laguna-s-2.1-free",
+            0,
+            Decimal::ZERO,
+            &usage(500, 100, 0),
+        );
         let learned = table.get(P, "laguna-s-2.1-free", 0).unwrap();
         assert_eq!(learned.samples, 1);
         assert_eq!(learned.input_per_token, Decimal::ZERO);
@@ -1347,7 +1371,10 @@ mod tests {
         // The first real observation replaces the prior outright.
         table.observe(P, "m", 0, Decimal::new(5, 2), &usage(1_000, 0, 0));
         assert_eq!(table.get(P, "m", 0).unwrap().samples, 1);
-        assert_eq!(table.get(P, "m", 0).unwrap().input_per_token, Decimal::new(5, 5));
+        assert_eq!(
+            table.get(P, "m", 0).unwrap().input_per_token,
+            Decimal::new(5, 5)
+        );
     }
 
     #[test]
@@ -1374,7 +1401,10 @@ mod tests {
         );
         let mut table = PriceTable::new();
         assert_eq!(table.seed_from_config(&prices), 0);
-        assert_eq!(table.estimate(P, "bad", 0, &usage(1, 1, 0), Decimal::ONE), None);
+        assert_eq!(
+            table.estimate(P, "bad", 0, &usage(1, 1, 0), Decimal::ONE),
+            None
+        );
     }
 
     #[test]
@@ -1468,11 +1498,17 @@ mod tests {
             table.estimate(P, "m", 0, &usage(1_000_000, 0, 0), Decimal::ONE),
             Some(Decimal::from(3))
         );
-        assert_eq!(table.entry(P, "m", 0).unwrap().source().map(|s| s.label()), Some("configured"));
+        assert_eq!(
+            table.entry(P, "m", 0).unwrap().source().map(|s| s.label()),
+            Some("configured")
+        );
 
         // After one observation the learned rate takes over for billing...
         table.observe(P, "m", 0, Decimal::from(9), &usage(1_000_000, 0, 0));
-        assert_eq!(table.entry(P, "m", 0).unwrap().source().map(|s| s.label()), Some("learned"));
+        assert_eq!(
+            table.entry(P, "m", 0).unwrap().source().map(|s| s.label()),
+            Some("learned")
+        );
         assert_eq!(
             table.estimate(P, "m", 0, &usage(1_000_000, 0, 0), Decimal::ONE),
             Some(Decimal::from(9))
@@ -1506,7 +1542,13 @@ mod tests {
         //   800k x 0.30/M + 200k x 0.03/M + 10k x 1.20/M = 0.258
         let mut heavy_in = PriceTable::new();
         heavy_in.seed_from_config(&prices);
-        heavy_in.observe(P, "m", 0, Decimal::new(258, 3), &usage(1_000_000, 10_000, 200_000));
+        heavy_in.observe(
+            P,
+            "m",
+            0,
+            Decimal::new(258, 3),
+            &usage(1_000_000, 10_000, 200_000),
+        );
 
         // Output-heavy: 100k prompt + 200k output.
         //   100k x 0.30/M + 200k x 1.20/M = 0.27
@@ -1529,10 +1571,15 @@ mod tests {
             a.actual_per_million,
             b.actual_per_million
         );
-        let (input_pct, out_pct, cache_pct) =
-            heavy_in.entry(P, "m", 0).unwrap().mix_percentages().unwrap();
+        let (input_pct, out_pct, cache_pct) = heavy_in
+            .entry(P, "m", 0)
+            .unwrap()
+            .mix_percentages()
+            .unwrap();
         assert!(
-            (input_pct - 79.2).abs() < 0.1 && (out_pct - 1.0).abs() < 0.1 && (cache_pct - 19.8).abs() < 0.1,
+            (input_pct - 79.2).abs() < 0.1
+                && (out_pct - 1.0).abs() < 0.1
+                && (cache_pct - 19.8).abs() < 0.1,
             "the mix is what explains the difference, got {input_pct}/{out_pct}/{cache_pct}"
         );
     }
@@ -1642,7 +1689,11 @@ mod tests {
 
         let off = table.drift(P, "m", 0).unwrap();
         let peak = table.drift(P, "m", 1).unwrap();
-        assert!(off.ratio.abs() < 0.01, "off-peak unchanged, got {:+.1}%", off.ratio * 100.0);
+        assert!(
+            off.ratio.abs() < 0.01,
+            "off-peak unchanged, got {:+.1}%",
+            off.ratio * 100.0
+        );
         assert!(
             (peak.ratio - 0.30).abs() < 0.01,
             "peak up 30%, got {:+.1}%",

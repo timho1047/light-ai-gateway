@@ -23,7 +23,7 @@
 //!   free_tokens      -> FreeTokens    (Covered daily token allowance)
 
 use super::{
-    get_body, json_money, json_u64, sat_add, sat_sub, ProbeError, ProbeOutcome, QuotaProbe,
+    ProbeError, ProbeOutcome, QuotaProbe, get_body, json_money, json_u64, sat_add, sat_sub,
 };
 use crate::accounts::gate;
 use crate::domain::{Account, Gate, GateKind};
@@ -64,9 +64,9 @@ impl XkiroProbe {
 pub(crate) fn outcome_from_body(body: &str) -> Result<ProbeOutcome, ProbeError> {
     let value: Value = serde_json::from_str(body)
         .map_err(|_| ProbeError::new("xkiro /v1/usage: response is not valid JSON"))?;
-    let object = value.as_object().ok_or_else(|| {
-        ProbeError::new("xkiro /v1/usage: response is not a JSON object")
-    })?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| ProbeError::new("xkiro /v1/usage: response is not a JSON object"))?;
 
     let mut gates = Vec::new();
 
@@ -79,17 +79,19 @@ pub(crate) fn outcome_from_body(body: &str) -> Result<ProbeOutcome, ProbeError> 
     }
 
     if let Some(free) = object.get("free_tokens").and_then(Value::as_object)
-        && let Some(g) = free_tokens_gate(free) {
-            gates.push(g);
-        }
+        && let Some(g) = free_tokens_gate(free)
+    {
+        gates.push(g);
+    }
 
     // An explicit null wallet is a real reading ("no wallet on this plan"), so
     // it must not become a zero-balance gate. A missing amount inside a present
     // wallet object is likewise not treated as zero.
     if let Some(wallet) = object.get("wallet").and_then(Value::as_object)
-        && let Some(g) = wallet_gate(wallet) {
-            gates.push(g);
-        }
+        && let Some(g) = wallet_gate(wallet)
+    {
+        gates.push(g);
+    }
 
     if gates.is_empty() {
         // Never report an empty success: the caller would carry nothing forward
@@ -101,7 +103,10 @@ pub(crate) fn outcome_from_body(body: &str) -> Result<ProbeOutcome, ProbeError> 
 
     Ok(ProbeOutcome {
         gates,
-        plan: object.get("plan").and_then(|p| p.as_str()).map(str::to_string),
+        plan: object
+            .get("plan")
+            .and_then(|p| p.as_str())
+            .map(str::to_string),
         // xKiro does not report a currency; amounts are USD by contract.
         currency: None,
     })
@@ -217,11 +222,7 @@ impl QuotaProbe for XkiroProbe {
         account: &Account,
         client: &reqwest::Client,
     ) -> Result<ProbeOutcome, ProbeError> {
-        let url = format!(
-            "{}{}",
-            self.base_url.trim_end_matches('/'),
-            USAGE_PATH
-        );
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), USAGE_PATH);
         let body = get_body(client, &url, &account.api_key, "xkiro /v1/usage").await?;
         outcome_from_body(&body)
     }
@@ -230,8 +231,10 @@ impl QuotaProbe for XkiroProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{parse_money, GateClass, GateKind};
-    use crate::quota::testutil::{capture_warnings, strict_client, test_account, Reply, TestServer};
+    use crate::domain::{GateClass, GateKind, parse_money};
+    use crate::quota::testutil::{
+        Reply, TestServer, capture_warnings, strict_client, test_account,
+    };
 
     /// Recorded /v1/usage response: both windows, free tokens and a wallet.
     const USAGE_BODY: &str = r#"{
@@ -343,13 +346,19 @@ mod tests {
         let (warnings, outcome) = capture_warnings(async { outcome_from_body(body) }).await;
         let outcome = outcome.expect("the known window must still parse");
 
-        assert_eq!(outcome.gates.len(), 1, "the unknown window is dropped, not guessed");
+        assert_eq!(
+            outcome.gates.len(),
+            1,
+            "the unknown window is dropped, not guessed"
+        );
         assert_eq!(
             gate_of(&outcome, GateKind::FiveHour).cap,
             parse_money("10").unwrap()
         );
         assert!(
-            warnings.iter().any(|line| line.contains("unrecognised window_sec")),
+            warnings
+                .iter()
+                .any(|line| line.contains("unrecognised window_sec")),
             "an unknown window must be reported, got {warnings:?}"
         );
 
@@ -364,7 +373,9 @@ mod tests {
         let outcome = outcome.expect("the weekly window must still parse");
         assert_eq!(outcome.gates.len(), 1);
         assert!(
-            warnings.iter().any(|line| line.contains("window_sec is not a number")),
+            warnings
+                .iter()
+                .any(|line| line.contains("window_sec is not a number")),
             "an unparsable window_sec must be reported, got {warnings:?}"
         );
     }
@@ -431,7 +442,10 @@ mod tests {
 
         assert_eq!(outcome.gates.len(), 1, "absent sections produce no gates");
         assert_eq!(outcome.plan, None);
-        assert_eq!(gate_of(&outcome, GateKind::FiveHour).used, parse_money("0.5").unwrap());
+        assert_eq!(
+            gate_of(&outcome, GateKind::FiveHour).used,
+            parse_money("0.5").unwrap()
+        );
     }
 
     #[test]
@@ -469,12 +483,20 @@ mod tests {
 
     #[test]
     fn xkiro_rejects_a_malformed_body() {
-        let err = outcome_from_body("<html>502 Bad Gateway</html>")
-            .expect_err("non-JSON must fail");
-        assert!(err.message.contains("not valid JSON"), "got {:?}", err.message);
+        let err =
+            outcome_from_body("<html>502 Bad Gateway</html>").expect_err("non-JSON must fail");
+        assert!(
+            err.message.contains("not valid JSON"),
+            "got {:?}",
+            err.message
+        );
 
         let err = outcome_from_body("[1, 2, 3]").expect_err("non-object must fail");
-        assert!(err.message.contains("not a JSON object"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not a JSON object"),
+            "got {:?}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -484,12 +506,19 @@ mod tests {
         let account = test_account("xkiro", "sk-xkiro-test-key");
 
         let probe = XkiroProbe::new(server.base_url.clone());
-        let outcome = probe.probe(&account, &client).await.expect("probe must succeed");
+        let outcome = probe
+            .probe(&account, &client)
+            .await
+            .expect("probe must succeed");
 
         assert_eq!(outcome.gates.len(), 4);
         assert_eq!(server.call_count(), 1);
         let request = server.requests()[0].to_ascii_lowercase();
-        assert!(request.starts_with("get /v1/usage http/1.1"), "got {:?}", request);
+        assert!(
+            request.starts_with("get /v1/usage http/1.1"),
+            "got {:?}",
+            request
+        );
         assert!(
             request.contains("authorization: bearer sk-xkiro-test-key"),
             "the bearer key must be sent: {request:?}"
@@ -530,6 +559,10 @@ mod tests {
             .probe(&account, &client)
             .await
             .expect_err("malformed body must fail");
-        assert!(err.message.contains("not valid JSON"), "got {:?}", err.message);
+        assert!(
+            err.message.contains("not valid JSON"),
+            "got {:?}",
+            err.message
+        );
     }
 }

@@ -256,19 +256,19 @@ impl StreamMeter {
                 }
                 MeterMode::Json => {
                     if !self.json_truncated
-                        && let Ok(value) = serde_json::from_slice::<Value>(&self.json_buf) {
-                            if let Some(usage) = usage_from_json(&value) {
-                                self.sse.merge_usage(&usage);
-                            }
-                            // Keep the content-length hint for the local
-                            // estimate when no usage frame was present.
-                            if let Some(len) = content_len(&value) {
-                                self.sse.inner.content_chunks += 1;
-                                self.sse.content_chars =
-                                    self.sse.content_chars.saturating_add(len);
-                            }
-                            self.sse.inner.saw_done = true;
+                        && let Ok(value) = serde_json::from_slice::<Value>(&self.json_buf)
+                    {
+                        if let Some(usage) = usage_from_json(&value) {
+                            self.sse.merge_usage(&usage);
                         }
+                        // Keep the content-length hint for the local
+                        // estimate when no usage frame was present.
+                        if let Some(len) = content_len(&value) {
+                            self.sse.inner.content_chunks += 1;
+                            self.sse.content_chars = self.sse.content_chars.saturating_add(len);
+                        }
+                        self.sse.inner.saw_done = true;
+                    }
                 }
             }
         }
@@ -354,7 +354,10 @@ pub fn inject_include_usage(body: &mut serde_json::Value) -> bool {
 /// Replace the model field, returning the previous value.
 pub fn set_model(body: &mut serde_json::Value, model: &str) -> Option<String> {
     let obj = body.as_object_mut()?;
-    let old = obj.get("model").and_then(|m| m.as_str()).map(str::to_string);
+    let old = obj
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
     obj.insert("model".into(), serde_json::Value::String(model.to_string()));
     old
 }
@@ -405,7 +408,9 @@ pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
         usage.prompt_tokens = n;
         any = true;
     } else if cache_hit.is_some() || cache_miss.is_some() {
-        usage.prompt_tokens = cache_hit.unwrap_or(0).saturating_add(cache_miss.unwrap_or(0));
+        usage.prompt_tokens = cache_hit
+            .unwrap_or(0)
+            .saturating_add(cache_miss.unwrap_or(0));
         any = true;
     }
 
@@ -473,7 +478,11 @@ pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
 fn content_len(v: &Value) -> Option<u64> {
     // Anthropic: content_block_delta / content_block_start, and the tool-use
     // arguments that arrive as input_json_delta fragments.
-    if let Some(t) = v.get("delta").and_then(|d| d.get("text")).and_then(Value::as_str) {
+    if let Some(t) = v
+        .get("delta")
+        .and_then(|d| d.get("text"))
+        .and_then(Value::as_str)
+    {
         return non_empty_len(t);
     }
     if let Some(t) = v
@@ -505,23 +514,26 @@ fn content_len(v: &Value) -> Option<u64> {
     let choices = v.get("choices")?.as_array()?;
     for c in choices {
         if let Some(t) = c.get("delta").and_then(|d| d.get("content"))
-            && let Some(n) = text_len(t) {
-                return Some(n);
-            }
+            && let Some(n) = text_len(t)
+        {
+            return Some(n);
+        }
         if let Some(n) = tool_calls_len_of(c.get("delta")) {
             return Some(n);
         }
         if let Some(t) = c.get("message").and_then(|m| m.get("content"))
-            && let Some(n) = text_len(t) {
-                return Some(n);
-            }
+            && let Some(n) = text_len(t)
+        {
+            return Some(n);
+        }
         if let Some(n) = tool_calls_len_of(c.get("message")) {
             return Some(n);
         }
         if let Some(t) = c.get("text")
-            && let Some(n) = text_len(t) {
-                return Some(n);
-            }
+            && let Some(n) = text_len(t)
+        {
+            return Some(n);
+        }
     }
     None
 }
@@ -578,8 +590,7 @@ fn stream_finished(v: &Value) -> bool {
     if v.get("type").and_then(Value::as_str) == Some("message_stop") {
         return true;
     }
-    if v
-        .get("delta")
+    if v.get("delta")
         .and_then(|d| d.get("stop_reason"))
         .map(|s| !s.is_null())
         .unwrap_or(false)
@@ -590,9 +601,9 @@ fn stream_finished(v: &Value) -> bool {
         && choices
             .iter()
             .any(|c| !c.get("finish_reason").map(Value::is_null).unwrap_or(true))
-        {
-            return true;
-        }
+    {
+        return true;
+    }
     false
 }
 
@@ -641,7 +652,10 @@ mod tests {
         let second = m.feed_line(
             r#"data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}"#,
         );
-        assert!(!second.first_content, "only the first content chunk reports it");
+        assert!(
+            !second.first_content,
+            "only the first content chunk reports it"
+        );
 
         let r = m.finish();
         assert_eq!(r.content_chunks, 2);
@@ -668,7 +682,10 @@ mod tests {
         let args = m.feed_line(
             r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":\"Paris\"}"}}]},"finish_reason":null}]}"#,
         );
-        assert!(!args.first_content, "only the first content frame reports it");
+        assert!(
+            !args.first_content,
+            "only the first content frame reports it"
+        );
 
         // An empty array and a structural frame are not content.
         let empty = m.feed_line(
@@ -701,7 +718,10 @@ mod tests {
         let open = m.feed_line(
             r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
         );
-        assert!(open.first_content, "the tool_use block is generated content");
+        assert!(
+            open.first_content,
+            "the tool_use block is generated content"
+        );
         assert_eq!(m.content_chars(), 11, "the 11 characters of get_weather");
 
         m.feed_line(
@@ -731,7 +751,9 @@ mod tests {
 
         // A normal stream must not be marked as errored.
         let mut ok = SseMeter::new();
-        ok.feed_line(r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#);
+        ok.feed_line(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+        );
         ok.feed_line("data: [DONE]");
         assert_eq!(ok.finish().error, None);
         assert!(ok.finish().saw_done);
@@ -764,9 +786,7 @@ mod tests {
         assert!(done.finish().saw_done());
 
         let mut finished = SseMeter::new();
-        finished.feed_line(
-            r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
-        );
+        finished.feed_line(r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#);
         assert!(
             finished.finish().saw_done(),
             "finish_reason also ends the stream"
@@ -846,8 +866,14 @@ mod tests {
         assert!(stop.done, "stop_reason signals the end");
 
         let r = m.finish();
-        assert_eq!(r.usage.prompt_tokens, 25, "message_start keeps the prompt count");
-        assert_eq!(r.usage.completion_tokens, 15, "message_delta carries the output count");
+        assert_eq!(
+            r.usage.prompt_tokens, 25,
+            "message_start keeps the prompt count"
+        );
+        assert_eq!(
+            r.usage.completion_tokens, 15,
+            "message_delta carries the output count"
+        );
         assert_eq!(r.usage.cached_tokens, 10);
         assert!(r.usage.measured);
     }

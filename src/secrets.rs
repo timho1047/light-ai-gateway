@@ -100,9 +100,7 @@ pub fn entry_user(provider: &str, account: &str) -> String {
 /// command that fixes the problem, because the alternative is an operator
 /// restarting with an empty environment and guessing.
 pub fn missing_credential_message(provider: &str, account: &str) -> String {
-    format!(
-        "no credential for {provider}/{account}. Run: lgw keys add {provider} {account}"
-    )
+    format!("no credential for {provider}/{account}. Run: lgw keys add {provider} {account}")
 }
 
 /// Name of the one item that holds every key.
@@ -544,7 +542,10 @@ mod tests {
         s.set("deepseek", "acc-1", "three").unwrap();
         assert_eq!(s.get("xkiro", "acc-1").unwrap().unwrap().expose(), "one");
         assert_eq!(s.get("xkiro", "acc-2").unwrap().unwrap().expose(), "two");
-        assert_eq!(s.get("deepseek", "acc-1").unwrap().unwrap().expose(), "three");
+        assert_eq!(
+            s.get("deepseek", "acc-1").unwrap().unwrap().expose(),
+            "three"
+        );
     }
 
     #[test]
@@ -613,7 +614,8 @@ mod tests {
 
     impl FakeItems {
         fn names(&self) -> Vec<String> {
-            let mut names: Vec<String> = self.items.lock().expect("items").keys().cloned().collect();
+            let mut names: Vec<String> =
+                self.items.lock().expect("items").keys().cloned().collect();
             names.sort();
             names
         }
@@ -670,10 +672,7 @@ mod tests {
             vec![VAULT_ITEM.to_string()],
             "three accounts, one credential-store item, one authorisation"
         );
-        assert_eq!(
-            v.get("xkiro", "acc-1").unwrap().unwrap().expose(),
-            "sk-one"
-        );
+        assert_eq!(v.get("xkiro", "acc-1").unwrap().unwrap().expose(), "sk-one");
         assert_eq!(
             v.get("commandcode", "acc-1").unwrap().unwrap().expose(),
             "sk-three"
@@ -704,10 +703,7 @@ mod tests {
         v.set("xkiro", "acc-1", "sk-new").unwrap();
 
         assert_eq!(v.get("xkiro", "acc-1").unwrap().unwrap().expose(), "sk-new");
-        assert_eq!(
-            v.origin("xkiro", "acc-1").unwrap(),
-            CredentialOrigin::Vault
-        );
+        assert_eq!(v.origin("xkiro", "acc-1").unwrap(), CredentialOrigin::Vault);
     }
 
     /// Merging, then running it again.
@@ -716,7 +712,11 @@ mod tests {
         let v = vault();
         v.items.put_legacy("xkiro", "acc-1", "sk-one");
         v.items.put_legacy("xkiro", "acc-2", "sk-two");
-        let pairs = [pair("xkiro", "acc-1"), pair("xkiro", "acc-2"), pair("xkiro", "acc-3")];
+        let pairs = [
+            pair("xkiro", "acc-1"),
+            pair("xkiro", "acc-2"),
+            pair("xkiro", "acc-3"),
+        ];
 
         let first = v.migrate(&pairs, false).unwrap();
         assert_eq!(first.merged, 2);
@@ -758,9 +758,7 @@ mod tests {
     #[test]
     fn a_corrupt_vault_is_an_error_rather_than_a_missing_credential() {
         let v = vault();
-        v.items
-            .write(VAULT_ITEM, "this is not json")
-            .unwrap();
+        v.items.write(VAULT_ITEM, "this is not json").unwrap();
 
         let err = v.get("xkiro", "acc-1").unwrap_err().to_string();
         assert!(err.contains(VAULT_ITEM), "got: {err}");
@@ -780,7 +778,10 @@ mod tests {
         assert!(v.delete("xkiro", "acc-1").unwrap());
         assert!(v.get("xkiro", "acc-1").unwrap().is_none());
         assert_eq!(v.items.names(), vec![VAULT_ITEM.to_string()]);
-        assert!(!v.delete("xkiro", "acc-1").unwrap(), "nothing left to remove");
+        assert!(
+            !v.delete("xkiro", "acc-1").unwrap(),
+            "nothing left to remove"
+        );
     }
 
     /// The item is read once per process, not once per account.
