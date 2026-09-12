@@ -87,7 +87,13 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     /// Price a usage sample through the learned price table. None means the
     /// model is unknown and the caller must fall back conservatively.
-    fn estimate_cost(&self, model: &str, usage: &TokenUsage, multiplier: Decimal) -> Option<Decimal>;
+    fn estimate_cost(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal>;
 
     fn record_success(
         &self,
@@ -171,12 +177,18 @@ impl ProxyBackend for GatewayBackend {
         self.gateway.http.clone()
     }
 
-    fn estimate_cost(&self, model: &str, usage: &TokenUsage, multiplier: Decimal) -> Option<Decimal> {
+    fn estimate_cost(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal> {
         self.gateway
             .prices
             .lock()
             .ok()
-            .and_then(|prices| prices.estimate(model, usage, multiplier))
+            .and_then(|prices| prices.estimate(provider, model, usage, multiplier))
     }
 
     fn record_success(
@@ -374,7 +386,8 @@ async fn chat_completions(
     };
 
     let estimated_prompt_tokens = crate::meter::estimate_prompt_tokens(&value);
-    let est_cost = estimate_request_cost(state.backend.as_ref(), &route.model, &value);
+    let est_cost =
+        estimate_request_cost(state.backend.as_ref(), &route.provider, &route.model, &value);
 
     // Without this flag the upstream never emits a usage frame and the local
     // ledger records zero forever, which silently disables cost control.
@@ -856,7 +869,12 @@ fn record_attempt_failure(
     backend.record_failure(plan, class, retry_after, None, attempt);
 }
 
-fn estimate_request_cost(backend: &dyn ProxyBackend, model: &str, body: &Value) -> Decimal {
+fn estimate_request_cost(
+    backend: &dyn ProxyBackend,
+    provider: &str,
+    model: &str,
+    body: &Value,
+) -> Decimal {
     let prompt = crate::meter::estimate_prompt_tokens(body);
     let max_tokens = body
         .get("max_tokens")
@@ -869,7 +887,7 @@ fn estimate_request_cost(backend: &dyn ProxyBackend, model: &str, body: &Value) 
         ..Default::default()
     };
     backend
-        .estimate_cost(model, &probe, Decimal::ONE)
+        .estimate_cost(provider, model, &probe, Decimal::ONE)
         // One shared definition of "unknown model" across the whole request
         // path: two different fallback constants would mean the gate and the
         // finalizer disagreed about what a request costs.
@@ -1042,7 +1060,12 @@ impl RelayStream {
 
         let cost = f
             .backend
-            .estimate_cost(&f.plan.model, &result.usage, f.credit_multiplier)
+            .estimate_cost(
+                &f.plan.provider,
+                &f.plan.model,
+                &result.usage,
+                f.credit_multiplier,
+            )
             .unwrap_or_else(|| {
                 crate::meter::conservative_estimate(&result.usage, f.credit_multiplier)
             });
@@ -1359,6 +1382,7 @@ mod tests {
 
         fn estimate_cost(
             &self,
+            _provider: &str,
             _model: &str,
             _usage: &TokenUsage,
             _multiplier: Decimal,

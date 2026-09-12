@@ -98,6 +98,15 @@ pub enum Command {
     Init(InitArgs),
     /// Register, list, and remove provider credentials.
     Keys(KeysArgs),
+    /// Show configured prices against the prices learned from real spend.
+    Prices(PricesArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PricesArgs {
+    /// Show only models whose observed price has moved away from the configured one.
+    #[arg(long)]
+    pub drift_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +221,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Tail(args) => cmd_tail(&path, args.limit),
         Command::Doctor => cmd_doctor(&path, origin).await,
         Command::Keys(args) => cmd_keys(&path, args).await,
+        Command::Prices(args) => cmd_prices(&path, &args),
     }
 }
 
@@ -1314,6 +1324,176 @@ async fn cmd_keys_test(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// prices
+// ---------------------------------------------------------------------------
+
+/// One line of the price report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceRow {
+    pub provider: String,
+    pub model: String,
+    pub source: String,
+    /// Rendering of the configured prompt/completion split, per million tokens.
+    pub configured: String,
+    /// Rendering of the learned blended rate, per million tokens.
+    pub learned: String,
+    /// Cost drift against the configured price, or a dash when not comparable.
+    pub drift: String,
+    pub significant: bool,
+    pub samples: u64,
+}
+
+/// Render a per-token price as USD per million tokens, without trailing zeros.
+///
+/// Prices span a wide range (a free model is 0, a frontier model is tens of
+/// dollars per million), so the precision adapts; the trimming keeps a table of
+/// prices readable rather than a wall of zeros.
+fn per_million(per_token: Decimal) -> String {
+    use rust_decimal::prelude::ToPrimitive;
+    let v = per_token.to_f64().unwrap_or(0.0) * 1_000_000.0;
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = v.abs();
+    let raw = if magnitude < 0.001 {
+        format!("{v:.6}")
+    } else if magnitude < 1.0 {
+        format!("{v:.4}")
+    } else if magnitude < 100.0 {
+        format!("{v:.3}")
+    } else {
+        format!("{v:.2}")
+    };
+    if raw.contains('.') {
+        raw.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        raw
+    }
+}
+
+/// Build the price report. Pure, so it can be tested without a terminal.
+pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
+    let mut rows: Vec<PriceRow> = table
+        .entries()
+        .filter_map(|(provider, model, entry)| {
+            let source = entry.source()?.label().to_string();
+            let configured = match entry.configured {
+                Some(p) => format!(
+                    "{} / {}",
+                    per_million(p.prompt_per_token),
+                    per_million(p.completion_per_token)
+                ),
+                None => "-".to_string(),
+            };
+            // The learned figure is a single blended rate: one equation cannot
+            // separate a prompt rate from a completion rate. Shown once, not
+            // twice, so it is not mistaken for a split.
+            let learned = match entry.learned {
+                Some(p) => per_million(p.prompt_per_token),
+                None => "-".to_string(),
+            };
+            let drift = table.drift(provider, model);
+            let samples = entry.learned.map(|p| p.samples).unwrap_or(0);
+            Some(PriceRow {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                source,
+                configured,
+                learned,
+                drift: match drift {
+                    Some(d) => format!("{:+.1}%", d.ratio * 100.0),
+                    None => "-".to_string(),
+                },
+                significant: drift.is_some_and(|d| d.significant),
+                samples,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.significant
+            .cmp(&a.significant)
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    rows
+}
+
+fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
+    let config = load_config(path)?;
+
+    // Configured prices come from the config file; learned prices come from the
+    // ledger, so this works whether or not a gateway is running.
+    let mut table = crate::meter::PriceTable::new();
+    table.seed_from_config(&config.prices);
+
+    let db = config.db_path();
+    if store::db_exists(&db) {
+        match store::open_readonly(&db).and_then(|conn| store::load_prices(&conn)) {
+            Ok(rows) => {
+                table.load_learned(rows);
+            }
+            Err(e) => println!("warning: could not read learned prices: {e:#}"),
+        }
+    }
+
+    let mut rows = price_rows(&table);
+    if args.drift_only {
+        rows.retain(|r| r.significant);
+    }
+
+    if rows.is_empty() {
+        if args.drift_only {
+            println!("no model has drifted materially from its configured price");
+        } else {
+            println!("no prices are configured or learned yet.");
+            println!();
+            println!("Set a starting price in the config file, and the gateway learns the real one");
+            println!("from the spend difference between quota probes:");
+            println!();
+            println!("  [prices.xkiro.\"z-ai/glm-5.3-flash\"]");
+            println!("  prompt_per_million = 0.30");
+            println!("  completion_per_million = 1.20");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<14} {:<30} {:<11} {:<17} {:<11} {:<9} SAMPLES",
+        "PROVIDER", "MODEL", "SOURCE", "CONFIGURED($/M)", "LEARNED($/M)", "DRIFT"
+    );
+    for r in &rows {
+        println!(
+            "{:<14} {:<30} {:<11} {:<17} {:<11} {:<9} {}",
+            r.provider,
+            r.model,
+            r.source,
+            r.configured,
+            r.learned,
+            if r.significant {
+                format!("{} !", r.drift)
+            } else {
+                r.drift.clone()
+            },
+            r.samples
+        );
+    }
+    println!();
+    println!("CONFIGURED is the price you set (prompt / completion, USD per million tokens).");
+    println!("LEARNED is the blended rate recovered from real spend; it is what billing uses.");
+    println!("DRIFT compares the two costs over the same usage. Positive means reality is");
+    println!("MORE EXPENSIVE than configured, and ! marks a divergence of 20% or more -");
+    println!("either a repricing you were told about, or one you were not.");
+
+    let drifted = rows.iter().filter(|r| r.significant).count();
+    if drifted > 0 {
+        println!();
+        println!("{drifted} model(s) have drifted; investigate before trusting the hard gate.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,6 +1503,101 @@ mod tests {
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).expect("valid decimal")
     }
+    // -- prices --------------------------------------------------------------
+
+    fn priced_table() -> crate::meter::PriceTable {
+        use crate::config::ModelPriceConfig;
+        use std::collections::BTreeMap;
+        let mut table = crate::meter::PriceTable::new();
+        let mut cfg: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        cfg.entry("xkiro".to_string()).or_default().insert(
+            "z-ai/glm-5.3-flash".to_string(),
+            ModelPriceConfig {
+                prompt_per_million: 0.30,
+                completion_per_million: 1.20,
+                cached_prompt_discount: 0.1,
+            },
+        );
+        table.seed_from_config(&cfg);
+        // Reality is 3x the configured prompt price: 0.90/M over 1M tokens.
+        table.observe(
+            "xkiro",
+            "z-ai/glm-5.3-flash",
+            dec("0.9"),
+            &crate::domain::TokenUsage {
+                prompt_tokens: 1_000_000,
+                ..Default::default()
+            },
+        );
+        // A second model with no configured price: nothing to compare against.
+        table.observe(
+            "commandcode",
+            "deepseek/deepseek-v4.1-flash",
+            dec("0.05"),
+            &crate::domain::TokenUsage {
+                prompt_tokens: 1_000,
+                completion_tokens: 25,
+                ..Default::default()
+            },
+        );
+        table
+    }
+
+    #[test]
+    fn price_rows_show_configured_against_learned() {
+        let rows = price_rows(&priced_table());
+        assert_eq!(rows.len(), 2);
+
+        let glm = rows.iter().find(|r| r.model == "z-ai/glm-5.3-flash").unwrap();
+        assert_eq!(glm.provider, "xkiro");
+        assert_eq!(glm.source, "learned", "an observed price outranks the expectation");
+        assert_eq!(glm.configured, "0.3 / 1.2");
+        assert_eq!(glm.learned, "0.9");
+        assert_eq!(glm.drift, "+200.0%");
+        assert!(glm.significant, "a tripling must be flagged");
+        assert_eq!(glm.samples, 1);
+
+        // No configured price means no drift claim can be made.
+        let ds = rows
+            .iter()
+            .find(|r| r.model == "deepseek/deepseek-v4.1-flash")
+            .unwrap();
+        assert_eq!(ds.configured, "-");
+        assert_eq!(ds.drift, "-");
+        assert!(!ds.significant);
+    }
+
+    #[test]
+    fn drifted_rows_sort_first_so_they_are_seen() {
+        let rows = price_rows(&priced_table());
+        assert!(rows[0].significant, "the drifted model must come first");
+    }
+
+    #[test]
+    fn a_configured_price_with_no_observation_is_shown_as_configured() {
+        use crate::config::ModelPriceConfig;
+        use std::collections::BTreeMap;
+        let mut table = crate::meter::PriceTable::new();
+        let mut cfg: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        cfg.entry("xkiro".to_string()).or_default().insert(
+            "m".to_string(),
+            ModelPriceConfig {
+                prompt_per_million: 1.0,
+                completion_per_million: 4.0,
+                cached_prompt_discount: 0.1,
+            },
+        );
+        table.seed_from_config(&cfg);
+
+        let rows = price_rows(&table);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, "configured");
+        assert_eq!(rows[0].configured, "1 / 4");
+        assert_eq!(rows[0].learned, "-");
+        assert_eq!(rows[0].drift, "-");
+        assert_eq!(rows[0].samples, 0);
+    }
+
 
     // -- credentials ---------------------------------------------------------
 

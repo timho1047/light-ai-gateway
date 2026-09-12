@@ -17,7 +17,7 @@ use crate::quota::{probe_for, QuotaProbe};
 use crate::store::StoreHandle;
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -106,12 +106,29 @@ impl Gateway {
         // silently becoming zero would make the model look free, and an
         // under-estimated cost is what lets a request slip into metered spend.
         let mut prices = PriceTable::new();
+        let configured_models: usize = config.prices.values().map(BTreeMap::len).sum();
         let seeded = prices.seed_from_config(&config.prices);
-        if seeded < config.prices.len() {
+        if seeded < configured_models {
             tracing::warn!(
-                skipped = config.prices.len() - seeded,
+                skipped = configured_models - seeded,
                 "ignored configured prices that are not usable"
             );
+        }
+
+        // Restore prices learned in an earlier run. Without this every restart
+        // reverts to the conservative default until the next probe, and that
+        // default was measured against live providers to be off by an order of
+        // magnitude in both directions.
+        match crate::store::open_readonly(&db_path) {
+            Ok(conn) => match crate::store::load_prices(&conn) {
+                Ok(rows) if !rows.is_empty() => {
+                    let n = prices.load_learned(rows);
+                    tracing::info!(count = n, "restored learned prices from disk");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "could not read learned prices"),
+            },
+            Err(e) => tracing::debug!(error = %e, "no price store to read yet"),
         }
 
         let gateway = Arc::new(Gateway {
@@ -190,6 +207,7 @@ impl Gateway {
     /// zero, so an unpriced model can never silently drain a wallet.
     pub fn estimate_cost(
         &self,
+        provider: &str,
         model: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -203,9 +221,10 @@ impl Gateway {
             measured: false,
         };
         if let Ok(prices) = self.prices.lock()
-            && let Some(c) = prices.estimate(model, &usage, multiplier) {
-                return c;
-            }
+            && let Some(c) = prices.estimate(provider, model, &usage, multiplier)
+        {
+            return c;
+        }
         // Nothing known about this model: over-state rather than under-state.
         crate::meter::conservative_estimate(&usage, multiplier)
     }
@@ -409,8 +428,44 @@ impl Gateway {
         };
         for ((_, model), usage) in drained {
             let share = Decimal::from(usage.total_tokens()) / Decimal::from(total_tokens);
-            prices.observe(&model, delta * share, &usage);
+            prices.observe(provider, &model, delta * share, &usage);
         }
+        drop(prices);
+
+        // Surface a model whose observed price no longer matches what was
+        // configured: that is either a real repricing or a quiet one, and both
+        // are worth knowing before the hard gate is sized from the wrong number.
+        self.warn_on_price_drift();
+        self.save_prices();
+    }
+
+    /// Log every model whose observed price has diverged materially from the
+    /// configured expectation.
+    fn warn_on_price_drift(&self) {
+        let Ok(prices) = self.prices.lock() else {
+            return;
+        };
+        for (provider, model, d) in prices.drifted() {
+            tracing::warn!(
+                provider,
+                model,
+                configured_cost = %d.expected,
+                observed_cost = %d.observed,
+                drift_pct = format_args!("{:+.1}%", d.ratio * 100.0),
+                samples = d.samples,
+                "learned price has drifted from the configured price; the upstream \
+                 may have changed its rates"
+            );
+        }
+    }
+
+    /// Persist learned prices so a restart does not fall back to the default.
+    pub fn save_prices(&self) {
+        let rows = match self.prices.lock() {
+            Ok(p) => p.learned_rows(),
+            Err(_) => return,
+        };
+        self.store.save_prices(rows);
     }
 
     /// Persist a request that failed across every attempt.

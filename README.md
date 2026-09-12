@@ -116,10 +116,44 @@ for tests and dry runs and never touches your real keychain.
     ai-gw serve                          start the proxy
     ai-gw status [--refresh]             account board
     ai-gw usage --since 7d --group-by provider,model,account
-    ai-gw accounts list|probe|disable
+    ai-gw prices [--drift-only]          configured price vs the price learned from real spend
+    ai-gw keys add|list|remove|test      provider credentials
+    ai-gw accounts list|probe|disable    account maintenance
     ai-gw tail                           recent requests
     ai-gw doctor                         config, credentials, probe reachability
     ai-gw init                           write an example config
+
+## Prices
+
+The gateway must know what a request costs before it sends it: that estimate is
+what the hard gate compares against the remaining allowance. Two numbers feed it.
+
+**Configured** is what you say a model costs, per provider:
+
+    [prices.xkiro."z-ai/glm-5.3-flash"]
+    prompt_per_million = 0.30
+    completion_per_million = 1.20
+
+**Learned** is what the spend difference between two quota probes says it
+actually costs. Providers apply per-model multipliers, promotions and credit
+rates, so observation is the more trustworthy figure, and it takes over for
+billing as soon as there is one. The configured value is kept unchanged.
+
+    ai-gw prices
+
+    PROVIDER  MODEL                SOURCE     CONFIGURED($/M)  LEARNED($/M)  DRIFT    SAMPLES
+    xkiro     z-ai/glm-5.3-flash   learned    0.3 / 1.2        0.8776        -15.2%   1
+
+That combination is a monitoring tool, not just a display. If the two agree,
+nothing has changed. If they diverge by 20% or more the row is flagged and a
+warning is logged, which means the upstream price is no longer what you were
+told -- a repricing you heard about, or one you did not. `--drift-only` prints
+just those rows.
+
+A model with no configured price and no observation yet is priced at a
+deliberately conservative default, so an unpriced model can never look free.
+
+Learned prices are persisted, so a restart does not fall back to that default.
 
 ## The two pots of money
 

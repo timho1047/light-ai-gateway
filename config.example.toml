@@ -104,7 +104,7 @@ label = "deepseek"
 [routes]
 "deepseek/deepseek-v3.2" = "xkiro"
 "openai/gpt-5.6-sol" = "xkiro"
-"claude/opus-4.8" = "commandcode"
+"claude-opus-4-8" = "commandcode"
 "deepseek/deepseek-chat" = "deepseek"
 
 # Optional escape hatch for name collisions. When set, a client may prefix the
@@ -114,17 +114,32 @@ label = "deepseek"
 # commandcode = "commandcode"
 
 # ---------------------------------------------------------------------------
-# Optional pricing, USD per million tokens.
+# Optional pricing, USD per million tokens, scoped by provider.
 #
-# Models absent here are priced at a deliberately conservative fallback (the
-# rates of a premium frontier model). Under-estimating cost would make the hard
-# gate too permissive and spend real money, so the bias is intentional.
-# The gateway also learns effective per-model prices from the spend difference
-# between consecutive quota probes, which absorbs provider multipliers and
-# promotions automatically.
+# Scoped by provider because the same model name can be billed differently by
+# each: one provider charges list price while another meters against a plan's
+# credit allowance.
+#
+# These prices are a STARTING POINT, not just a fallback. On the first probe
+# that observes real spend for a model, the learned rate takes over for billing,
+# and the configured value is kept unchanged as the expectation to compare
+# against. Run  ai-gw prices  to see the two side by side; a persistent gap means
+# the upstream changed its rates, quietly or otherwise.
+#
+# Models with no entry here and no observation yet are priced at a deliberately
+# conservative fallback. Under-estimating cost makes the hard gate too
+# permissive and spends real money, so the bias is intentional.
 # ---------------------------------------------------------------------------
 
-[prices."deepseek/deepseek-v3.2"]
+[prices.xkiro."deepseek/deepseek-v3.2"]
 prompt_per_million = 0.28
 completion_per_million = 0.42
 cached_prompt_discount = 0.1
+
+# [prices.xkiro."z-ai/glm-5.3-flash"]
+# prompt_per_million = 0.30
+# completion_per_million = 1.20
+#
+# [prices.commandcode."deepseek/deepseek-v4.1-flash"]
+# prompt_per_million = 1.00
+# completion_per_million = 3.00

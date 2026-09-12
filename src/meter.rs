@@ -20,7 +20,7 @@ use crate::config::ModelPriceConfig;
 use crate::domain::TokenUsage;
 use rust_decimal::Decimal;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 /// Fallback prompt price in USD per million tokens, used when a model has no
@@ -81,15 +81,154 @@ impl ModelPrice {
     }
 }
 
-/// Learned price per model.
+/// Where a price came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceSource {
+    /// Set by the operator in the [prices] config table. THE EXPECTATION.
+    Configured,
+    /// Recovered from provider spend deltas. THE OBSERVED REALITY.
+    Learned,
+}
+
+impl PriceSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            PriceSource::Configured => "configured",
+            PriceSource::Learned => "learned",
+        }
+    }
+}
+
+/// One model's pricing under one provider: what was configured, and what was
+/// observed.
+///
+/// These are kept apart on purpose. The configured price is the expectation and
+/// is never overwritten by observation, so the two can be compared forever.
+/// Divergence means the upstream price no longer matches what the operator
+/// agreed to -- a real repricing, or a quiet one.
+#[derive(Debug, Clone, Default)]
+pub struct PriceEntry {
+    pub configured: Option<ModelPrice>,
+    pub learned: Option<ModelPrice>,
+    /// Token volume that produced the learned figure.
+    ///
+    /// Kept because a configured prompt/completion split cannot be compared
+    /// directly against a single blended learned rate: they are different
+    /// shapes. Comparing the two COSTS over the same usage mix is the only fair
+    /// comparison, and for that the mix has to be remembered.
+    pub observed_prompt_tokens: u64,
+    pub observed_completion_tokens: u64,
+    pub observed_cached_tokens: u64,
+}
+
+impl PriceEntry {
+    /// Which price to bill with. Observed reality wins over the expectation.
+    pub fn effective(&self) -> Option<&ModelPrice> {
+        self.learned.as_ref().or(self.configured.as_ref())
+    }
+
+    pub fn source(&self) -> Option<PriceSource> {
+        if self.learned.is_some() {
+            Some(PriceSource::Learned)
+        } else if self.configured.is_some() {
+            Some(PriceSource::Configured)
+        } else {
+            None
+        }
+    }
+
+    /// The usage this entry has accumulated, for drift comparison.
+    pub fn observed_usage(&self) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: self.observed_prompt_tokens,
+            completion_tokens: self.observed_completion_tokens,
+            cached_tokens: self.observed_cached_tokens,
+            reasoning_tokens: 0,
+            measured: true,
+        }
+    }
+}
+
+/// How far the observed price has drifted from the configured expectation.
+#[derive(Debug, Clone, Copy)]
+pub struct PriceDrift {
+    /// What the configured price says the accumulated usage should have cost.
+    pub expected: Decimal,
+    /// What the learned rate says it actually cost.
+    pub observed: Decimal,
+    /// observed / expected - 1. Positive means reality is MORE EXPENSIVE than
+    /// configured, which is the direction that threatens the hard gate.
+    pub ratio: f64,
+    pub samples: u64,
+    /// Whether the divergence is large enough to act on.
+    pub significant: bool,
+}
+
+/// Relative divergence at or above this is reported. Small differences are
+/// normal: the learned rate is a blended approximation, and the configured
+/// split is rounded from a pricing page.
+pub const PRICE_DRIFT_THRESHOLD: f64 = 0.20;
+
+/// A price as it survives a restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedPrice {
+    pub provider: String,
+    pub model: String,
+    pub price: ModelPrice,
+    pub observed_prompt_tokens: u64,
+    pub observed_completion_tokens: u64,
+    pub observed_cached_tokens: u64,
+}
+
+/// Effective prices per (provider, model).
+///
+/// Keyed by provider as well as model because the same model can be billed
+/// differently by different providers: one sells tokens at list price, another
+/// meters them against a plan's credit allowance.
 #[derive(Debug, Clone, Default)]
 pub struct PriceTable {
-    prices: HashMap<String, ModelPrice>,
+    entries: BTreeMap<(String, String), PriceEntry>,
 }
 
 impl PriceTable {
     pub fn new() -> Self {
         PriceTable::default()
+    }
+
+    fn key(provider: &str, model: &str) -> (String, String) {
+        (provider.to_string(), model.to_string())
+    }
+
+    /// Billing price for a model: the learned rate when there is one, otherwise
+    /// the configured price.
+    pub fn effective(&self, provider: &str, model: &str) -> Option<&ModelPrice> {
+        self.entries
+            .get(&Self::key(provider, model))
+            .and_then(PriceEntry::effective)
+    }
+
+    pub fn entry(&self, provider: &str, model: &str) -> Option<&PriceEntry> {
+        self.entries.get(&Self::key(provider, model))
+    }
+
+    /// Every entry, for the prices command.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str, &PriceEntry)> {
+        self.entries
+            .iter()
+            .map(|((p, m), e)| (p.as_str(), m.as_str(), e))
+    }
+
+    pub fn is_known(&self, provider: &str, model: &str) -> bool {
+        self.entries
+            .get(&Self::key(provider, model))
+            .is_some_and(|e| e.effective().is_some())
+    }
+
+    pub fn known_models(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.effective().is_some())
+            .count()
     }
 
     /// Estimated cost of a usage sample. Returns None when the model is
@@ -102,9 +241,15 @@ impl PriceTable {
     ///
     /// Bias: never returns zero for an unknown model. Zero would let a request
     /// through the hard gate for free.
-    pub fn estimate(&self, model: &str, usage: &TokenUsage, multiplier: Decimal) -> Option<Decimal> {
-        let price = self.prices.get(model)?;
-        Some(price.cost(usage, multiplier))
+    pub fn estimate(
+        &self,
+        provider: &str,
+        model: &str,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal> {
+        self.effective(provider, model)
+            .map(|price| price.cost(usage, multiplier))
     }
 
     /// Learn from an observed spend delta.
@@ -129,16 +274,25 @@ impl PriceTable {
     /// a non-zero token delta IS learned, at rate 0 -- that is how free models
     /// such as "laguna-s-2.1-free" end up costing nothing and never trigger a
     /// rotation.
-    pub fn observe(&mut self, model: &str, cost: Decimal, usage: &TokenUsage) {
+    pub fn observe(&mut self, provider: &str, model: &str, cost: Decimal, usage: &TokenUsage) {
         if cost < Decimal::ZERO {
             return;
         }
         let cached = usage.cached_tokens.min(usage.prompt_tokens);
         let uncached = usage.prompt_tokens - cached;
 
-        let previous = self.prices.get(model).copied();
+        let entry = self.entries.entry(Self::key(provider, model)).or_default();
+        // A configured price carries samples == 0 and is only a starting point,
+        // so it is replaced outright by the first real observation rather than
+        // averaged with it. Averaging an expectation into reality would hide
+        // exactly the drift this comparison exists to reveal.
+        let previous = match entry.learned {
+            Some(p) if p.samples > 0 => Some(p),
+            _ => None,
+        };
         let discount = previous
             .map(|p| p.cached_prompt_discount)
+            .or_else(|| entry.configured.map(|p| p.cached_prompt_discount))
             .unwrap_or_else(default_cached_discount);
 
         let weighted = sat_add(
@@ -162,7 +316,7 @@ impl PriceTable {
 
         let prior_samples = previous.map(|p| p.samples).unwrap_or(0);
         let (prompt_per_token, completion_per_token) = match previous {
-            Some(p) if prior_samples > 0 => {
+            Some(p) => {
                 let n = Decimal::from(prior_samples);
                 let weight = n + Decimal::ONE;
                 (
@@ -170,71 +324,210 @@ impl PriceTable {
                     (sat_add(sat_mul(p.completion_per_token, n), observed)) / weight,
                 )
             }
-            _ => (observed, observed),
+            // One equation cannot separate a prompt rate from a completion
+            // rate, so the learned figure is a single blended rate applied to
+            // both. The configured price keeps its own split, which is why the
+            // drift comparison is made on cost rather than on the two rates.
+            None => (observed, observed),
         };
 
-        self.prices.insert(
-            model.to_string(),
-            ModelPrice {
-                prompt_per_token,
-                completion_per_token,
-                cached_prompt_discount: discount,
-                samples: prior_samples.saturating_add(1),
-            },
-        );
+        entry.learned = Some(ModelPrice {
+            prompt_per_token,
+            completion_per_token,
+            cached_prompt_discount: discount,
+            samples: prior_samples.saturating_add(1),
+        });
+        entry.observed_prompt_tokens = entry
+            .observed_prompt_tokens
+            .saturating_add(usage.prompt_tokens);
+        entry.observed_completion_tokens = entry
+            .observed_completion_tokens
+            .saturating_add(usage.completion_tokens);
+        entry.observed_cached_tokens = entry
+            .observed_cached_tokens
+            .saturating_add(cached);
     }
 
     /// Install prices from the [prices] config table (USD per million tokens).
     /// They are priors: `samples` stays 0 until an observation replaces them.
     /// Returns how many models were installed; entries with a non-finite or
     /// negative price are skipped rather than clamped.
-    pub fn seed_from_config(&mut self, prices: &BTreeMap<String, ModelPriceConfig>) -> usize {
+    /// Install prices from the [prices] config table (USD per million tokens).
+    ///
+    /// These are the operator's EXPECTATION and double as the starting point for
+    /// learning: the learned value replaces them on the first observation, while
+    /// the configured value is kept unchanged as the reference for drift.
+    ///
+    /// Returns how many were installed; entries with a non-finite or negative
+    /// price are skipped rather than clamped, because a bad price silently
+    /// becoming zero is the one error that spends money.
+    pub fn seed_from_config(
+        &mut self,
+        prices: &BTreeMap<String, BTreeMap<String, ModelPriceConfig>>,
+    ) -> usize {
         let mut installed = 0;
-        for (model, p) in prices {
-            let (Some(prompt), Some(completion)) = (
-                per_token_from_million(p.prompt_per_million),
-                per_token_from_million(p.completion_per_million),
-            ) else {
-                continue;
-            };
-            let discount = if p.cached_prompt_discount.is_finite()
-                && (0.0..=1.0).contains(&p.cached_prompt_discount)
-            {
-                Decimal::try_from(p.cached_prompt_discount)
-                    .unwrap_or_else(|_| default_cached_discount())
-            } else {
-                default_cached_discount()
-            };
-            self.prices.insert(
-                model.clone(),
-                ModelPrice {
+        for (provider, models) in prices {
+            for (model, p) in models {
+                let (Some(prompt), Some(completion)) = (
+                    per_token_from_million(p.prompt_per_million),
+                    per_token_from_million(p.completion_per_million),
+                ) else {
+                    continue;
+                };
+                let discount = if p.cached_prompt_discount.is_finite()
+                    && (0.0..=1.0).contains(&p.cached_prompt_discount)
+                {
+                    Decimal::try_from(p.cached_prompt_discount)
+                        .unwrap_or_else(|_| default_cached_discount())
+                } else {
+                    default_cached_discount()
+                };
+                let entry = self.entries.entry(Self::key(provider, model)).or_default();
+                entry.configured = Some(ModelPrice {
                     prompt_per_token: prompt,
                     completion_per_token: completion,
                     cached_prompt_discount: discount,
                     samples: 0,
-                },
-            );
-            installed += 1;
+                });
+                installed += 1;
+            }
         }
         installed
     }
 
-    pub fn set(&mut self, model: &str, price: ModelPrice) {
-        self.prices.insert(model.to_string(), price);
+    /// Restore prices learned in an earlier run.
+    ///
+    /// Without this, every restart falls back to the conservative default until
+    /// the next probe, and that default was measured against live providers to
+    /// be off by an order of magnitude in both directions.
+    pub fn load_learned(&mut self, rows: Vec<PersistedPrice>) -> usize {
+        let mut loaded = 0;
+        for row in rows {
+            if row.model.is_empty() || row.provider.is_empty() {
+                continue;
+            }
+            let entry = self
+                .entries
+                .entry(Self::key(&row.provider, &row.model))
+                .or_default();
+            entry.learned = Some(row.price);
+            entry.observed_prompt_tokens = row.observed_prompt_tokens;
+            entry.observed_completion_tokens = row.observed_completion_tokens;
+            entry.observed_cached_tokens = row.observed_cached_tokens;
+            loaded += 1;
+        }
+        loaded
     }
 
-    pub fn get(&self, model: &str) -> Option<&ModelPrice> {
-        self.prices.get(model)
+    /// Everything worth persisting: learned rates and the usage behind them.
+    /// Configured prices come from the config file and are not stored here.
+    pub fn learned_rows(&self) -> Vec<PersistedPrice> {
+        self.entries
+            .iter()
+            .filter_map(|((provider, model), e)| {
+                let price = e.learned?;
+                Some(PersistedPrice {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    price,
+                    observed_prompt_tokens: e.observed_prompt_tokens,
+                    observed_completion_tokens: e.observed_completion_tokens,
+                    observed_cached_tokens: e.observed_cached_tokens,
+                })
+            })
+            .collect()
     }
 
-    /// Whether this model has any price at all (learned, configured, or seeded).
-    pub fn is_known(&self, model: &str) -> bool {
-        self.prices.contains_key(model)
+    pub fn set(&mut self, provider: &str, model: &str, price: ModelPrice) {
+        self.entries
+            .entry(Self::key(provider, model))
+            .or_default()
+            .learned = Some(price);
     }
 
-    pub fn known_models(&self) -> usize {
-        self.prices.len()
+    pub fn get(&self, provider: &str, model: &str) -> Option<&ModelPrice> {
+        self.effective(provider, model)
     }
+
+    /// How far reality has diverged from the configured expectation.
+    ///
+    /// None when either side is missing: with no configured price there is
+    /// nothing to compare against, and with no observation there is no reality
+    /// yet.
+    pub fn drift(&self, provider: &str, model: &str) -> Option<PriceDrift> {
+        let entry = self.entries.get(&Self::key(provider, model))?;
+        let configured = entry.configured?;
+        let learned = entry.learned.filter(|p| p.samples > 0)?;
+        let usage = entry.observed_usage();
+        if usage.total_tokens() == 0 {
+            return None;
+        }
+
+        let expected = configured.cost(&usage, Decimal::ONE);
+        if expected <= Decimal::ZERO {
+            return None;
+        }
+        let weighted = weighted_tokens(&usage, learned.cached_prompt_discount);
+        let observed = sat_mul(learned.prompt_per_token, weighted);
+
+        let ratio = {
+            use rust_decimal::prelude::ToPrimitive;
+            let e = expected.to_f64().unwrap_or(0.0);
+            let o = observed.to_f64().unwrap_or(0.0);
+            if e > 0.0 { (o / e) - 1.0 } else { 0.0 }
+        };
+
+        Some(PriceDrift {
+            expected,
+            observed,
+            ratio,
+            samples: learned.samples,
+            significant: ratio.abs() >= PRICE_DRIFT_THRESHOLD,
+        })
+    }
+
+    /// Every entry whose observed price has drifted materially from the
+    /// configured one, worst first. This is the list an operator actually wants:
+    /// each row is a model that no longer costs what they were told.
+    pub fn drifted(&self) -> Vec<(String, String, PriceDrift)> {
+        let mut out: Vec<(String, String, PriceDrift)> = self
+            .entries
+            .keys()
+            .filter_map(|(provider, model)| {
+                let d = self.drift(provider, model)?;
+                if d.significant {
+                    Some((provider.clone(), model.clone(), d))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.2.ratio
+                .abs()
+                .partial_cmp(&a.2.ratio.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
+    }
+}
+
+/// Tokens weighted by how much they actually cost.
+///
+/// Cached prompt tokens are billed at a fraction of the uncached rate, so a raw
+/// token count cannot be divided into a spend delta. This is the denominator
+/// that can: uncached prompt tokens at full weight, cached at the discount, and
+/// completion tokens at full weight.
+fn weighted_tokens(usage: &TokenUsage, cached_discount: Decimal) -> Decimal {
+    let cached = usage.cached_tokens.min(usage.prompt_tokens);
+    let uncached = usage.prompt_tokens - cached;
+    sat_add(
+        Decimal::from(uncached),
+        sat_add(
+            sat_mul(Decimal::from(cached), cached_discount),
+            Decimal::from(usage.completion_tokens),
+        ),
+    )
 }
 
 /// Deliberately conservative cost for a model we know nothing about.
@@ -501,6 +794,9 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
+    /// Provider used by every price test. Prices are keyed by (provider, model).
+    const P: &str = "prov";
+
     fn price(prompt: i64, completion: i64, discount_scale: u32) -> ModelPrice {
         ModelPrice {
             prompt_per_token: Decimal::new(prompt, 6),
@@ -523,13 +819,13 @@ mod tests {
     #[test]
     fn cached_prompt_token_costs_less_than_an_uncached_one() {
         let mut table = PriceTable::new();
-        table.set("m", price(3, 15, 1)); // $3 / $15 per million
+        table.set(P, "m", price(3, 15, 1)); // $3 / $15 per million
 
         let uncached = table
-            .estimate("m", &usage(1_000, 0, 0), Decimal::ONE)
+            .estimate(P, "m", &usage(1_000, 0, 0), Decimal::ONE)
             .unwrap();
         let cached = table
-            .estimate("m", &usage(1_000, 0, 1_000), Decimal::ONE)
+            .estimate(P, "m", &usage(1_000, 0, 1_000), Decimal::ONE)
             .unwrap();
 
         assert!(
@@ -544,9 +840,9 @@ mod tests {
     #[test]
     fn completion_tokens_are_priced_at_the_completion_rate() {
         let mut table = PriceTable::new();
-        table.set("m", price(3, 15, 1));
+        table.set(P, "m", price(3, 15, 1));
         let cost = table
-            .estimate("m", &usage(0, 1_000, 0), Decimal::ONE)
+            .estimate(P, "m", &usage(0, 1_000, 0), Decimal::ONE)
             .unwrap();
         assert_eq!(cost, Decimal::new(15, 3)); // 1000 * 0.000015
     }
@@ -554,24 +850,24 @@ mod tests {
     #[test]
     fn credit_multiplier_is_applied_to_the_whole_cost() {
         let mut table = PriceTable::new();
-        table.set("m", price(3, 15, 1));
+        table.set(P, "m", price(3, 15, 1));
         let u = usage(1_000, 1_000, 0);
 
-        let one = table.estimate("m", &u, Decimal::ONE).unwrap();
-        let four = table.estimate("m", &u, Decimal::from(4)).unwrap();
+        let one = table.estimate(P, "m", &u, Decimal::ONE).unwrap();
+        let four = table.estimate(P, "m", &u, Decimal::from(4)).unwrap();
         assert_eq!(four, one * Decimal::from(4));
 
         // A zero or negative multiplier must not make a request look free.
-        assert_eq!(table.estimate("m", &u, Decimal::ZERO).unwrap(), one);
-        assert_eq!(table.estimate("m", &u, Decimal::NEGATIVE_ONE).unwrap(), one);
+        assert_eq!(table.estimate(P, "m", &u, Decimal::ZERO).unwrap(), one);
+        assert_eq!(table.estimate(P, "m", &u, Decimal::NEGATIVE_ONE).unwrap(), one);
     }
 
     #[test]
     fn unknown_model_estimates_none_not_zero() {
         let table = PriceTable::new();
         let u = usage(5_000, 500, 0);
-        assert_eq!(table.estimate("nobody/knows-this", &u, Decimal::ONE), None);
-        assert!(!table.is_known("nobody/knows-this"));
+        assert_eq!(table.estimate(P, "nobody/knows-this", &u, Decimal::ONE), None);
+        assert!(!table.is_known(P, "nobody/knows-this"));
         // ... and the explicit fallback is strictly positive, never free.
         assert!(conservative_estimate(&u, Decimal::ONE) > Decimal::ZERO);
     }
@@ -579,10 +875,10 @@ mod tests {
     #[test]
     fn conservative_estimate_is_above_a_plausible_real_price() {
         let mut table = PriceTable::new();
-        table.set("m", price(3, 15, 1));
+        table.set(P, "m", price(3, 15, 1));
         let u = usage(10_000, 1_000, 0);
         let fallback = conservative_estimate(&u, Decimal::ONE);
-        let real = table.estimate("m", &u, Decimal::ONE).unwrap();
+        let real = table.estimate(P, "m", &u, Decimal::ONE).unwrap();
         assert!(
             fallback > real,
             "the unknown-model fallback ({fallback}) must over-estimate the known price ({real})"
@@ -593,15 +889,15 @@ mod tests {
     fn observe_learns_the_effective_rate_from_a_delta() {
         let mut table = PriceTable::new();
         // Ten cents of delta spend over 1000 prompt + 1000 completion tokens.
-        table.observe("m", Decimal::new(10, 2), &usage(1_000, 1_000, 0));
+        table.observe(P, "m", Decimal::new(10, 2), &usage(1_000, 1_000, 0));
 
-        let learned = table.get("m").unwrap();
+        let learned = table.get(P, "m").unwrap();
         assert_eq!(learned.samples, 1);
         assert_eq!(learned.prompt_per_token, Decimal::new(5, 5)); // 0.10 / 2000
         assert_eq!(learned.completion_per_token, Decimal::new(5, 5));
         // Replaying the same delta through the learned rate returns the same cost.
         let cost = table
-            .estimate("m", &usage(1_000, 1_000, 0), Decimal::ONE)
+            .estimate(P, "m", &usage(1_000, 1_000, 0), Decimal::ONE)
             .unwrap();
         assert_eq!(cost, Decimal::new(10, 2));
     }
@@ -610,9 +906,9 @@ mod tests {
     fn observe_weights_cached_tokens_by_the_discount() {
         let mut table = PriceTable::new();
         // All 1000 prompt tokens were cache reads: weight = 1000 * 0.1 = 100.
-        table.observe("m", Decimal::new(1, 2), &usage(1_000, 0, 1_000));
+        table.observe(P, "m", Decimal::new(1, 2), &usage(1_000, 0, 1_000));
         assert_eq!(
-            table.get("m").unwrap().prompt_per_token,
+            table.get(P, "m").unwrap().prompt_per_token,
             Decimal::new(1, 4) // 0.01 / 100
         );
     }
@@ -620,14 +916,14 @@ mod tests {
     #[test]
     fn observe_averages_repeated_observations() {
         let mut table = PriceTable::new();
-        table.observe("m", Decimal::from(1), &usage(1_000, 0, 0)); // rate 0.001
-        table.observe("m", Decimal::from(3), &usage(1_000, 0, 0)); // rate 0.003
-        let learned = table.get("m").unwrap();
+        table.observe(P, "m", Decimal::from(1), &usage(1_000, 0, 0)); // rate 0.001
+        table.observe(P, "m", Decimal::from(3), &usage(1_000, 0, 0)); // rate 0.003
+        let learned = table.get(P, "m").unwrap();
         assert_eq!(learned.samples, 2);
         assert_eq!(learned.prompt_per_token, Decimal::new(2, 3)); // mean 0.002
         assert_eq!(
             table
-                .estimate("m", &usage(1_000, 0, 0), Decimal::ONE)
+                .estimate(P, "m", &usage(1_000, 0, 0), Decimal::ONE)
                 .unwrap(),
             Decimal::from(2)
         );
@@ -638,13 +934,13 @@ mod tests {
         // DESIGN section 3: free models must fall out as a zero rate so they
         // never look like they are burning quota.
         let mut table = PriceTable::new();
-        table.observe("laguna-s-2.1-free", Decimal::ZERO, &usage(500, 100, 0));
-        let learned = table.get("laguna-s-2.1-free").unwrap();
+        table.observe(P, "laguna-s-2.1-free", Decimal::ZERO, &usage(500, 100, 0));
+        let learned = table.get(P, "laguna-s-2.1-free").unwrap();
         assert_eq!(learned.samples, 1);
         assert_eq!(learned.prompt_per_token, Decimal::ZERO);
         assert_eq!(
             table
-                .estimate("laguna-s-2.1-free", &usage(500, 100, 0), Decimal::ONE)
+                .estimate(P, "laguna-s-2.1-free", &usage(500, 100, 0), Decimal::ONE)
                 .unwrap(),
             Decimal::ZERO
         );
@@ -653,15 +949,15 @@ mod tests {
     #[test]
     fn observe_ignores_an_interval_with_no_traffic_or_negative_cost() {
         let mut table = PriceTable::new();
-        table.observe("m", Decimal::from(1), &usage(0, 0, 0));
-        table.observe("m", Decimal::NEGATIVE_ONE, &usage(10, 10, 0));
+        table.observe(P, "m", Decimal::from(1), &usage(0, 0, 0));
+        table.observe(P, "m", Decimal::NEGATIVE_ONE, &usage(10, 10, 0));
         assert_eq!(table.known_models(), 0);
     }
 
     #[test]
     fn observe_rejects_an_implausible_rate() {
         let mut table = PriceTable::new();
-        table.observe("m", Decimal::from(1_000_000), &usage(1, 0, 0));
+        table.observe(P, "m", Decimal::from(1_000_000), &usage(1, 0, 0));
         assert_eq!(
             table.known_models(),
             0,
@@ -671,8 +967,8 @@ mod tests {
 
     #[test]
     fn config_seeded_priors_are_used_and_replaced_by_the_first_observation() {
-        let mut prices = BTreeMap::new();
-        prices.insert(
+        let mut prices: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        prices.entry(P.to_string()).or_default().insert(
             "m".to_string(),
             ModelPriceConfig {
                 prompt_per_million: 3.0,
@@ -683,26 +979,27 @@ mod tests {
 
         let mut table = PriceTable::new();
         assert_eq!(table.seed_from_config(&prices), 1);
-        assert!(table.is_known("m"));
+        assert!(table.is_known(P, "m"));
         assert!(
-            !table.get("m").unwrap().is_usable(),
+            !table.get(P, "m").unwrap().is_usable(),
             "a configured prior has samples = 0"
         );
         assert_eq!(
-            table.estimate("m", &usage(1_000_000, 0, 0), Decimal::ONE),
+            table.estimate(P, "m", &usage(1_000_000, 0, 0), Decimal::ONE),
             Some(Decimal::from(3))
         );
 
         // The first real observation replaces the prior outright.
-        table.observe("m", Decimal::new(5, 2), &usage(1_000, 0, 0));
-        assert_eq!(table.get("m").unwrap().samples, 1);
-        assert_eq!(table.get("m").unwrap().prompt_per_token, Decimal::new(5, 5));
+        table.observe(P, "m", Decimal::new(5, 2), &usage(1_000, 0, 0));
+        assert_eq!(table.get(P, "m").unwrap().samples, 1);
+        assert_eq!(table.get(P, "m").unwrap().prompt_per_token, Decimal::new(5, 5));
     }
 
     #[test]
     fn config_seeded_priors_skip_broken_prices() {
-        let mut prices = BTreeMap::new();
-        prices.insert(
+        let mut prices: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        let models = prices.entry(P.to_string()).or_default();
+        models.insert(
             "bad".to_string(),
             ModelPriceConfig {
                 prompt_per_million: f64::NAN,
@@ -710,7 +1007,7 @@ mod tests {
                 cached_prompt_discount: 0.1,
             },
         );
-        prices.insert(
+        models.insert(
             "negative".to_string(),
             ModelPriceConfig {
                 prompt_per_million: -1.0,
@@ -720,7 +1017,126 @@ mod tests {
         );
         let mut table = PriceTable::new();
         assert_eq!(table.seed_from_config(&prices), 0);
-        assert_eq!(table.estimate("bad", &usage(1, 1, 0), Decimal::ONE), None);
+        assert_eq!(table.estimate(P, "bad", &usage(1, 1, 0), Decimal::ONE), None);
+    }
+
+    #[test]
+    fn learned_prices_survive_a_round_trip() {
+        let mut table = PriceTable::new();
+        table.observe(P, "m", Decimal::new(5, 2), &usage(1_000, 500, 100));
+        assert_eq!(table.learned_rows().len(), 1);
+
+        // A fresh table restores what the first one learned.
+        let mut restored = PriceTable::new();
+        assert_eq!(restored.load_learned(table.learned_rows()), 1);
+        assert_eq!(
+            restored.get(P, "m").unwrap().prompt_per_token,
+            table.get(P, "m").unwrap().prompt_per_token
+        );
+        assert_eq!(restored.get(P, "m").unwrap().samples, 1);
+        // The usage behind the rate comes back too, so drift stays comparable.
+        let entry = restored.entry(P, "m").unwrap();
+        assert_eq!(entry.observed_prompt_tokens, 1_000);
+        assert_eq!(entry.observed_completion_tokens, 500);
+        assert_eq!(entry.observed_cached_tokens, 100);
+    }
+
+    #[test]
+    fn a_model_with_no_configured_price_has_nothing_to_drift_from() {
+        let mut table = PriceTable::new();
+        table.observe(P, "m", Decimal::from(1), &usage(1_000, 0, 0));
+        assert!(table.drift(P, "m").is_none());
+        assert!(table.drifted().is_empty());
+    }
+
+    #[test]
+    fn drift_is_reported_only_when_reality_moves_away_from_the_configured_price() {
+        let mut prices: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        prices.entry(P.to_string()).or_default().insert(
+            "m".to_string(),
+            ModelPriceConfig {
+                prompt_per_million: 3.0,
+                completion_per_million: 15.0,
+                cached_prompt_discount: 0.1,
+            },
+        );
+
+        // Reality matches the expectation: 1M prompt tokens at $3/M.
+        let mut table = PriceTable::new();
+        table.seed_from_config(&prices);
+        table.observe(P, "m", Decimal::from(3), &usage(1_000_000, 0, 0));
+        let d = table.drift(P, "m").expect("drift needs both sides");
+        assert!(
+            d.ratio.abs() < 0.01,
+            "a matching price must not look like drift, got {:+.1}%",
+            d.ratio * 100.0
+        );
+        assert!(!d.significant);
+        assert!(table.drifted().is_empty());
+
+        // Now double the observed spend for the same tokens: +100%.
+        let mut table = PriceTable::new();
+        table.seed_from_config(&prices);
+        table.observe(P, "m", Decimal::from(6), &usage(1_000_000, 0, 0));
+        let d = table.drift(P, "m").unwrap();
+        assert!((d.ratio - 1.0).abs() < 0.01, "got {:+.1}%", d.ratio * 100.0);
+        assert!(d.significant, "a doubling must be reported");
+        assert_eq!(d.expected, Decimal::from(3));
+        assert_eq!(d.observed, Decimal::from(6));
+
+        let all = table.drifted();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, P);
+        assert_eq!(all[0].1, "m");
+    }
+
+    #[test]
+    fn a_configured_price_is_a_starting_point_not_a_permanent_answer() {
+        let mut prices: BTreeMap<String, BTreeMap<String, ModelPriceConfig>> = BTreeMap::new();
+        prices.entry(P.to_string()).or_default().insert(
+            "m".to_string(),
+            ModelPriceConfig {
+                prompt_per_million: 3.0,
+                completion_per_million: 15.0,
+                cached_prompt_discount: 0.1,
+            },
+        );
+        let mut table = PriceTable::new();
+        table.seed_from_config(&prices);
+
+        // Until something is observed, the configured split is billed.
+        assert_eq!(
+            table.estimate(P, "m", &usage(1_000_000, 0, 0), Decimal::ONE),
+            Some(Decimal::from(3))
+        );
+        assert_eq!(table.entry(P, "m").unwrap().source().map(|s| s.label()), Some("configured"));
+
+        // After one observation the learned rate takes over for billing...
+        table.observe(P, "m", Decimal::from(9), &usage(1_000_000, 0, 0));
+        assert_eq!(table.entry(P, "m").unwrap().source().map(|s| s.label()), Some("learned"));
+        assert_eq!(
+            table.estimate(P, "m", &usage(1_000_000, 0, 0), Decimal::ONE),
+            Some(Decimal::from(9))
+        );
+        // ...while the configured expectation stays put as the reference.
+        let entry = table.entry(P, "m").unwrap();
+        assert_eq!(
+            entry.configured.unwrap().prompt_per_token,
+            Decimal::new(3, 6)
+        );
+    }
+
+    #[test]
+    fn prices_are_scoped_per_provider() {
+        let mut table = PriceTable::new();
+        table.observe("cheap", "m", Decimal::from(1), &usage(1_000, 0, 0));
+        table.observe("dear", "m", Decimal::from(10), &usage(1_000, 0, 0));
+        assert_ne!(
+            table.get("cheap", "m").unwrap().prompt_per_token,
+            table.get("dear", "m").unwrap().prompt_per_token,
+            "the same model name must not share one price across providers"
+        );
+        assert_eq!(table.known_models(), 2);
     }
 
     #[test]
@@ -939,14 +1355,14 @@ mod tests {
     #[test]
     fn learned_price_drives_the_full_cost_model() {
         let mut table = PriceTable::new();
-        table.observe("m", Decimal::new(1, 2), &usage(2_000, 0, 0)); // 0.000005/token
+        table.observe(P, "m", Decimal::new(1, 2), &usage(2_000, 0, 0)); // 0.000005/token
         assert_eq!(
-            table.get("m").unwrap().prompt_per_token,
+            table.get(P, "m").unwrap().prompt_per_token,
             Decimal::new(5, 6)
         );
 
         let cost = table
-            .estimate("m", &usage(1_000, 1_000, 1_000), Decimal::from(2))
+            .estimate(P, "m", &usage(1_000, 1_000, 1_000), Decimal::from(2))
             .unwrap();
         // (0 uncached + 1000 cached * 0.1 + 1000 completion) * 5e-6 * 2 = 0.011
         assert_eq!(cost, Decimal::new(11, 3));

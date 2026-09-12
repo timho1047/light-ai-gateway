@@ -150,6 +150,25 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     PRIMARY KEY (day, provider, account_id, model)
 );
 
+-- Prices recovered from provider spend, one row per (provider, model).
+-- Persisted so a restart does not fall back to the conservative default, which
+-- was measured against live providers to be off by an order of magnitude in
+-- both directions. The token columns are the usage the learned rate was derived
+-- from, needed to compare it against the configured price over the same mix.
+CREATE TABLE IF NOT EXISTS prices (
+    provider                  TEXT    NOT NULL,
+    model                     TEXT    NOT NULL,
+    prompt_per_token          TEXT    NOT NULL,
+    completion_per_token      TEXT    NOT NULL,
+    cached_prompt_discount    TEXT    NOT NULL,
+    samples                   INTEGER NOT NULL,
+    observed_prompt_tokens    INTEGER NOT NULL DEFAULT 0,
+    observed_completion_tokens INTEGER NOT NULL DEFAULT 0,
+    observed_cached_tokens    INTEGER NOT NULL DEFAULT 0,
+    updated_at                INTEGER NOT NULL,
+    PRIMARY KEY (provider, model)
+);
+
 CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_account  ON requests(account_id);
 CREATE INDEX IF NOT EXISTS idx_requests_session  ON requests(session_key);
@@ -164,7 +183,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_daily_day   ON usage_daily(day);
 /// written under the old key cannot be attributed to a provider, so the account
 /// and gate tables are rebuilt rather than guessed at. Usage history already
 /// carried provider and is preserved.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
+
+/// The version at which account identity changed from id alone to
+/// (provider, id). Only a database older than THIS needs the rebuild; later
+/// versions are additive and must not wipe the ledger.
+const IDENTITY_CHANGE_VERSION: i64 = 2;
 
 fn schema_version(conn: &Connection) -> Result<i64> {
     conn.execute(
@@ -201,7 +225,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
     let version = schema_version(conn)?;
 
-    if existing_accounts && version < SCHEMA_VERSION {
+    if existing_accounts && version < IDENTITY_CHANGE_VERSION {
         // Accounts written before version 2 were keyed by the bare account id,
         // so two providers sharing an id are indistinguishable in them and the
         // rows cannot be attributed with certainty. Rebuild rather than guess:
@@ -266,6 +290,8 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
 /// Messages accepted by the writer task.
 #[derive(Debug)]
 pub enum WriteMsg {
+    /// Replace the learned price table.
+    Prices(Vec<crate::meter::PersistedPrice>),
     Request(Box<RequestRecord>),
     Attempt(Box<AttemptRecord>),
     Accounts(Vec<Account>),
@@ -318,6 +344,13 @@ impl StoreHandle {
             .is_err()
         {
             tracing::warn!("store writer is gone; dropping account ledger snapshot");
+        }
+    }
+
+    /// Persist learned prices. Sent after every probe that learned something.
+    pub fn save_prices(&self, prices: Vec<crate::meter::PersistedPrice>) {
+        if self.tx.send(WriteMsg::Prices(prices)).is_err() {
+            tracing::warn!("store writer is gone; dropping learned prices");
         }
     }
 
@@ -387,6 +420,7 @@ fn apply_batch(conn: &mut Connection, batch: Vec<WriteMsg>) {
             WriteMsg::Request(r) => insert_request(&tx, r),
             WriteMsg::Attempt(a) => insert_attempt(&tx, a),
             WriteMsg::Accounts(accounts) => save_accounts_tx(&tx, accounts),
+            WriteMsg::Prices(prices) => save_prices_tx(&tx, prices),
             WriteMsg::Flush(ack) => {
                 flushes.push(ack.clone());
                 Ok(())
@@ -519,6 +553,95 @@ fn insert_attempt(tx: &Transaction<'_>, a: &AttemptRecord) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Replace the learned price table.
+///
+/// Wholesale rather than incremental: the in-memory table is the source of
+/// truth and a price that disappeared there must not linger here.
+fn save_prices_tx(tx: &Transaction<'_>, prices: &[crate::meter::PersistedPrice]) -> Result<()> {
+    let updated_at = OffsetDateTime::now_utc().unix_timestamp();
+    tx.execute("DELETE FROM prices", [])?;
+    for p in prices {
+        tx.execute(
+            "INSERT OR REPLACE INTO prices (
+                 provider, model, prompt_per_token, completion_per_token,
+                 cached_prompt_discount, samples, observed_prompt_tokens,
+                 observed_completion_tokens, observed_cached_tokens, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                p.provider,
+                p.model,
+                dec_str(p.price.prompt_per_token),
+                dec_str(p.price.completion_per_token),
+                dec_str(p.price.cached_prompt_discount),
+                p.price.samples as i64,
+                p.observed_prompt_tokens as i64,
+                p.observed_completion_tokens as i64,
+                p.observed_cached_tokens as i64,
+                updated_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Read the learned price table back.
+pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice>> {
+    use crate::meter::{ModelPrice, PersistedPrice};
+
+    /// provider, model, prompt, completion, discount, samples, prompt_tok, completion_tok, cached_tok
+    type PriceRowTuple = (String, String, String, String, String, i64, i64, i64, i64);
+    let rows: Vec<PriceRowTuple> = {
+        let mut stmt = conn.prepare(
+            "SELECT provider, model, prompt_per_token, completion_per_token,
+                    cached_prompt_discount, samples, observed_prompt_tokens,
+                    observed_completion_tokens, observed_cached_tokens
+             FROM prices ORDER BY provider, model",
+        )?;
+        let mapped = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (provider, model, prompt, completion, discount, samples, p_tok, c_tok, cached_tok) in rows {
+        // A row we cannot parse is skipped, never defaulted: a price that
+        // silently became zero would make a paid model look free.
+        let (Some(prompt), Some(completion), Some(discount)) = (
+            crate::domain::parse_money(&prompt),
+            crate::domain::parse_money(&completion),
+            crate::domain::parse_money(&discount),
+        ) else {
+            tracing::warn!(provider = %provider, model = %model, "store: unreadable price row; skipping");
+            continue;
+        };
+        out.push(PersistedPrice {
+            provider,
+            model,
+            price: ModelPrice {
+                prompt_per_token: prompt,
+                completion_per_token: completion,
+                cached_prompt_discount: discount,
+                samples: samples.max(0) as u64,
+            },
+            observed_prompt_tokens: p_tok.max(0) as u64,
+            observed_completion_tokens: c_tok.max(0) as u64,
+            observed_cached_tokens: cached_tok.max(0) as u64,
+        });
+    }
+    Ok(out)
 }
 
 /// Upsert accounts and replace their gates, all inside the caller transaction
@@ -1202,6 +1325,77 @@ mod tests {
             "the other provider's gates overwrote this one"
         );
         assert_eq!(cc_row.gates[0].used, dec("1.0"));
+    }
+
+    /// Learned prices must survive a restart: without them every start falls
+    /// back to the conservative default, which was measured against live
+    /// providers to be off by an order of magnitude in both directions.
+    #[test]
+    fn learned_prices_round_trip_through_the_writer() {
+        let tmp = TempDb::new("prices");
+        let handle = StoreHandle::spawn(&tmp.path).expect("spawn writer");
+
+        let rows = vec![
+            crate::meter::PersistedPrice {
+                provider: "xkiro".to_string(),
+                model: "z-ai/glm-5.3-flash".to_string(),
+                price: crate::meter::ModelPrice {
+                    prompt_per_token: dec("0.0000004"),
+                    completion_per_token: dec("0.0000012"),
+                    cached_prompt_discount: dec("0.1"),
+                    samples: 7,
+                },
+                observed_prompt_tokens: 1_234,
+                observed_completion_tokens: 567,
+                observed_cached_tokens: 89,
+            },
+            crate::meter::PersistedPrice {
+                provider: "commandcode".to_string(),
+                model: "z-ai/glm-5.3-flash".to_string(),
+                price: crate::meter::ModelPrice {
+                    prompt_per_token: dec("0.0000041"),
+                    completion_per_token: dec("0.0000041"),
+                    cached_prompt_discount: dec("0.1"),
+                    samples: 2,
+                },
+                observed_prompt_tokens: 43,
+                observed_completion_tokens: 25,
+                observed_cached_tokens: 0,
+            },
+        ];
+        handle.save_prices(rows.clone());
+        handle.flush_blocking().expect("flush");
+
+        let conn = open(&tmp.path).expect("reopen");
+        let loaded = load_prices(&conn).expect("load_prices");
+        assert_eq!(loaded.len(), 2, "got {loaded:?}");
+
+        // Same model name under two providers must stay two rows.
+        let xk = loaded.iter().find(|p| p.provider == "xkiro").unwrap();
+        assert_eq!(xk.model, "z-ai/glm-5.3-flash");
+        assert_eq!(xk.price.samples, 7);
+        assert_eq!(
+            xk.price.prompt_per_token,
+            dec("0.0000004"),
+            "Decimal precision must survive"
+        );
+        assert_eq!(xk.observed_prompt_tokens, 1_234);
+        assert_eq!(xk.observed_completion_tokens, 567);
+        assert_eq!(xk.observed_cached_tokens, 89);
+
+        let cc = loaded.iter().find(|p| p.provider == "commandcode").unwrap();
+        assert_eq!(cc.price.samples, 2);
+        assert_ne!(
+            cc.price.prompt_per_token, xk.price.prompt_per_token,
+            "providers must not share a price"
+        );
+
+        // Saving again replaces wholesale rather than accumulating.
+        handle.save_prices(vec![rows[0].clone()]);
+        handle.flush_blocking().expect("flush");
+        let conn = open(&tmp.path).expect("reopen");
+        let after = load_prices(&conn).expect("load_prices");
+        assert_eq!(after.len(), 1, "a removed price must not linger: {after:?}");
     }
 
     #[test]

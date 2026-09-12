@@ -366,9 +366,19 @@ pub struct Config {
     /// for "xkiro/deepseek/deepseek-v3.2". Disabled when empty.
     #[serde(default)]
     pub provider_prefix_aliases: BTreeMap<String, String>,
-    /// model name -> price, in USD per million tokens.
+    /// provider -> model -> price, in USD per million tokens.
+    ///
+    /// Scoped by provider because the same model name can be billed differently
+    /// by each: one provider sells tokens at list price while another meters
+    /// them against a plan's credit allowance.
+    ///
+    /// ```toml
+    /// [prices.xkiro."z-ai/glm-5.3-flash"]
+    /// prompt_per_million = 0.28
+    /// completion_per_million = 0.42
+    /// ```
     #[serde(default)]
-    pub prices: BTreeMap<String, ModelPriceConfig>,
+    pub prices: BTreeMap<ProviderId, BTreeMap<String, ModelPriceConfig>>,
 }
 
 /// A resolved routing decision.
@@ -454,6 +464,17 @@ impl Config {
         for (alias, provider) in &self.provider_prefix_aliases {
             if !self.providers.contains_key(provider) {
                 bail!("provider_prefix_aliases {alias} points at unknown provider {provider}");
+            }
+        }
+
+        for (provider, models) in &self.prices {
+            if !self.providers.contains_key(provider) {
+                bail!("[prices.{provider}] names an unknown provider");
+            }
+            for model in models.keys() {
+                if model.trim().is_empty() {
+                    bail!("[prices.{provider}] has an empty model name");
+                }
             }
         }
 
