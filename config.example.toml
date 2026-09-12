@@ -8,7 +8,8 @@
 listen = "127.0.0.1:8787"
 db_path = "~/.light-ai-gateway/gateway.db"
 # Strongly recommended. Without it any local process can spend your quota.
-# local_key = { env = "AI_GW_LOCAL_KEY" }
+# The value is a token you invent; register it with: ai-gw keys add local gateway
+# local_key = { keychain = true }
 
 [policy]
 # Soft threshold: accounts at or above this stop taking NEW sessions but keep
@@ -49,12 +50,26 @@ adapter = "xkiro"
 base_url = "https://api.xkiro.com/v1"
 currency = "USD"
 
+# Accounts need no key here. Omitting it means "read from the OS credential
+# store", which you fill in once:
+#
+#     ai-gw keys add xkiro acc-1
+#
+# The key is handed to the operating system's own credential store (macOS
+# Keychain, Windows Credential Manager, freedesktop Secret Service), so it is
+# never written to a file in plaintext and you never prepare an environment
+# variable before starting.
+#
+# If you would rather be explicit, these also work:
+#     key = { keychain = true }
+#     key = { env = "XKIRO_KEY_1" }
+#     key = { key_file = "/run/secrets/xkiro-1" }
+#     key = "sk-literal-not-recommended"
+
 [providers.xkiro.accounts.acc-1]
-key = { env = "XKIRO_KEY_1" }
 label = "xkiro primary"
 
 [providers.xkiro.accounts.acc-2]
-key = { env = "XKIRO_KEY_2" }
 label = "xkiro secondary"
 
 [providers.commandcode]
@@ -66,7 +81,6 @@ probe_base_url = "https://api.commandcode.ai"
 currency = "USD"
 
 [providers.commandcode.accounts.acc-1]
-key = { env = "COMMANDCODE_KEY_1" }
 label = "command code"
 
 [providers.deepseek]
@@ -77,7 +91,6 @@ probe_base_url = "https://api.deepseek.com"
 currency = "USD"
 
 [providers.deepseek.accounts.main]
-key = { env = "DEEPSEEK_KEY" }
 label = "deepseek"
 
 # ---------------------------------------------------------------------------

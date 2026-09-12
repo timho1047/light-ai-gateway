@@ -12,6 +12,7 @@ pub mod meter;
 pub mod proxy;
 pub mod quota;
 pub mod router;
+pub mod secrets;
 pub mod sse;
 pub mod store;
 

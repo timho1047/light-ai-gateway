@@ -39,6 +39,9 @@ pub enum SecretRef {
     Env { env: String },
     /// Read from a file (mode 0600 recommended).
     File { key_file: String },
+    /// Read from the operating system credential store, registered with
+    /// ai-gw keys add. This is the recommended form.
+    Keychain,
     /// Inline literal. Supported but discouraged.
     Literal(String),
 }
@@ -54,6 +57,9 @@ impl<'de> Deserialize<'de> for SecretRef {
             env: Option<String>,
             #[serde(default)]
             key_file: Option<String>,
+            /// key = { keychain = true }
+            #[serde(default)]
+            keychain: Option<bool>,
         }
 
         #[derive(Deserialize)]
@@ -66,13 +72,15 @@ impl<'de> Deserialize<'de> for SecretRef {
         match Repr::deserialize(deserializer)? {
             Repr::Literal(s) => Ok(SecretRef::Literal(s)),
             Repr::Table(t) => {
-                if let Some(env) = t.env {
+                if t.keychain == Some(true) {
+                    Ok(SecretRef::Keychain)
+                } else if let Some(env) = t.env {
                     Ok(SecretRef::Env { env })
                 } else if let Some(key_file) = t.key_file {
                     Ok(SecretRef::File { key_file })
                 } else {
                     Err(serde::de::Error::custom(
-                        "secret must set env, key_file, or be a literal string",
+                        "secret must set env, key_file, keychain, or be a literal string",
                     ))
                 }
             }
@@ -81,8 +89,37 @@ impl<'de> Deserialize<'de> for SecretRef {
 }
 
 impl SecretRef {
-    pub fn resolve(&self) -> Result<ApiKey> {
+    /// Where this reference reads from, for display. Never includes the secret.
+    pub fn describe(&self) -> String {
         match self {
+            SecretRef::Env { env } => format!("env:{env}"),
+            SecretRef::File { key_file } => format!("file:{key_file}"),
+            SecretRef::Keychain => "credential-store".to_string(),
+            SecretRef::Literal(_) => "inline-literal".to_string(),
+        }
+    }
+
+    /// Resolve this reference to an actual key.
+    ///
+    /// provider and account are required for every variant, not just the
+    /// credential store, so a misconfiguration surfaces as one clear message.
+    pub fn resolve(
+        &self,
+        store: &crate::secrets::CredentialStore,
+        provider: &str,
+        account: &str,
+    ) -> Result<ApiKey> {
+        if let SecretRef::Keychain = self {
+            return match store.get(provider, account)? {
+                Some(key) => Ok(key),
+                None => bail!(
+                    "{}",
+                    crate::secrets::missing_credential_message(provider, account)
+                ),
+            };
+        }
+        match self {
+            SecretRef::Keychain => unreachable!("handled above"),
             SecretRef::Env { env } => {
                 let v = std::env::var(env).map_err(|_| {
                     anyhow!("environment variable {env} is not set (required by config)")
@@ -241,8 +278,14 @@ impl Default for PolicyConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountConfig {
-    /// Credential for this account, for example key = { env = "XKIRO_KEY_1" }.
-    pub key: SecretRef,
+    /// Where this account's credential comes from.
+    ///
+    /// Omitting it means "use the OS credential store", which is the form the
+    /// ai-gw keys add command registers. Requiring a key here would force the
+    /// operator to prepare secrets before every start, which is the friction
+    /// this whole mechanism exists to remove.
+    #[serde(default)]
+    pub key: Option<SecretRef>,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
@@ -364,6 +407,13 @@ impl Config {
             if p.base_url.trim().is_empty() {
                 bail!("provider {name}: base_url must not be empty");
             }
+            // Credential-store entries are keyed by "provider/account". A slash
+            // inside either half would let two different accounts resolve to the
+            // same stored secret, so it is rejected at the boundary rather than
+            // discovered later as a mysteriously shared key.
+            if name.contains('/') {
+                bail!("provider name {name:?} must not contain a slash");
+            }
             if p.accounts.is_empty() {
                 bail!("provider {name}: no accounts configured");
             }
@@ -371,6 +421,11 @@ impl Config {
                 let _ = a; // secret resolution happens in build_accounts
                 if acct.trim().is_empty() {
                     bail!("provider {name}: account id must not be empty");
+                }
+                if acct.contains('/') {
+                    bail!(
+                        "provider {name}: account id {acct:?} must not contain a slash,                          because provider/account is the credential-store key"
+                    );
                 }
             }
         }
@@ -426,13 +481,18 @@ impl Config {
     /// Every account starts in AccountState::Unknown with no gates. It must be
     /// probed before it serves traffic: restoring from disk and assuming zero
     /// spend is exactly how a gateway silently spends real money.
-    pub fn build_accounts(&self) -> Result<Vec<Account>> {
+    pub fn build_accounts(
+        &self,
+        store: &crate::secrets::CredentialStore,
+    ) -> Result<Vec<Account>> {
         let mut out = Vec::new();
         for (provider_name, p) in &self.providers {
             for (account_id, a) in &p.accounts {
-                let key = a
-                    .key
-                    .resolve()
+                // No key configured means the credential store, looked up by
+                // provider/account.
+                let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
+                let key = secret_ref
+                    .resolve(store, provider_name, account_id)
                     .with_context(|| format!("provider {provider_name} account {account_id}"))?;
                 let currency = a
                     .currency
@@ -464,6 +524,43 @@ impl Config {
         }
         if out.is_empty() {
             bail!("configuration produced no accounts");
+        }
+        Ok(out)
+    }
+
+    /// Build the account list WITHOUT resolving credentials.
+    ///
+    /// Only for operations that need identity and state and never make an
+    /// upstream call: listing accounts and disabling one. The key is left empty,
+    /// and any attempt to use it against a provider will fail authentication
+    /// rather than silently borrow another account's identity. This exists so an
+    /// account whose key is missing can still be listed and disabled.
+    pub fn build_accounts_unresolved(&self) -> Result<Vec<Account>> {
+        let mut out = Vec::new();
+        for (provider_name, p) in &self.providers {
+            for (account_id, a) in &p.accounts {
+                out.push(Account {
+                    id: account_id.clone(),
+                    provider: provider_name.clone(),
+                    label: a.label.clone().unwrap_or_else(|| account_id.clone()),
+                    base_url: p.base_url.trim_end_matches('/').to_string(),
+                    api_key: ApiKey::new(""),
+                    currency: a.currency.clone().unwrap_or_else(|| p.currency.clone()),
+                    gates: Vec::new(),
+                    state: AccountState::Unknown,
+                    available_at: None,
+                    window_started_at: None,
+                    credit_multiplier: a
+                        .credit_multiplier
+                        .or(p.credit_multiplier)
+                        .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ONE))
+                        .unwrap_or(Decimal::ONE),
+                    rpm_limit: a.rpm_limit,
+                    concurrency_limit: a.concurrency_limit,
+                    last_probe_at: None,
+                    last_error: None,
+                });
+            }
         }
         Ok(out)
     }
@@ -518,11 +615,17 @@ adapter = "xkiro"
 base_url = "https://api.xkiro.com/v1"
 currency = "USD"
 
+# Accounts need no key here: omitting it means "read from the OS credential
+# store", registered once with:
+#     ai-gw keys add xkiro acc-1
+# Explicit alternatives, if you prefer them:
+#     key = { env = "XKIRO_KEY_1" }
+#     key = { key_file = "/run/secrets/xkiro-1" }
+#     key = "sk-literal-not-recommended"
+
 [providers.xkiro.accounts.acc-1]
-key = { env = "XKIRO_KEY_1" }
 
 [providers.xkiro.accounts.acc-2]
-key = { env = "XKIRO_KEY_2" }
 
 [providers.commandcode]
 adapter = "command-code"
@@ -531,7 +634,6 @@ probe_base_url = "https://api.commandcode.ai"
 currency = "USD"
 
 [providers.commandcode.accounts.acc-1]
-key = { env = "COMMANDCODE_KEY_1" }
 
 [providers.deepseek]
 adapter = "deepseek"
@@ -540,7 +642,6 @@ probe_base_url = "https://api.deepseek.com"
 currency = "USD"
 
 [providers.deepseek.accounts.main]
-key = { env = "DEEPSEEK_KEY" }
 
 [routes]
 "deepseek/deepseek-v3.2" = "xkiro"
@@ -570,7 +671,7 @@ key = "sk-test-1"
 adapter = "deepseek"
 base_url = "https://api.deepseek.com/v1"
 [providers.deepseek.accounts.d1]
-key = "sk-test-2"
+key = { keychain = true }
 [routes]
 "deepseek/deepseek-v3.2" = "xkiro"
 "deepseek/deepseek-chat" = "deepseek"
@@ -627,12 +728,69 @@ key = "sk-test-2"
     #[test]
     fn accounts_start_unknown_and_unprobed() {
         let cfg = cfg_with_two_providers();
-        let accts = cfg.build_accounts().unwrap();
+        let store = crate::secrets::CredentialStore::memory();
+        // The keychain-backed account takes its key from the credential store;
+        // the other uses an inline literal, so nothing here touches a real store.
+        store.set("deepseek", "d1", "sk-from-store").unwrap();
+        let accts = cfg.build_accounts(&store).unwrap();
         assert_eq!(accts.len(), 2);
         for a in &accts {
             assert_eq!(a.state, AccountState::Unknown);
             assert!(a.gates.is_empty(), "must not assume zero spend before probing");
         }
+        let d1 = accts.iter().find(|a| a.id == "d1").unwrap();
+        assert_eq!(d1.api_key.expose(), "sk-from-store");
+    }
+
+    #[test]
+    fn an_account_with_no_key_is_read_from_the_credential_store() {
+        // Omitting key entirely is the recommended form; it must resolve from the
+        // store without any environment variable being prepared.
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+[providers.xkiro.accounts.acc-1]
+[routes]
+"m" = "xkiro"
+"#,
+        )
+        .unwrap();
+        let store = crate::secrets::CredentialStore::memory();
+        store.set("xkiro", "acc-1", "sk-stored").unwrap();
+        let accts = cfg.build_accounts(&store).unwrap();
+        assert_eq!(accts[0].api_key.expose(), "sk-stored");
+    }
+
+    #[test]
+    fn a_missing_stored_credential_names_the_command_that_fixes_it() {
+        let cfg = cfg_with_two_providers();
+        let store = crate::secrets::CredentialStore::memory();
+        let err = format!("{:#}", cfg.build_accounts(&store).unwrap_err());
+        assert!(
+            err.contains("ai-gw keys add deepseek d1"),
+            "the error must tell the operator what to run; got: {err}"
+        );
+    }
+
+    #[test]
+    fn slashes_are_rejected_because_they_would_alias_credentials() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers
+            .get_mut("deepseek")
+            .unwrap()
+            .accounts
+            .insert("bad/id".into(), AccountConfig {
+                key: None,
+                label: None,
+                currency: None,
+                credit_multiplier: None,
+                concurrency_limit: None,
+                rpm_limit: None,
+            });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("slash"), "got: {err}");
     }
 
     #[test]

@@ -234,7 +234,11 @@ pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
     let max_body_bytes = backend.config().policy.max_body_bytes;
     let auth = match &backend.config().server.local_key {
         None => LocalAuth::Open,
-        Some(secret) => match secret.resolve() {
+        Some(secret) => match secret.resolve(
+            &crate::secrets::CredentialStore::keychain(),
+            crate::secrets::LOCAL_KEY_PROVIDER,
+            crate::secrets::LOCAL_KEY_ACCOUNT,
+        ) {
             Ok(key) => LocalAuth::Required(key),
             Err(e) => {
                 // Fail closed: without our key on disk this proxy would be an
@@ -1429,7 +1433,9 @@ key = "sk-a2"
 
     fn fake_backend(base_url: &str) -> Arc<FakeBackend> {
         let config = test_config(base_url);
-        let accounts = config.build_accounts().unwrap();
+        let accounts = config
+            .build_accounts(&crate::secrets::CredentialStore::memory())
+            .unwrap();
         let pool = Pool::new(accounts, &config.policy);
         activate(&pool, "a1", 1);
         activate(&pool, "a2", 0);
@@ -1643,7 +1649,9 @@ key = "sk-a2"
         let (upstream_url, _mock) = spawn_mock(MockMode::JsonOk).await;
         let mut config = test_config(&upstream_url);
         config.server.local_key = Some(SecretRef::Literal("sk-local".into()));
-        let accounts = config.build_accounts().unwrap();
+        let accounts = config
+            .build_accounts(&crate::secrets::CredentialStore::memory())
+            .unwrap();
         let pool = Pool::new(accounts, &config.policy);
         activate(&pool, "a1", 1);
         activate(&pool, "a2", 0);
@@ -1684,7 +1692,9 @@ key = "sk-a2"
         let (upstream_url, _mock) = spawn_mock(MockMode::JsonOk).await;
         let mut config = test_config(&upstream_url);
         config.policy.max_body_bytes = 64;
-        let accounts = config.build_accounts().unwrap();
+        let accounts = config
+            .build_accounts(&crate::secrets::CredentialStore::memory())
+            .unwrap();
         let pool = Pool::new(accounts, &config.policy);
         activate(&pool, "a1", 1);
         let fake = Arc::new(FakeBackend::new(config, pool));

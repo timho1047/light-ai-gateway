@@ -32,6 +32,9 @@ pub struct Gateway {
     pub config: Config,
     pub pool: Pool,
     pub store: StoreHandle,
+    /// Where provider credentials live. The operator's real OS credential store
+    /// in production; an in-memory store in tests.
+    pub credentials: crate::secrets::CredentialStore,
     pub http: reqwest::Client,
     pub prices: Mutex<PriceTable>,
     pub probes: HashMap<String, Arc<dyn QuotaProbe>>,
@@ -43,7 +46,18 @@ pub struct Gateway {
 
 impl Gateway {
     pub async fn new(config: Config) -> Result<Arc<Self>> {
-        let accounts = config.build_accounts()?;
+        Self::with_credentials(config, crate::secrets::CredentialStore::keychain()).await
+    }
+
+    /// Build a gateway against an explicit credential store.
+    ///
+    /// Tests pass an in-memory store: touching the operator's real keychain from
+    /// a test would both pollute it and be non-reproducible.
+    pub async fn with_credentials(
+        config: Config,
+        credentials: crate::secrets::CredentialStore,
+    ) -> Result<Arc<Self>> {
+        let accounts = config.build_accounts(&credentials)?;
         let pool = Pool::new(accounts, &config.policy);
 
         // Probes are pinned to configured hosts so credentials can never be
@@ -86,6 +100,7 @@ impl Gateway {
             config,
             pool,
             store,
+            credentials,
             http,
             prices: Mutex::new(prices),
             probes,

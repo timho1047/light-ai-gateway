@@ -27,15 +27,55 @@ Design and rationale: [docs/DESIGN.md](docs/DESIGN.md).
     cargo build --release
     ./target/release/light-ai-gateway init          # writes an example config
     cp config.example.toml ~/.light-ai-gateway/config.toml
-    $EDITOR ~/.light-ai-gateway/config.toml         # add providers, routes, keys
-    export XKIRO_KEY_1=sk-...
-    ./target/release/light-ai-gateway doctor        # validates config and credentials
-    ./target/release/light-ai-gateway serve
+    $EDITOR ~/.light-ai-gateway/config.toml         # add providers, accounts, routes
+
+    ai-gw keys add xkiro acc-1                      # hidden prompt; run once per account
+    ai-gw keys add xkiro acc-2
+    ai-gw keys list                                 # check everything resolves
+
+    ai-gw doctor                                    # config, credentials, probe reachability
+    ai-gw serve
 
 Then point your client at it:
 
     export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
     export OPENAI_API_KEY=unused          # or the local_key you configured
+
+## Credentials
+
+Keys go into the operating system's own credential store (macOS Keychain,
+Windows Credential Manager, freedesktop Secret Service) via the keyring crate.
+Accounts in the config need no key field at all; omitting it looks the account up
+by provider/account name.
+
+    ai-gw keys add <provider> <account>     # hidden prompt, never an argv flag
+    ai-gw keys add <provider> <account> --stdin
+    ai-gw keys list                         # source and status, never the secret
+    ai-gw keys test <provider> <account>    # prove it by probing the provider
+    ai-gw keys remove <provider> <account>
+
+The key is read from a hidden prompt rather than a command-line argument, because
+arguments are visible to every process on the machine and land in shell history.
+
+Explicit alternatives are still supported when you want them:
+key = { keychain = true }, key = { env = "X" }, key = { key_file = "/run/secrets/x" },
+or an inline literal (discouraged).
+
+### What this actually protects
+
+- **Protected:** other users on the machine, backups and disk images, accidental
+  commits, and anything that reads files but not the credential store.
+- **NOT protected:** a process already running as you. It can ask the OS for the
+  same secret; macOS unlocks the login keychain for the session.
+
+A vault file encrypted with a key compiled into the binary would *look* like it
+covered that second case and would not: whoever has the binary has the key. That
+is obfuscation rather than encryption, so it is deliberately not implemented. If
+you need the credentials to travel between machines, export them from the OS
+store rather than committing a ciphertext.
+
+Set AI_GW_CREDENTIAL_BACKEND=memory to force an ephemeral store, which is useful
+for tests and dry runs and never touches your real keychain.
 
 ## Commands
 

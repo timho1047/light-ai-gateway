@@ -23,7 +23,8 @@
 //! out to providers.
 
 use crate::accounts::Pool;
-use crate::config::{Config, QuotaAdapter};
+use crate::config::{Config, QuotaAdapter, SecretRef};
+use crate::secrets::CredentialStore;
 use crate::domain::{
     Account, AccountOverview, AccountState, Confidence, Gate, GateClass, GateKind, GroupBy,
     RequestStatus, RequestSummary, UsageRow,
@@ -95,6 +96,35 @@ pub enum Command {
     Doctor,
     /// Write an example configuration file.
     Init(InitArgs),
+    /// Register, list, and remove provider credentials.
+    Keys(KeysArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct KeysArgs {
+    #[command(subcommand)]
+    pub command: KeysCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeysCommand {
+    /// Store a credential in the OS credential store.
+    ///
+    /// The key is read from a hidden prompt, never from a command-line argument:
+    /// arguments are visible in the process table and land in shell history.
+    Add {
+        provider: String,
+        account: String,
+        /// Read the key from stdin instead of prompting, for scripting.
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Show every configured account, where its credential comes from, and whether it resolves.
+    List,
+    /// Remove a stored credential.
+    Remove { provider: String, account: String },
+    /// Check a stored credential by probing the provider with it.
+    Test { provider: String, account: String },
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +211,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Accounts(args) => cmd_accounts(&path, args).await,
         Command::Tail(args) => cmd_tail(&path, args.limit),
         Command::Doctor => cmd_doctor(&path, origin).await,
+        Command::Keys(args) => cmd_keys(&path, args).await,
     }
 }
 
@@ -849,7 +880,9 @@ fn provider_of(config: &Config, account_id: &str) -> Result<String> {
 fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
     let config = load_config(path)?;
     let provider = provider_of(&config, account_id)?;
-    let accounts = config.build_accounts()?;
+    // Deliberately unresolved: disabling an account must work even when its
+    // credential is missing, which is exactly when you want to disable it.
+    let accounts = config.build_accounts_unresolved()?;
     let pool = Pool::new(accounts, &config.policy);
 
     // There is no dedicated "operator disabled" transition in the frozen pool
@@ -885,6 +918,17 @@ fn cmd_accounts_disable(path: &Path, account_id: &str) -> Result<()> {
 // doctor
 // ---------------------------------------------------------------------------
 
+/// Which credential backend to use.
+///
+/// AI_GW_CREDENTIAL_BACKEND=memory forces an ephemeral store, so tests, dry runs
+/// and CI never read or write the operator's real OS keychain.
+fn credential_store() -> CredentialStore {
+    match std::env::var("AI_GW_CREDENTIAL_BACKEND").as_deref() {
+        Ok("memory") => CredentialStore::memory(),
+        _ => CredentialStore::keychain(),
+    }
+}
+
 async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
     let mut problems = 0u32;
     println!("config path : {} (from {})", path.display(), origin.label());
@@ -900,6 +944,8 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
             bail!("configuration is unusable; nothing else could be checked");
         }
     };
+
+    let creds = credential_store();
 
     let accounts: usize = config.providers.values().map(|p| p.accounts.len()).sum();
     println!(
@@ -940,12 +986,14 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
             problems += 1;
         }
         for (id, a) in &p.accounts {
-            match a.key.resolve() {
+            let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
+            let source = secret_ref.describe();
+            match secret_ref.resolve(&creds, provider, id) {
                 // The key itself is never printed; ApiKey redacts Debug/Display
                 // and this path never formats it at all.
-                Ok(_) => println!("  {provider}/{id}: ok"),
+                Ok(_) => println!("  {provider}/{id}: ok ({source})"),
                 Err(e) => {
-                    println!("  {provider}/{id}: MISSING - {e:#}");
+                    println!("  {provider}/{id}: MISSING ({source}) - {e:#}");
                     problems += 1;
                 }
             }
@@ -965,7 +1013,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin) -> Result<()> {
         targets.insert(provider, (adapter, base));
     }
 
-    match config.build_accounts() {
+    match config.build_accounts(&creds) {
         Err(e) => {
             println!("  skipped: {e:#}");
             println!("  (fix the missing credentials above, then re-run doctor)");
@@ -1026,6 +1074,241 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------------------
+// keys
+// ---------------------------------------------------------------------------
+
+async fn cmd_keys(path: &Path, args: KeysArgs) -> Result<()> {
+    let config = load_config(path)?;
+    let creds = credential_store();
+    match args.command {
+        KeysCommand::Add {
+            provider,
+            account,
+            stdin,
+        } => cmd_keys_add(&config, &creds, &provider, &account, stdin),
+        KeysCommand::List => cmd_keys_list(&config, &creds),
+        KeysCommand::Remove { provider, account } => cmd_keys_remove(&creds, &provider, &account),
+        KeysCommand::Test { provider, account } => {
+            cmd_keys_test(&config, &creds, &provider, &account).await
+        }
+    }
+}
+
+/// Read the secret from a hidden prompt, or from stdin when asked.
+///
+/// Deliberately not a command-line flag: an argument is visible to every process
+/// on the machine via ps, and is written to shell history.
+fn read_secret(provider: &str, account: &str, from_stdin: bool) -> Result<String> {
+    let secret = if from_stdin {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .context("reading the key from stdin")?;
+        line
+    } else {
+        rpassword::prompt_password(format!(
+            "API key for {provider}/{account} (input hidden): "
+        ))
+        .context("reading the key from the terminal")?
+    };
+    let trimmed = secret.trim().to_string();
+    if trimmed.is_empty() {
+        bail!("no key was entered");
+    }
+    Ok(trimmed)
+}
+
+fn cmd_keys_add(
+    config: &Config,
+    creds: &CredentialStore,
+    provider: &str,
+    account: &str,
+    from_stdin: bool,
+) -> Result<()> {
+    // The credential is looked up by provider/account, so both must exist in the
+    // configuration or the entry could never be reached.
+    let p = config
+        .providers
+        .get(provider)
+        .with_context(|| {
+            let known: Vec<&str> = config.providers.keys().map(String::as_str).collect();
+            format!(
+                "unknown provider {provider:?}. Configured providers: [{}]",
+                known.join(", ")
+            )
+        })?;
+    if !p.accounts.contains_key(account) {
+        let known: Vec<&str> = p.accounts.keys().map(String::as_str).collect();
+        bail!(
+            "unknown account {account:?} under provider {provider:?}. \
+             Configured accounts: [{}]",
+            known.join(", ")
+        );
+    }
+
+    let secret = read_secret(provider, account, from_stdin)?;
+    creds
+        .set(provider, account, &secret)
+        .with_context(|| format!("storing the credential for {provider}/{account}"))?;
+
+    // Read it back: a store that silently drops writes is worse than one that
+    // fails, because the operator only discovers it at request time.
+    match creds.get(provider, account)? {
+        Some(stored) if stored.expose() == secret => {
+            println!(
+                "stored  {provider}/{account} in {} ({})",
+                creds.backend_name(),
+                crate::secrets::describe_secret(&secret)
+            );
+            Ok(())
+        }
+        _ => bail!(
+            "the credential was written but could not be read back from {}; \
+             the store may be unavailable",
+            creds.backend_name()
+        ),
+    }
+}
+
+/// One row of the credential report. Pure, so it can be tested without
+/// capturing stdout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRow {
+    pub provider: String,
+    pub account: String,
+    /// Where the secret comes from, never the secret itself.
+    pub source: String,
+    pub status: String,
+}
+
+fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRow> {
+    let mut rows = Vec::new();
+    for (provider, p) in &config.providers {
+        for (id, a) in &p.accounts {
+            let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
+            let status = match secret_ref.resolve(creds, provider, id) {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("MISSING ({e})"),
+            };
+            rows.push(CredentialRow {
+                provider: provider.clone(),
+                account: id.clone(),
+                source: secret_ref.describe(),
+                status,
+            });
+        }
+    }
+    rows
+}
+
+fn cmd_keys_list(config: &Config, creds: &CredentialStore) -> Result<()> {
+    println!("backend: {}", creds.backend_name());
+    println!();
+    println!("{:<16} {:<20} {:<22} STATUS", "PROVIDER", "ACCOUNT", "SOURCE");
+    for row in credential_rows(config, creds) {
+        println!(
+            "{:<16} {:<20} {:<22} {}",
+            row.provider, row.account, row.source, row.status
+        );
+    }
+    println!();
+    println!("Register one with: ai-gw keys add <provider> <account>");
+    Ok(())
+}
+
+fn cmd_keys_remove(creds: &CredentialStore, provider: &str, account: &str) -> Result<()> {
+    if creds.delete(provider, account)? {
+        println!("removed {provider}/{account} from {}", creds.backend_name());
+    } else {
+        println!("nothing stored for {provider}/{account}");
+    }
+    Ok(())
+}
+
+/// Resolve the stored credential and prove it works against the provider.
+async fn cmd_keys_test(
+    config: &Config,
+    creds: &CredentialStore,
+    provider: &str,
+    account: &str,
+) -> Result<()> {
+    let p = config
+        .providers
+        .get(provider)
+        .with_context(|| format!("unknown provider {provider:?}"))?;
+    let account_cfg = p
+        .accounts
+        .get(account)
+        .with_context(|| format!("unknown account {account:?} under provider {provider:?}"))?;
+
+    // Build just this one account so the test cannot be satisfied by another
+    // account's credential.
+    let secret_ref = account_cfg.key.clone().unwrap_or(SecretRef::Keychain);
+    let key = secret_ref
+        .resolve(creds, provider, account)
+        .with_context(|| format!("resolving the credential for {provider}/{account}"))?;
+
+    let Some(probe) = crate::quota::probe_for(p.adapter, p.probe_base_url.as_deref().unwrap_or(&p.base_url)) else {
+        println!("{provider}/{account}: credential found ({} chars), but this provider has no quota probe to test against",
+            key.expose().len());
+        return Ok(());
+    };
+
+    let account_model = crate::domain::Account {
+        id: account.to_string(),
+        provider: provider.to_string(),
+        label: account_cfg.label.clone().unwrap_or_else(|| account.to_string()),
+        base_url: p.base_url.trim_end_matches('/').to_string(),
+        api_key: key,
+        currency: account_cfg
+            .currency
+            .clone()
+            .unwrap_or_else(|| p.currency.clone()),
+        gates: Vec::new(),
+        state: crate::domain::AccountState::Unknown,
+        available_at: None,
+        window_started_at: None,
+        credit_multiplier: rust_decimal::Decimal::ONE,
+        rpm_limit: None,
+        concurrency_limit: None,
+        last_probe_at: None,
+        last_error: None,
+    };
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(
+            config.policy.connect_timeout_secs.max(1),
+        ))
+        .build()
+        .context("building the probe HTTP client")?;
+
+    match probe.probe(&account_model, &client).await {
+        Ok(outcome) => {
+            println!(
+                "{provider}/{account}: ok - {} credentials accepted, {} gates read",
+                probe.name(),
+                outcome.gates.len()
+            );
+            for g in &outcome.gates {
+                println!(
+                    "    {:<18} {}/{} {:?}",
+                    g.kind.label(),
+                    g.used,
+                    g.cap,
+                    g.class()
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            println!("{provider}/{account}: FAILED - {e}");
+            bail!("the stored credential was rejected or the probe endpoint is unreachable")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1318,100 @@ mod tests {
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).expect("valid decimal")
     }
+
+    // -- credentials ---------------------------------------------------------
+
+    /// A config exercising every credential source except the real keychain.
+    /// Uses a key_file rather than an environment variable: mutating process-wide
+    /// env in a test is racy across threads and needs unsafe in edition 2024.
+    fn keys_config(key_file: &str) -> Config {
+        Config::from_toml_str(&format!(
+            r#"
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+[providers.xkiro.accounts.from-store]
+[providers.xkiro.accounts.from-file]
+key = {{ key_file = "{key_file}" }}
+[routes]
+"m" = "xkiro"
+"#
+        ))
+        .unwrap()
+    }
+
+    fn temp_key_file(contents: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("lai-gw-key-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[test]
+    fn credential_rows_report_source_and_status_without_the_secret() {
+        let path = temp_key_file("sk-envvalue");
+        let config = keys_config(path.to_str().unwrap());
+        let creds = CredentialStore::memory();
+        creds.set("xkiro", "from-store", "sk-abcdefghij").unwrap();
+
+        let rows = credential_rows(&config, &creds);
+        assert_eq!(rows.len(), 2);
+
+        let stored = rows.iter().find(|r| r.account == "from-store").unwrap();
+        assert_eq!(stored.source, "credential-store");
+        assert_eq!(stored.status, "ok");
+
+        let file = rows.iter().find(|r| r.account == "from-file").unwrap();
+        assert!(file.source.starts_with("file:"), "got {}", file.source);
+        assert_eq!(file.status, "ok");
+
+        // The rendered output must never contain either secret.
+        let rendered = format!("{rows:?}");
+        assert!(!rendered.contains("sk-abcdefghij"));
+        assert!(!rendered.contains("sk-envvalue"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_credential_is_reported_as_missing_not_as_a_pass() {
+        let path = temp_key_file("unused");
+        let config = keys_config(path.to_str().unwrap());
+        let creds = CredentialStore::memory();
+        let rows = credential_rows(&config, &creds);
+        let stored = rows.iter().find(|r| r.account == "from-store").unwrap();
+        assert!(stored.status.starts_with("MISSING"), "got {}", stored.status);
+        // And it names the exact command that fixes it.
+        assert!(stored.status.contains("ai-gw keys add xkiro from-store"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keys_add_rejects_an_unknown_provider_before_reading_a_secret() {
+        let config = keys_config("/nonexistent");
+        let creds = CredentialStore::memory();
+        // from_stdin is irrelevant: validation must fail first.
+        let err = cmd_keys_add(&config, &creds, "nope", "acc", true).unwrap_err();
+        assert!(err.to_string().contains("unknown provider"), "got: {err}");
+    }
+
+    #[test]
+    fn keys_add_rejects_an_unknown_account_and_lists_the_known_ones() {
+        let config = keys_config("/nonexistent");
+        let creds = CredentialStore::memory();
+        let err = cmd_keys_add(&config, &creds, "xkiro", "nope", true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown account"), "got: {msg}");
+        assert!(msg.contains("from-store"), "should list known accounts: {msg}");
+    }
+
+    #[test]
+    fn keys_remove_is_idempotent() {
+        let creds = CredentialStore::memory();
+        creds.set("xkiro", "acc", "sk-x").unwrap();
+        assert!(cmd_keys_remove(&creds, "xkiro", "acc").is_ok());
+        assert!(cmd_keys_remove(&creds, "xkiro", "acc").is_ok());
+        assert!(creds.get("xkiro", "acc").unwrap().is_none());
+    }
+
 
     fn gate(
         kind: GateKind,
