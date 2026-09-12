@@ -390,6 +390,32 @@ fn board_row(cells: &[&str; 6]) -> String {
     line
 }
 
+/// Token counts on the board.
+///
+/// A daily allowance of 30000000 reads better as 30M, and unlike a spend this is
+/// an allowance rather than a measurement, so the exact digits carry no
+/// information at a glance.
+fn token_count(d: Decimal) -> String {
+    use rust_decimal::prelude::ToPrimitive;
+    let v = d.to_f64().unwrap_or(0.0);
+    if v >= 1_000_000.0 {
+        format!("{:.0}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("{:.0}k", v / 1_000.0)
+    } else {
+        board_amount(d)
+    }
+}
+
+/// Whether a gate is denominated in money or in tokens.
+///
+/// This distinction has to survive into the display. The free-token allowance is
+/// counted in TOKENS, and printing it under the account's currency label claimed
+/// that 30000000 tokens were 30000000 dollars.
+fn is_money(g: &Gate) -> bool {
+    g.kind != GateKind::FreeTokens
+}
+
 fn covered_cell(r: &AccountOverview) -> String {
     let mut gates: Vec<&Gate> = r
         .gates
@@ -400,18 +426,38 @@ fn covered_cell(r: &AccountOverview) -> String {
         return "-".to_string();
     }
     gates.sort_by_key(|g| gate_rank(g.kind));
-    let parts: Vec<String> = gates
-        .iter()
-        .map(|g| format!("{}/{}", short(g.used), short(g.cap)))
-        .collect();
-    // The unit matters: "40/100" is credits on Command Code and USD on xKiro,
-    // and an operator reading the board has to know which pot it is.
-    format!(
-        "{} {}{}",
-        parts.join(" "),
-        r.currency,
-        markers(&gates)
-    )
+
+    // Every gate carries its own label. Without one the column is a row of bare
+    // fractions whose meaning depends on knowing the order, which is exactly how
+    // a free-token allowance gets mistaken for a monthly cap.
+    let money: Vec<&&Gate> = gates.iter().filter(|g| is_money(g)).collect();
+    let tokens: Vec<&&Gate> = gates.iter().filter(|g| !is_money(g)).collect();
+
+    let mut out = String::new();
+    for g in &money {
+        out.push_str(&format!(
+            "{} {}/{}  ",
+            g.kind.label(),
+            board_amount(g.used),
+            board_amount(g.cap)
+        ));
+    }
+    if !money.is_empty() {
+        out.push_str(&r.currency);
+    }
+    for (i, g) in tokens.iter().enumerate() {
+        if !money.is_empty() || i > 0 {
+            out.push_str("  ");
+        }
+        out.push_str(&format!(
+            "{} {}/{} tok",
+            g.kind.label(),
+            token_count(g.used),
+            token_count(g.cap)
+        ));
+    }
+    out.push_str(&markers(&gates));
+    out
 }
 
 fn metered_cell(r: &AccountOverview) -> String {
@@ -430,12 +476,20 @@ fn metered_cell(r: &AccountOverview) -> String {
             let note = if g.used <= Decimal::ZERO {
                 "unused".to_string()
             } else {
-                format!("{} spent", short(g.used))
+                format!("{} spent", board_amount(g.used))
             };
-            format!("{} {}({})", short(g.remaining()), r.currency, note)
+            // Label the pot too: a wallet and a purchased-credit balance are both
+            // real money but they behave differently on exhaustion.
+            format!(
+                "{} {} {}({})",
+                g.kind.label(),
+                board_amount(g.remaining()),
+                r.currency,
+                note
+            )
         })
         .collect();
-    format!("{}{}", parts.join(" "), markers(&gates))
+    format!("{}{}", parts.join("  "), markers(&gates))
 }
 
 /// A stale reading dominates an estimated one: it is the reading most likely to
@@ -527,8 +581,68 @@ fn gate_rank(kind: GateKind) -> u8 {
 }
 
 /// Decimal without trailing zeros: 12.3400 prints as 12.34, 0 as 0.
+///
+/// Used for cost columns, where a request can genuinely cost 0.0000036 and must
+/// not be rounded away. Board amounts use board_amount instead.
 fn short(d: Decimal) -> String {
     d.normalize().to_string()
+}
+
+/// An amount on the account board, rounded to ONE decimal place.
+///
+/// The ledger is Decimal arithmetic, so a running balance carries fifteen digits
+/// nobody wants to read: 1.113194698/14 is a wall of digits wrapped around the
+/// one that matters.
+///
+/// Two departures from a plain one-decimal rounding, both to avoid printing
+/// something untrue:
+///   - a small but REAL balance would round to 0 and read as untouched, so
+///     anything under 0.05 keeps enough digits to stay visible;
+///   - an exact integer keeps no decimal point, so 368 does not become 368.0.
+///
+/// Full precision stays available in the usage and prices reports; the board is
+/// meant to be read at a glance.
+fn board_amount(d: Decimal) -> String {
+    use rust_decimal::prelude::ToPrimitive;
+    let v = d.to_f64().unwrap_or(0.0);
+    if v == 0.0 {
+        return "0".to_string();
+    }
+
+    let trim = |s: &str| -> String {
+        let mut s = s.to_string();
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        if s.is_empty() || s == "-" || s == "0" || s == "-0" {
+            "0".to_string()
+        } else {
+            s
+        }
+    };
+
+    if v.abs() < 0.05 {
+        // Three decimals is enough to show that something was spent.
+        let three = trim(&format!("{v:.3}"));
+        if three != "0" {
+            return three;
+        }
+        let six = trim(&format!("{v:.6}"));
+        if six != "0" {
+            return six;
+        }
+        // Non-zero in the ledger, below what six decimals can show.
+        return if v < 0.0 {
+            "<-0.000001".to_string()
+        } else {
+            "<0.000001".to_string()
+        };
+    }
+
+    trim(&format!("{v:.1}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,6 +1837,33 @@ mod tests {
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).expect("valid decimal")
     }
+
+    #[test]
+    fn board_amounts_round_to_one_decimal_without_lying() {
+        // The values that prompted this: fifteen digits wrapped around one.
+        assert_eq!(board_amount(dec("1.113194698")), "1.1");
+        assert_eq!(board_amount(dec("4.175475087")), "4.2");
+        assert_eq!(board_amount(dec("4.182168809")), "4.2");
+        assert_eq!(board_amount(dec("65.824524913")), "65.8");
+        assert_eq!(board_amount(dec("1320.065041")), "1320.1");
+        assert_eq!(board_amount(dec("32.042344")), "32");
+
+        // An exact integer keeps no decimal point.
+        assert_eq!(board_amount(dec("368")), "368");
+        assert_eq!(board_amount(dec("30000000")), "30000000");
+        assert_eq!(board_amount(Decimal::ZERO), "0");
+
+        // A small but real balance must never read as untouched: that is the
+        // difference between "this account has not been used" and "it has been
+        // used a little", and the board is where that judgement gets made.
+        assert_eq!(board_amount(dec("0.001221")), "0.001");
+        assert_eq!(board_amount(dec("0.0004")), "0.0004");
+        assert_ne!(board_amount(dec("0.0000001")), "0");
+        assert_eq!(board_amount(dec("-0.0000001")), "<-0.000001");
+
+        // Money is not rounded away in the cost columns, which use short().
+        assert_eq!(short(dec("0.0000036")), "0.0000036");
+    }
     // -- prices --------------------------------------------------------------
 
     fn priced_table() -> crate::meter::PriceTable {
@@ -2026,9 +2167,9 @@ key = {{ key_file = "{key_file}" }}
 
         let covered = covered_cell(&acct);
         let metered = metered_cell(&acct);
-        assert_eq!(covered, "40/100 25/500 USD", "covered shows used/cap and its unit");
+        assert_eq!(covered, "5h 40/100  7d 25/500  USD", "covered shows used/cap and its unit");
         assert_eq!(
-            metered, "12 USD(unused)",
+            metered, "credits 12 USD(unused)",
             "metered shows the money left and says it is untouched"
         );
         assert_ne!(covered, metered);
@@ -2036,8 +2177,8 @@ key = {{ key_file = "{key_file}" }}
         let board = render_board(&[acct], t);
         assert!(board.contains("COVERED"));
         assert!(board.contains("METERED"));
-        assert!(board.contains("40/100 25/500 USD"));
-        assert!(board.contains("12 USD(unused)"));
+        assert!(board.contains("5h 40/100  7d 25/500  USD"));
+        assert!(board.contains("credits 12 USD(unused)"));
         assert!(board.contains("DRAINING"));
         assert!(
             board.contains("metered = real money remaining"),
@@ -2064,7 +2205,7 @@ key = {{ key_file = "{key_file}" }}
             )],
         );
         assert_eq!(covered_cell(&acct), "-", "covered must be blank, not 0/0");
-        assert_eq!(metered_cell(&acct), "12.34 USD(unused)");
+        assert_eq!(metered_cell(&acct), "wallet 12.3 USD(unused)");
         assert!(state_cell(&acct).contains("metered only"));
         assert_eq!(reset_cell(&acct, t), "-", "a wallet has no reset");
     }
@@ -2087,7 +2228,7 @@ key = {{ key_file = "{key_file}" }}
                 t,
             )],
         );
-        assert_eq!(metered_cell(&acct), "683.95 USD(16.05 spent)");
+        assert_eq!(metered_cell(&acct), "wallet 684 USD(16.1 spent)");
     }
 
     #[test]
