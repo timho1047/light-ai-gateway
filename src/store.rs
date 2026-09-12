@@ -158,6 +158,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE TABLE IF NOT EXISTS prices (
     provider                  TEXT    NOT NULL,
     model                     TEXT    NOT NULL,
+    tier                      INTEGER NOT NULL,
     input_per_token           TEXT    NOT NULL,
     output_per_token          TEXT    NOT NULL,
     cache_read_per_token      TEXT    NOT NULL,
@@ -166,7 +167,7 @@ CREATE TABLE IF NOT EXISTS prices (
     observed_completion_tokens INTEGER NOT NULL DEFAULT 0,
     observed_cached_tokens    INTEGER NOT NULL DEFAULT 0,
     updated_at                INTEGER NOT NULL,
-    PRIMARY KEY (provider, model)
+    PRIMARY KEY (provider, model, tier)
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
@@ -183,7 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_daily_day   ON usage_daily(day);
 /// written under the old key cannot be attributed to a provider, so the account
 /// and gate tables are rebuilt rather than guessed at. Usage history already
 /// carried provider and is preserved.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The version at which account identity changed from id alone to
 /// (provider, id). Only a database older than THIS needs the rebuild; later
@@ -239,7 +240,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             .context("dropping pre-v2 account tables")?;
     }
 
-    if version < 4 && table_exists(conn, "prices")? {
+    if version < 5 && table_exists(conn, "prices")? {
         // The price columns were renamed when cache read became a price rather
         // than a ratio. These rows are observations that cost nothing to
         // re-learn, so they are rebuilt rather than migrated.
@@ -574,13 +575,14 @@ fn save_prices_tx(tx: &Transaction<'_>, prices: &[crate::meter::PersistedPrice])
     for p in prices {
         tx.execute(
             "INSERT OR REPLACE INTO prices (
-                 provider, model, input_per_token, output_per_token,
+                 provider, model, tier, input_per_token, output_per_token,
                  cache_read_per_token, samples, observed_prompt_tokens,
                  observed_completion_tokens, observed_cached_tokens, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 p.provider,
                 p.model,
+                i64::from(p.tier),
                 dec_str(p.price.input_per_token),
                 dec_str(p.price.output_per_token),
                 dec_str(p.price.cache_read_per_token),
@@ -618,14 +620,15 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
         return Ok(Vec::new());
     }
 
-    /// provider, model, prompt, completion, discount, samples, prompt_tok, completion_tok, cached_tok
-    type PriceRowTuple = (String, String, String, String, String, i64, i64, i64, i64);
+    /// provider, model, tier, input, output, cache_read, samples, prompt_tok,
+    /// completion_tok, cached_tok
+    type PriceRowTuple = (String, String, i64, String, String, String, i64, i64, i64, i64);
     let rows: Vec<PriceRowTuple> = {
         let mut stmt = conn.prepare(
-            "SELECT provider, model, input_per_token, output_per_token,
+            "SELECT provider, model, tier, input_per_token, output_per_token,
                     cache_read_per_token, samples, observed_prompt_tokens,
                     observed_completion_tokens, observed_cached_tokens
-             FROM prices ORDER BY provider, model",
+             FROM prices ORDER BY provider, model, tier",
         )?;
         let mapped = stmt.query_map([], |row| {
             Ok((
@@ -638,13 +641,15 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
                 row.get(6)?,
                 row.get(7)?,
                 row.get(8)?,
+                row.get(9)?,
             ))
         })?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     let mut out = Vec::with_capacity(rows.len());
-    for (provider, model, input, output, cache_read, samples, p_tok, c_tok, cached_tok) in rows {
+    for (provider, model, tier, input, output, cache_read, samples, p_tok, c_tok, cached_tok) in rows
+    {
         // A row we cannot parse is skipped, never defaulted: a price that
         // silently became zero would make a paid model look free.
         let (Some(input), Some(output), Some(cache_read)) = (
@@ -658,6 +663,7 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
         out.push(PersistedPrice {
             provider,
             model,
+            tier: tier.max(0) as u32,
             price: ModelPrice {
                 input_per_token: input,
                 output_per_token: output,
@@ -1379,6 +1385,7 @@ mod tests {
             crate::meter::PersistedPrice {
                 provider: "xkiro".to_string(),
                 model: "z-ai/glm-5.3-flash".to_string(),
+                tier: 0,
                 price: crate::meter::ModelPrice {
                     input_per_token: dec("0.0000004"),
                     output_per_token: dec("0.0000012"),
@@ -1392,6 +1399,7 @@ mod tests {
             crate::meter::PersistedPrice {
                 provider: "commandcode".to_string(),
                 model: "z-ai/glm-5.3-flash".to_string(),
+                tier: 0,
                 price: crate::meter::ModelPrice {
                     input_per_token: dec("0.0000041"),
                     output_per_token: dec("0.0000041"),

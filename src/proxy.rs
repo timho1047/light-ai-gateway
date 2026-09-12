@@ -87,10 +87,14 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     /// Price a usage sample through the learned price table. None means the
     /// model is unknown and the caller must fall back conservatively.
+    /// Which price tier a request starting now falls into. 0 is the default.
+    fn tier_at(&self, provider: &str, model: &str) -> u32;
+
     fn estimate_cost(
         &self,
         provider: &str,
         model: &str,
+        tier: u32,
         usage: &TokenUsage,
         multiplier: Decimal,
     ) -> Option<Decimal>;
@@ -177,10 +181,16 @@ impl ProxyBackend for GatewayBackend {
         self.gateway.http.clone()
     }
 
+    fn tier_at(&self, provider: &str, model: &str) -> u32 {
+        self.gateway
+            .tier_at(provider, model, crate::domain::now())
+    }
+
     fn estimate_cost(
         &self,
         provider: &str,
         model: &str,
+        tier: u32,
         usage: &TokenUsage,
         multiplier: Decimal,
     ) -> Option<Decimal> {
@@ -188,7 +198,7 @@ impl ProxyBackend for GatewayBackend {
             .prices
             .lock()
             .ok()
-            .and_then(|prices| prices.estimate(provider, model, usage, multiplier))
+            .and_then(|prices| prices.estimate(provider, model, tier, usage, multiplier))
     }
 
     fn record_success(
@@ -886,8 +896,9 @@ fn estimate_request_cost(
         completion_tokens: completion,
         ..Default::default()
     };
+    let tier = backend.tier_at(provider, model);
     backend
-        .estimate_cost(provider, model, &probe, Decimal::ONE)
+        .estimate_cost(provider, model, tier, &probe, Decimal::ONE)
         // One shared definition of "unknown model" across the whole request
         // path: two different fallback constants would mean the gate and the
         // finalizer disagreed about what a request costs.
@@ -1063,6 +1074,7 @@ impl RelayStream {
             .estimate_cost(
                 &f.plan.provider,
                 &f.plan.model,
+                f.plan.tier,
                 &result.usage,
                 f.credit_multiplier,
             )
@@ -1380,10 +1392,15 @@ mod tests {
             self.http.clone()
         }
 
+        fn tier_at(&self, _provider: &str, _model: &str) -> u32 {
+            0
+        }
+
         fn estimate_cost(
             &self,
             _provider: &str,
             _model: &str,
+            _tier: u32,
             _usage: &TokenUsage,
             _multiplier: Decimal,
         ) -> Option<Decimal> {

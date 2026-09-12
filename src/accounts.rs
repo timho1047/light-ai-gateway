@@ -83,6 +83,9 @@ pub struct AttemptPlan {
     pub session_key: Option<String>,
     /// Which pot the router expects to pay from.
     pub coverage: GateClass,
+    /// Price tier this request was priced at, decided when it was planned.
+    /// 0 is the default tier; higher values are configured time windows.
+    pub tier: u32,
     pub attempt_no: u32,
 }
 
@@ -425,6 +428,9 @@ impl Pool {
                         model: model.to_string(),
                         session_key: session_key.map(str::to_string),
                         coverage,
+                        // The pool knows nothing about price windows; the router
+                        // overwrites this once it has resolved the schedule.
+                        tier: 0,
                         attempt_no,
                     });
                 }
@@ -500,6 +506,7 @@ impl Pool {
             model: model.to_string(),
             session_key: session_key.map(str::to_string),
             coverage,
+            tier: 0,
             attempt_no,
         })
     }

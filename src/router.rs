@@ -38,9 +38,14 @@ pub struct Gateway {
     pub http: reqwest::Client,
     pub prices: Mutex<PriceTable>,
     pub probes: HashMap<String, Arc<dyn QuotaProbe>>,
+    /// Parsed price windows, keyed by (provider, model). Only models with a
+    /// configured schedule appear here; everything else is priced at tier 0.
+    pub schedules: HashMap<(String, String), crate::tier::Schedule>,
     /// Token usage accumulated since the last successful probe, keyed by
-    /// (provider, model). Only used to attribute probe-to-probe spend deltas.
-    pending: Mutex<HashMap<(String, String), TokenUsage>>,
+    /// (provider, model, tier). The tier is part of the key so an interval's
+    /// spend can be attributed to the window that actually earned it instead of
+    /// being smeared across the peak and off-peak rates.
+    pending: Mutex<HashMap<(String, String, u32), TokenUsage>>,
     last_spend: Mutex<HashMap<String, SpendSample>>,
 }
 
@@ -131,11 +136,26 @@ impl Gateway {
             Err(e) => tracing::debug!(error = %e, "no price store to read yet"),
         }
 
+        // Parse the configured price windows once. Only models that have one
+        // appear here; every other model is priced at tier 0.
+        let mut schedules: HashMap<(String, String), crate::tier::Schedule> = HashMap::new();
+        for (provider, models) in &config.prices {
+            for (model, p) in models {
+                let Ok(s) = p.schedule(provider, model) else {
+                    continue;
+                };
+                if !s.is_empty() {
+                    schedules.insert((provider.clone(), model.clone()), s);
+                }
+            }
+        }
+
         let gateway = Arc::new(Gateway {
             config,
             pool,
             store,
             credentials,
+            schedules,
             http,
             prices: Mutex::new(prices),
             probes,
@@ -190,7 +210,7 @@ impl Gateway {
             .config
             .resolve(client_model)
             .map_err(|_| PlanError::UnknownProvider(client_model.to_string()))?;
-        let plan = self.pool.select(
+        let mut plan = self.pool.select(
             &route.provider,
             &route.model,
             session_key,
@@ -198,6 +218,10 @@ impl Gateway {
             request_id,
             attempt_no,
         )?;
+        // Fix the price tier now, from the time the request starts. Deciding it
+        // later would let a request that began in one window be billed against
+        // another.
+        plan.tier = self.tier_at(&route.provider, &route.model, now());
         Ok((route, plan))
     }
 
@@ -205,6 +229,22 @@ impl Gateway {
     ///
     /// Unknown models are priced at the conservative fallback rather than at
     /// zero, so an unpriced model can never silently drain a wallet.
+    /// Which price tier a request starting now falls into.
+    ///
+    /// Tier 0 is the default price. A configured window makes a request cost
+    /// the tier price instead, and getting this wrong is off by the peak
+    /// multiplier -- toward spending when the peak rate is higher.
+    pub fn tier_at(&self, provider: &str, model: &str, at: time::OffsetDateTime) -> u32 {
+        let Some(schedule) = self.schedules.get(&(provider.to_string(), model.to_string()))
+        else {
+            return 0;
+        };
+        match schedule.tier_index_at(at) {
+            Some(i) => (i + 1) as u32,
+            None => 0,
+        }
+    }
+
     pub fn estimate_cost(
         &self,
         provider: &str,
@@ -220,8 +260,9 @@ impl Gateway {
             reasoning_tokens: 0,
             measured: false,
         };
+        let tier = self.tier_at(provider, model, now());
         if let Ok(prices) = self.prices.lock()
-            && let Some(c) = prices.estimate(provider, model, &usage, multiplier)
+            && let Some(c) = prices.estimate(provider, model, tier, &usage, multiplier)
         {
             return c;
         }
@@ -245,7 +286,7 @@ impl Gateway {
     ) {
         self.pool.settle(plan, cost, true);
         self.pool.note_activity();
-        self.accumulate_usage(&plan.provider, &plan.model, usage);
+        self.accumulate_usage(&plan.provider, &plan.model, plan.tier, usage);
         // Standing contract with the store: persist the ledger after EVERY
         // state transition. A lost ledger is not just a stale display -- on
         // restart it means re-spending quota already consumed, which on
@@ -275,12 +316,12 @@ impl Gateway {
         self.store.record_attempt(attempt);
     }
 
-    fn accumulate_usage(&self, provider: &str, model: &str, usage: &TokenUsage) {
+    fn accumulate_usage(&self, provider: &str, model: &str, tier: u32, usage: &TokenUsage) {
         let Ok(mut pending) = self.pending.lock() else {
             return;
         };
         let e = pending
-            .entry((provider.to_string(), model.to_string()))
+            .entry((provider.to_string(), model.to_string(), tier))
             .or_default();
         e.prompt_tokens += usage.prompt_tokens;
         e.completion_tokens += usage.completion_tokens;
@@ -401,13 +442,13 @@ impl Gateway {
             return;
         }
 
-        let drained: Vec<((String, String), TokenUsage)> = {
+        let drained: Vec<((String, String, u32), TokenUsage)> = {
             let Ok(mut pending) = self.pending.lock() else {
                 return;
             };
-            let keys: Vec<(String, String)> = pending
+            let keys: Vec<(String, String, u32)> = pending
                 .keys()
-                .filter(|(p, _)| p == provider)
+                .filter(|(p, _, _)| p == provider)
                 .cloned()
                 .collect();
             keys.into_iter()
@@ -418,17 +459,40 @@ impl Gateway {
             return;
         }
 
-        let total_tokens: u64 = drained.iter().map(|(_, u)| u.total_tokens()).sum();
-        if total_tokens == 0 {
-            return;
-        }
-
         let Ok(mut prices) = self.prices.lock() else {
             return;
         };
-        for ((_, model), usage) in drained {
-            let share = Decimal::from(usage.total_tokens()) / Decimal::from(total_tokens);
-            prices.observe(provider, &model, delta * share, &usage);
+
+        // Group the interval by model, then split its spend across the tiers that
+        // were actually used, in proportion to what each tier was expected to
+        // cost. A tick that only touched one tier is exact; one that straddles a
+        // window boundary is a proportional approximation, which is the best a
+        // single spend figure per interval allows.
+        let mut by_model: HashMap<String, Vec<(u32, TokenUsage)>> = HashMap::new();
+        for ((_, model, tier), usage) in drained {
+            by_model.entry(model).or_default().push((tier, usage));
+        }
+
+        for (model, tiers) in by_model {
+            let expected: Vec<Decimal> = tiers
+                .iter()
+                .map(|(tier, usage)| {
+                    prices
+                        .estimate(provider, &model, *tier, usage, Decimal::ONE)
+                        .unwrap_or_else(|| {
+                            crate::meter::conservative_estimate(usage, Decimal::ONE)
+                        })
+                })
+                .collect();
+            let total_expected: Decimal = expected.iter().copied().sum();
+            for ((tier, usage), exp) in tiers.iter().zip(expected.iter()) {
+                let share = if total_expected > Decimal::ZERO {
+                    *exp / total_expected
+                } else {
+                    Decimal::ONE / Decimal::from(tiers.len().max(1) as u64)
+                };
+                prices.observe(provider, &model, *tier, delta * share, usage);
+            }
         }
         drop(prices);
 
@@ -445,10 +509,11 @@ impl Gateway {
         let Ok(prices) = self.prices.lock() else {
             return;
         };
-        for (provider, model, d) in prices.drifted() {
+        for (provider, model, tier, d) in prices.drifted() {
             tracing::warn!(
                 provider,
                 model,
+                tier,
                 configured_cost = %d.expected,
                 observed_cost = %d.observed,
                 drift_pct = format_args!("{:+.1}%", d.ratio * 100.0),

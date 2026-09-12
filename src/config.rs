@@ -355,6 +355,114 @@ pub struct ModelPriceConfig {
     /// a cache read look free, and under-estimating is the direction that spends.
     #[serde(rename = "cache read", alias = "cache_read", default)]
     pub cache_read: Option<f64>,
+    /// Time windows charged at a different rate.
+    ///
+    /// The prices above are the DEFAULT tier, charged whenever no window here
+    /// matches. Command Code, for example, bills deepseek-v4.1-flash at double
+    /// the rate Mon-Fri 01:00-04:00 and 06:00-10:00 UTC:
+    ///
+    /// ```toml
+    /// [prices.commandcode."deepseek/deepseek-v4.1-flash"]
+    /// input = 0.15              # off-peak, the default tier
+    /// output = 0.60
+    /// "cache read" = 0.003
+    ///
+    /// [[prices.commandcode."deepseek/deepseek-v4.1-flash".schedules]]
+    /// name  = "peak"
+    /// days  = "mon-fri"
+    /// hours = "01:00-04:00, 06:00-10:00"
+    /// tz    = "UTC"             # or a fixed offset like "+08:00"
+    /// input = 0.30
+    /// output = 1.20
+    /// "cache read" = 0.006
+    /// ```
+    ///
+    /// Without this, a request during a peak window is priced at the default
+    /// rate, which is wrong by the peak multiplier -- toward spending when the
+    /// peak rate is higher.
+    #[serde(default)]
+    pub schedules: Vec<ScheduleConfig>,
+}
+
+/// One time window charged at its own rate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScheduleConfig {
+    /// Label used in reports. Defaults to "schedule N".
+    #[serde(default)]
+    pub name: Option<String>,
+    /// "mon-fri", "sat,sun", "mon,wed,fri" or "*".
+    pub days: String,
+    /// "01:00-04:00, 06:00-10:00". Each range is half-open on the end.
+    pub hours: String,
+    /// "UTC" (the default) or a fixed offset such as "+08:00".
+    #[serde(default)]
+    pub tz: Option<String>,
+    pub input: f64,
+    pub output: f64,
+    #[serde(rename = "cache read", alias = "cache_read", default)]
+    pub cache_read: Option<f64>,
+}
+
+/// One tier's prices in USD per million tokens, with the cache-read price
+/// already resolved so callers never re-derive it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierPrices {
+    pub name: String,
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+}
+
+impl ModelPriceConfig {
+    /// The default tier first, then each schedule in the order they are tested.
+    /// Index 0 is always the default tier.
+    pub fn tiers(&self) -> Vec<TierPrices> {
+        let cache_read = |input: f64, given: Option<f64>| {
+            given.unwrap_or(input * default_cache_read_ratio())
+        };
+        let mut out = vec![TierPrices {
+            name: "default".to_string(),
+            input: self.input,
+            output: self.output,
+            cache_read: cache_read(self.input, self.cache_read),
+        }];
+        for (i, s) in self.schedules.iter().enumerate() {
+            out.push(TierPrices {
+                name: s
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("schedule {}", i + 1)),
+                input: s.input,
+                output: s.output,
+                cache_read: cache_read(s.input, s.cache_read),
+            });
+        }
+        out
+    }
+
+    /// The parsed time windows. An error names the provider and model, because
+    /// a schedule that fails to parse would otherwise silently price every
+    /// request at the default rate.
+    pub fn schedule(&self, provider: &str, model: &str) -> Result<crate::tier::Schedule> {
+        let mut tiers = Vec::new();
+        for (i, s) in self.schedules.iter().enumerate() {
+            let label = s
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("schedule {}", i + 1));
+            let ctx = format!("[prices.{provider}.{model}] {label}");
+            tiers.push(crate::tier::Tier {
+                name: label.clone(),
+                days: crate::tier::parse_days(&s.days)
+                    .with_context(|| format!("{ctx}: days"))?,
+                hours: crate::tier::parse_hours(&s.hours)
+                    .with_context(|| format!("{ctx}: hours"))?,
+                offset_minutes: crate::tier::parse_tz(s.tz.as_deref().unwrap_or("UTC"))
+                    .with_context(|| format!("{ctx}: tz"))?,
+            });
+        }
+        Ok(crate::tier::Schedule { tiers })
+    }
 }
 
 /// The share of the input price a cache read costs when none is given. Matches
@@ -485,10 +593,13 @@ impl Config {
             if !self.providers.contains_key(provider) {
                 bail!("[prices.{provider}] names an unknown provider");
             }
-            for model in models.keys() {
+            for (model, price) in models {
                 if model.trim().is_empty() {
                     bail!("[prices.{provider}] has an empty model name");
                 }
+                // Surface a malformed window at startup rather than as a
+                // silently wrong price at request time.
+                price.schedule(provider, model)?;
             }
         }
 
@@ -957,10 +1068,112 @@ output = 15.0
         .unwrap();
         let mut table = PriceTable::new();
         assert_eq!(table.seed_from_config(&cfg.prices), 1);
-        let p = table.get("xkiro", "m").unwrap();
+        let p = table.get("xkiro", "m", 0).unwrap();
         // $3/M input -> $0.30/M cache read, never zero: a free-looking cache
         // read would under-estimate cost, which is the spending direction.
         assert_eq!(p.cache_read_per_token, rust_decimal::Decimal::new(3, 7));
+    }
+
+    #[test]
+    fn a_peak_off_peak_schedule_parses_into_tiers() {
+        // The real Command Code shape: off-peak as the default tier, peak as a
+        // windowed override.
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.commandcode]
+adapter = "command-code"
+base_url = "https://api.commandcode.ai/provider/v1"
+
+[providers.commandcode.accounts.acc-1]
+key = "k"
+
+[routes]
+"deepseek/deepseek-v4.1-flash" = "commandcode"
+
+[prices.commandcode."deepseek/deepseek-v4.1-flash"]
+input = 0.15
+output = 0.60
+"cache read" = 0.003
+
+[[prices.commandcode."deepseek/deepseek-v4.1-flash".schedules]]
+name  = "peak"
+days  = "mon-fri"
+hours = "01:00-04:00, 06:00-10:00"
+tz    = "UTC"
+input = 0.30
+output = 1.20
+"cache read" = 0.006
+"#,
+        )
+        .expect("a windowed price must parse");
+
+        let m = &cfg.prices["commandcode"]["deepseek/deepseek-v4.1-flash"];
+        let tiers = m.tiers();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0].name, "default");
+        assert_eq!(tiers[0].input, 0.15);
+        assert_eq!(tiers[1].name, "peak");
+        assert_eq!(tiers[1].input, 0.30);
+        assert_eq!(tiers[1].cache_read, 0.006);
+
+        let schedule = m.schedule("commandcode", "deepseek/deepseek-v4.1-flash").unwrap();
+        assert_eq!(schedule.tiers.len(), 1);
+        assert_eq!(schedule.tiers[0].hours.len(), 2);
+    }
+
+    #[test]
+    fn an_omitted_cache_read_on_a_tier_defaults_to_a_tenth_of_that_tier() {
+        let cfg = Config::from_toml_str(
+            r#"
+[providers.p]
+adapter = "none"
+base_url = "https://example.invalid/v1"
+[providers.p.accounts.a]
+key = "k"
+[routes]
+"m" = "p"
+[prices.p."m"]
+input = 3.0
+output = 15.0
+[[prices.p."m".schedules]]
+days = "sat,sun"
+hours = "00:00-23:59"
+input = 6.0
+output = 30.0
+"#,
+        )
+        .unwrap();
+        let tiers = cfg.prices["p"]["m"].tiers();
+        assert!(
+            (tiers[1].cache_read - 0.6).abs() < 1e-9,
+            "a tenth of that tier's input, got {}",
+            tiers[1].cache_read
+        );
+    }
+
+    #[test]
+    fn a_malformed_window_fails_at_startup_not_at_request_time() {
+        let bad = Config::from_toml_str(
+            r#"
+[providers.p]
+adapter = "none"
+base_url = "https://example.invalid/v1"
+[providers.p.accounts.a]
+key = "k"
+[routes]
+"m" = "p"
+[prices.p."m"]
+input = 1.0
+output = 2.0
+[[prices.p."m".schedules]]
+days = "mon-fri"
+hours = "01:00-01:00"
+input = 1.0
+output = 2.0
+"#,
+        );
+        let err = format!("{:#}", bad.unwrap_err());
+        assert!(err.contains("empty"), "got: {err}");
     }
 
     #[test]

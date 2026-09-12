@@ -535,6 +535,21 @@ fn short(d: Decimal) -> String {
 // usage
 // ---------------------------------------------------------------------------
 
+/// Rebuild the price table from the config file plus whatever the ledger has
+/// learned. Used by every command that reports on prices, so they cannot drift
+/// apart.
+fn load_price_table(config: &Config) -> crate::meter::PriceTable {
+    let mut table = crate::meter::PriceTable::new();
+    table.seed_from_config(&config.prices);
+    let db = config.db_path();
+    if store::db_exists(&db)
+        && let Ok(rows) = store::open_readonly(&db).and_then(|conn| store::load_prices(&conn))
+    {
+        table.load_learned(rows);
+    }
+    table
+}
+
 fn cmd_usage(path: &Path, args: &UsageArgs) -> Result<()> {
     let config = load_config(path)?;
     let conn = open_ledger(&config.db_path())?;
@@ -561,7 +576,55 @@ fn cmd_usage(path: &Path, args: &UsageArgs) -> Result<()> {
         return Ok(());
     }
     print!("{}", render_usage(&rows, &dims, since));
+
+    // Rates in effect, then what each model is actually costing against them.
+    // The panel comes first because the drift table is unreadable without it.
+    let table = load_price_table(&config);
+    println!();
+    print_price_panel(&config, &table);
+
+    let names = tier_names(&config);
+    let drift_rows = price_rows(&table, &names);
+    if !drift_rows.is_empty() {
+        println!();
+        print!("{}", render_price_rows(&drift_rows));
+    }
     Ok(())
+}
+
+/// The drift table, shared by the usage and prices commands.
+fn render_price_rows(rows: &[PriceRow]) -> String {
+    let mut out = String::new();
+    out.push_str("DRIFT   observed spend against the configured schedule\n\n");
+    out.push_str(&format!(
+        "{:<13} {:<26} {:<10} {:<10} {:<14} {:<11} {:<11} {:<9} SAMPLES\n",
+        "PROVIDER", "MODEL", "TIER", "SOURCE", "MIX in/out/cr", "EXPECTED", "ACTUAL", "DRIFT"
+    ));
+    for r in rows {
+        out.push_str(&format!(
+            "{:<13} {:<26} {:<10} {:<10} {:<14} {:<11} {:<11} {:<9} {}\n",
+            r.provider,
+            r.model,
+            r.tier_name,
+            r.source,
+            r.mix,
+            r.expected_per_million,
+            r.actual_per_million,
+            if r.significant {
+                format!("{} !", r.drift)
+            } else {
+                r.drift.clone()
+            },
+            r.samples
+        ));
+    }
+    out.push('\n');
+    out.push_str("EXPECTED is your configured rates applied to the observed usage for that tier.\n");
+    out.push_str("ACTUAL is what the observed spend works out to over the same usage.\n");
+    out.push_str("MIX is your input / output / cache-read share of tokens, per tier.\n");
+    out.push_str("DRIFT is ACTUAL against EXPECTED; ! marks 20% or more, meaning the upstream is\n");
+    out.push_str("no longer charging what you configured - for that tier in particular.\n");
+    out
 }
 
 fn parse_group_by(spec: &str) -> Result<Vec<GroupBy>> {
@@ -1325,6 +1388,176 @@ async fn cmd_keys_test(
 }
 
 
+
+// ---------------------------------------------------------------------------
+// prices panel
+// ---------------------------------------------------------------------------
+
+/// One line of the rates-in-effect panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PricePanelRow {
+    /// "peak", "default", "learned".
+    pub label: String,
+    /// When it applies, or a note for the learned row.
+    pub when: String,
+    /// The tier's multiplier against the default tier.
+    pub ratio: String,
+    pub input: String,
+    pub output: String,
+    pub cache_read: String,
+}
+
+/// USD per million tokens, prefixed. Built by pushing the sign so a format
+/// string never has to start with a dollar sign followed by a brace.
+fn usd(per_token: rust_decimal::Decimal) -> String {
+    let v = f64_of(per_token) * 1_000_000.0;
+    let mut out = String::new();
+    out.push('$');
+    out.push_str(&format!("{v:.4}"));
+    out
+}
+
+fn usd_from_million(per_million: f64) -> String {
+    let mut out = String::new();
+    out.push('$');
+    out.push_str(&format!("{per_million:.3}"));
+    out
+}
+
+/// A human reading of a configured window: "Mon-Fri 01:00-04:00, 06:00-10:00 UTC".
+fn window_label(days: &str, hours: &str, tz: Option<&str>) -> String {
+    let days = match days.trim().to_ascii_lowercase().as_str() {
+        "mon-fri" => "Mon-Fri".to_string(),
+        "sat,sun" | "sat-sun" => "Sat-Sun".to_string(),
+        "*" => "Every day".to_string(),
+        other => other.to_string(),
+    };
+    let hours = hours.split(',').map(str::trim).collect::<Vec<_>>().join(" ");
+    let tz = tz.unwrap_or("UTC");
+    format!("{days} {hours} {tz}")
+}
+
+/// The rates in effect, per configured model, plus the built-in fallback.
+///
+/// This is the panel that answers "what am I actually being charged, and what
+/// would be used for a model I have not priced". The fallback row matters
+/// because it is what the hard gate uses for an unconfigured model, and it is
+/// deliberately far above real prices.
+pub fn price_panel(
+    config: &Config,
+    table: &crate::meter::PriceTable,
+) -> Vec<(String, Vec<PricePanelRow>)> {
+    let mut out = Vec::new();
+
+    for (provider, models) in &config.prices {
+        for (model, price) in models {
+            let label = format!("{provider}/{model}");
+            let tiers = price.tiers();
+            let default_input = tiers.first().map(|t| t.input).unwrap_or(0.0);
+            let mut rows = Vec::new();
+
+            // Windows first: they are the exception the reader is looking for.
+            let parsed = price.schedule(provider, model).ok();
+            for (i, s) in price.schedules.iter().enumerate() {
+                let tier = &tiers[i + 1];
+                let ratio = if default_input > 0.0 {
+                    format!("x{:.2}", tier.input / default_input)
+                } else {
+                    "-".to_string()
+                };
+                let _ = parsed.as_ref();
+                rows.push(PricePanelRow {
+                    label: tier.name.clone(),
+                    when: window_label(&s.days, &s.hours, s.tz.as_deref()),
+                    ratio,
+                    input: usd_from_million(tier.input),
+                    output: usd_from_million(tier.output),
+                    cache_read: usd_from_million(tier.cache_read),
+                });
+            }
+
+            let d = &tiers[0];
+            rows.push(PricePanelRow {
+                label: "default".to_string(),
+                when: if price.schedules.is_empty() {
+                    "no schedule configured".to_string()
+                } else {
+                    "every other hour".to_string()
+                },
+                ratio: "x1.00".to_string(),
+                input: usd_from_million(d.input),
+                output: usd_from_million(d.output),
+                cache_read: usd_from_million(d.cache_read),
+            });
+
+            // A learned rate for a model with no configured price is the only
+            // number that exists for it, so show it in the same shape.
+            for (p, m, tier, entry) in table.entries() {
+                if p != provider.as_str() || m != model.as_str() {
+                    continue;
+                }
+                let Some(learned) = entry.learned else { continue };
+                let name = tiers
+                    .get(tier as usize)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| format!("tier {tier}"));
+                rows.push(PricePanelRow {
+                    label: format!("learned ({name})"),
+                    when: "recovered from observed spend".to_string(),
+                    ratio: "-".to_string(),
+                    input: usd(learned.input_per_token),
+                    output: usd(learned.output_per_token),
+                    cache_read: usd(learned.cache_read_per_token),
+                });
+            }
+
+            out.push((label, rows));
+        }
+    }
+
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// The built-in fallback, as one line, for models with no configured price.
+pub fn fallback_row() -> PricePanelRow {
+    use crate::meter::{
+        CONSERVATIVE_COMPLETION_PER_MILLION as OUT, CONSERVATIVE_PROMPT_PER_MILLION as IN,
+    };
+    let input = IN as f64;
+    let cache_read = input * crate::config::default_cache_read_ratio();
+    PricePanelRow {
+        label: "fallback".to_string(),
+        when: "any model with no configured price".to_string(),
+        ratio: "-".to_string(),
+        input: usd_from_million(input),
+        output: usd_from_million(OUT as f64),
+        cache_read: usd_from_million(cache_read),
+    }
+}
+
+fn print_price_panel(config: &Config, table: &crate::meter::PriceTable) {
+    let panels = price_panel(config, table);
+    println!("PRICES   rates in effect, USD per million tokens");
+    for (label, rows) in &panels {
+        println!();
+        println!("{label}");
+        for r in rows {
+            println!(
+                "  {:<16} {:<38} {:<6} in {:<8} out {:<8} cache-read {}",
+                r.label, r.when, r.ratio, r.input, r.output, r.cache_read
+            );
+        }
+    }
+    let f = fallback_row();
+    println!();
+    println!(
+        "  {:<16} {:<38} {:<6} in {:<8} out {:<8} cache-read {}",
+        f.label, f.when, f.ratio, f.input, f.output, f.cache_read
+    );
+    println!("  deliberately high - under-estimating is what spends money");
+}
+
 // ---------------------------------------------------------------------------
 // prices
 // ---------------------------------------------------------------------------
@@ -1334,6 +1567,10 @@ async fn cmd_keys_test(
 pub struct PriceRow {
     pub provider: String,
     pub model: String,
+    /// 0 is the default price tier; higher values are configured time windows.
+    pub tier: u32,
+    /// "default", or the window's name from the configuration.
+    pub tier_name: String,
     pub source: String,
     /// Input / output / cache-read share of the tokens actually used.
     pub mix: String,
@@ -1352,12 +1589,40 @@ fn f64_of(d: Decimal) -> f64 {
     d.to_f64().unwrap_or(0.0)
 }
 
+/// Names for price tiers, keyed by (provider, model, tier). Built from the
+/// configuration, since the learned table knows only the tier index.
+pub type TierNames = std::collections::HashMap<(String, String, u32), String>;
+
+/// Tier names for every configured model, so a report can label a window the
+/// way the operator wrote it.
+pub fn tier_names(config: &Config) -> TierNames {
+    let mut out = TierNames::new();
+    for (provider, models) in &config.prices {
+        for (model, price) in models {
+            for (tier, t) in price.tiers().into_iter().enumerate() {
+                out.insert((provider.clone(), model.clone(), tier as u32), t.name);
+            }
+        }
+    }
+    out
+}
+
 /// Build the price report. Pure, so it can be tested without a terminal.
-pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
+pub fn price_rows(table: &crate::meter::PriceTable, names: &TierNames) -> Vec<PriceRow> {
     let mut rows: Vec<PriceRow> = table
         .entries()
-        .filter_map(|(provider, model, entry)| {
+        .filter_map(|(provider, model, tier, entry)| {
             let source = entry.source()?.label().to_string();
+            let tier_name = names
+                .get(&(provider.to_string(), model.to_string(), tier))
+                .cloned()
+                .unwrap_or_else(|| {
+                    if tier == 0 {
+                        "default".to_string()
+                    } else {
+                        format!("tier {tier}")
+                    }
+                });
 
             // The mix is what makes a per-million figure mean anything: the same
             // prices produce very different per-million costs on different mixes.
@@ -1368,13 +1633,13 @@ pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
             // The two per-million figures are the same comparison as the ratio,
             // expressed in money over the SAME observed mix, which is what makes
             // them readable: I expected this much per million, I am paying that.
-            let drift = table.drift(provider, model);
+            let drift = table.drift(provider, model, tier);
             let expected_per_million = drift
                 .as_ref()
                 .map(|d| format!("${:.4}", f64_of(d.expected_per_million)))
                 .unwrap_or_else(|| "-".to_string());
             let actual_per_million = table
-                .actual_per_million(provider, model)
+                .actual_per_million(provider, model, tier)
                 .map(|(v, _)| format!("${:.4}", f64_of(v)))
                 .unwrap_or_else(|| "-".to_string());
 
@@ -1382,6 +1647,8 @@ pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
             Some(PriceRow {
                 provider: provider.to_string(),
                 model: model.to_string(),
+                tier,
+                tier_name,
                 source,
                 mix,
                 expected_per_million,
@@ -1409,20 +1676,12 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
 
     // Configured prices come from the config file; learned prices come from the
     // ledger, so this works whether or not a gateway is running.
-    let mut table = crate::meter::PriceTable::new();
-    table.seed_from_config(&config.prices);
+    let table = load_price_table(&config);
+    print_price_panel(&config, &table);
+    println!();
 
-    let db = config.db_path();
-    if store::db_exists(&db) {
-        match store::open_readonly(&db).and_then(|conn| store::load_prices(&conn)) {
-            Ok(rows) => {
-                table.load_learned(rows);
-            }
-            Err(e) => println!("warning: could not read learned prices: {e:#}"),
-        }
-    }
-
-    let mut rows = price_rows(&table);
+    let names = tier_names(&config);
+    let mut rows = price_rows(&table, &names);
     if args.drift_only {
         rows.retain(|r| r.significant);
     }
@@ -1444,40 +1703,8 @@ fn cmd_prices(path: &Path, args: &PricesArgs) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<13} {:<29} {:<10} {:<14} {:<11} {:<11} {:<9} SAMPLES",
-        "PROVIDER", "MODEL", "SOURCE", "MIX in/out/cr", "EXPECTED", "ACTUAL", "DRIFT"
-    );
-    for r in &rows {
-        println!(
-            "{:<13} {:<29} {:<10} {:<14} {:<11} {:<11} {:<9} {}",
-            r.provider,
-            r.model,
-            r.source,
-            r.mix,
-            r.expected_per_million,
-            r.actual_per_million,
-            if r.significant {
-                format!("{} !", r.drift)
-            } else {
-                r.drift.clone()
-            },
-            r.samples
-        );
-    }
-    println!();
-    println!("MIX is your input / output / cache-read share of tokens. It is what makes the");
-    println!("per-million figures mean anything: identical prices cost very different amounts");
-    println!("per million on different mixes, so never compare them across mixes.");
-    println!("EXPECTED is your configured prices applied to that mix; ACTUAL is what the");
-    println!("observed spend works out to over the same mix. Both are USD per million tokens.");
-    println!("DRIFT is ACTUAL against EXPECTED. It is zero whenever the prices match, whatever");
-    println!("the mix, so it is the alarm; ! marks a 20% divergence or more, which means the");
-    println!("upstream is no longer charging what you configured.");
-    println!();
-    println!("A learned rate is a single blended figure - one probe gives one equation for");
-    println!("three unknown prices, so input and output cannot be separated without usage");
-    println!("whose mix varies. The split is therefore trusted only where you configured it.");
+    // One renderer for both commands, so they cannot disagree.
+    print!("{}", render_price_rows(&rows));
 
     let drifted = rows.iter().filter(|r| r.significant).count();
     if drifted > 0 {
@@ -1509,6 +1736,7 @@ mod tests {
                 input: 0.30,
                 output: 1.20,
                 cache_read: None,
+                schedules: Vec::new(),
             },
         );
         table.seed_from_config(&cfg);
@@ -1516,6 +1744,7 @@ mod tests {
         table.observe(
             "xkiro",
             "z-ai/glm-5.3-flash",
+            0,
             dec("0.9"),
             &crate::domain::TokenUsage {
                 prompt_tokens: 1_000_000,
@@ -1526,6 +1755,7 @@ mod tests {
         table.observe(
             "commandcode",
             "deepseek/deepseek-v4.1-flash",
+            0,
             dec("0.05"),
             &crate::domain::TokenUsage {
                 prompt_tokens: 1_000,
@@ -1538,7 +1768,7 @@ mod tests {
 
     #[test]
     fn price_rows_show_configured_against_learned() {
-        let rows = price_rows(&priced_table());
+        let rows = price_rows(&priced_table(), &TierNames::new());
         assert_eq!(rows.len(), 2);
 
         let glm = rows.iter().find(|r| r.model == "z-ai/glm-5.3-flash").unwrap();
@@ -1568,7 +1798,7 @@ mod tests {
 
     #[test]
     fn drifted_rows_sort_first_so_they_are_seen() {
-        let rows = price_rows(&priced_table());
+        let rows = price_rows(&priced_table(), &TierNames::new());
         assert!(rows[0].significant, "the drifted model must come first");
     }
 
@@ -1584,11 +1814,12 @@ mod tests {
                 input: 1.0,
                 output: 4.0,
                 cache_read: None,
+                schedules: Vec::new(),
             },
         );
         table.seed_from_config(&cfg);
 
-        let rows = price_rows(&table);
+        let rows = price_rows(&table, &TierNames::new());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "configured");
         // Nothing observed yet, so there is no mix and no per-million figure:
