@@ -406,9 +406,10 @@ TTFT 测到第一个**内容** token，跳过只带 role 和开场白性质的�
 
     cargo test                              # 整个测试套件，几秒钟
     cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
 
-两者都在每次 push 的 CI 里跑，另外还有一个 release 构建。没有 tests/ 目录：测试就放在它
-覆盖的代码旁边、各个模块内部，并且按它断言的行为命名。
+仓库里没有 CI 流水线：改动离开本机之前，跑这三条，再加一次 release 构建。也没有 tests/
+目录 —— 测试就放在它覆盖的代码旁边、各个模块内部，并且按它断言的行为命名。
 
 各家 provider 的配额适配器在 src/quota。加一家 provider = 实现一个 trait，再声明它的
 base URL、凭据和错误词表。`adapter = "none"` 刻意不支持：账号只有探测成功后才进池子，

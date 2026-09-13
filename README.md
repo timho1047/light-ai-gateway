@@ -478,10 +478,12 @@ the gateway should infer.
 
     cargo test                              # the whole suite, a couple of seconds
     cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
 
-Both run in CI on every push, together with a release build. There is no
-tests/ directory: the suite lives beside the code it covers, in each module, and
-the tests are named as the behaviour they assert.
+There is no CI workflow: those three plus a release build are what to run before
+a change leaves this machine. There is no tests/ directory either -- the suite
+lives beside the code it covers, in each module, and the tests are named as the
+behaviour they assert.
 
 Provider quota adapters live in src/quota. Adding a provider means implementing
 one trait and declaring its base URL, credentials and error vocabulary.
