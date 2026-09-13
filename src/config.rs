@@ -1379,10 +1379,30 @@ output = 2.0
         let raw = include_str!("../config.example.toml");
         let cfg = Config::from_toml_str(raw).expect("config.example.toml must stay valid");
         assert_eq!(cfg.providers.len(), 3);
-        assert_eq!(
-            cfg.resolve("deepseek/deepseek-v3.2").unwrap().provider,
-            "xkiro"
-        );
+        assert!(!cfg.routes.is_empty(), "the example must route something");
+
+        // A model name gets copied out of here into a real config, so both of the
+        // ways it can be wrong are checked: a route that does not resolve to the
+        // provider it names, and a price written for a model no route reaches. The
+        // second is how a wrong vendor prefix hides, and it leaves the route
+        // priced at the conservative default without saying so.
+        for (model, provider) in &cfg.routes {
+            assert_eq!(
+                &cfg.resolve(model).unwrap().provider,
+                provider,
+                "the example routes {model} to {provider}"
+            );
+        }
+        for (provider, models) in &cfg.prices {
+            for model in models.keys() {
+                assert_eq!(
+                    cfg.routes.get(model),
+                    Some(provider),
+                    "[prices.{provider}] {model} is unreachable: no route sends it there"
+                );
+            }
+        }
+
         assert!(
             !cfg.policy.allow_metered,
             "default must not spend metered credit"
