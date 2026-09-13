@@ -1063,7 +1063,7 @@ fn render_usage(
         .join("+");
 
     // One key can legitimately appear once per currency, and the two must not
-    // be added together (DESIGN section 7). Suffix the key in exactly that case
+    // be added together. Suffix the key in exactly that case
     // so the two rows do not look like an accidental duplicate.
     let mut keys_per_currency: BTreeMap<&str, std::collections::BTreeSet<&str>> = BTreeMap::new();
     for r in rows {
@@ -1119,8 +1119,7 @@ fn render_usage(
     }
     out.push_str(&table.render(pal));
 
-    // Totals are per currency. Adding CNY to USD would be meaningless, and
-    // DESIGN section 7 calls that out explicitly.
+    // Totals are per currency. Adding CNY to USD would be meaningless.
     let mut totals: BTreeMap<String, (u64, u64, u64, u64, Decimal)> = BTreeMap::new();
     for r in rows {
         let t = totals.entry(r.currency.clone()).or_default();

@@ -42,8 +42,6 @@ everything cost.
 - **Shows you the numbers.** A terminal board of covered allowance against
   metered balance, with reset countdowns.
 
-Design and rationale: [docs/DESIGN.md](docs/DESIGN.md) (in Chinese).
-
 ## Install
 
 Requires Rust **1.88 or newer**. The credential store binds to macOS Keychain,

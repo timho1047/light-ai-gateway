@@ -4,7 +4,7 @@
 //!
 //! Model routing is deliberately static: a model name maps to exactly one
 //! provider. Cross-provider fallback and cross-model downgrade are out of
-//! scope by design (see docs/DESIGN.md section 1).
+//! scope by design.
 
 use crate::domain::{Account, AccountState, ApiKey, ProviderId};
 use anyhow::{Context, Result, anyhow, bail};

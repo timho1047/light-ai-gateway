@@ -133,8 +133,8 @@ pub struct AttemptPlan {
     /// What this attempt committed against its account's hard gate when it was
     /// planned. Released on settle, and read by the next request's reserve.
     ///
-    /// This is what makes the in-flight term in DESIGN section 4 a real number
-    /// instead of a decoration: without it, twenty concurrent requests each
+    /// This is what makes the in-flight term a real number instead of a
+    /// decoration: without it, twenty concurrent requests each
     /// size the gate as if they were alone and can commit twenty times the
     /// headroom the account actually has.
     pub estimated_cost: Decimal,
@@ -1066,7 +1066,8 @@ impl Pool {
         // Disabled had no exit at all: nothing else in the codebase leaves it, a
         // restart restores it from disk, and no CLI command clears it, so one
         // transient 401 removed the account for good. The operator's only escape
-        // was deleting the ledger -- the thing DESIGN section 10 forbids.
+        // was deleting the ledger, which makes the gateway re-spend quota it
+        // already consumed.
         //
         // The exit is deliberately narrower than "the probe answered": that would
         // put an account disabled for insufficient credit back into rotation once
@@ -1829,8 +1830,8 @@ mod tests {
     /// Disabled had no exit at all: apply_probe revived only Unknown and Parked,
     /// a restart restored Disabled from disk, and no CLI command could clear it.
     /// Fixing the credential and probing again changed nothing, so the operator's
-    /// only escape was deleting the ledger -- the exact thing DESIGN section 10
-    /// says makes the gateway re-spend quota it already consumed.
+    /// only escape was deleting the ledger, which makes the gateway re-spend
+    /// quota it already consumed.
     #[test]
     fn a_successful_probe_brings_a_disabled_account_back() {
         let p = Pool::new(

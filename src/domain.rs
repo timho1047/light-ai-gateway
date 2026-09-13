@@ -3,7 +3,7 @@
 //! FROZEN CONTRACT (Lead-owned). Other modules depend on these shapes;
 //! changing them requires a coordinated update across the crate.
 //!
-//! Central model (see docs/DESIGN.md):
+//! Central model:
 //!   - An account holds a set of Gates. EVERY gate must pass for a request
 //!     to be accepted (AND semantics).
 //!   - GateClass::Covered gates are money already paid for by a subscription

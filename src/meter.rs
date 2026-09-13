@@ -163,12 +163,12 @@ impl PriceEntry {
     /// Cost of a usage sample under the account's credit multiplier.
     ///
     /// The multiplier converts a USD price into the account's billing unit
-    /// (DESIGN section 3: `spent_local += price(model, tokens) x
-    /// credit_multiplier`), so it applies to the CONFIGURED price only. A
+    /// (`spent_local += price(model, tokens) x credit_multiplier`), so it applies
+    /// to the CONFIGURED price only. A
     /// learned price was recovered as "provider spend delta / weighted tokens";
     /// that spend is already in billing units, so multiplying it again squares
-    /// the factor: a 4x multiplier -- the kind DESIGN section 3 lists for
-    /// Command Code's models -- over-estimates 16x, which is merely early,
+    /// the factor: a 4x multiplier -- the kind Command Code's models use --
+    /// over-estimates 16x, which is merely early,
     /// while a multiplier below 1 under-estimates by the same factor, and
     /// under-estimating is the direction that lets spend slip through into
     /// metered.
@@ -1105,8 +1105,8 @@ mod tests {
         );
     }
 
-    /// DESIGN section 3 charges price(model, tokens) x credit_multiplier, and
-    /// observe recovers that price from provider-reported spend -- spend that has
+    /// Billing charges price(model, tokens) x credit_multiplier, and observe
+    /// recovers that price from provider-reported spend -- spend that has
     /// ALREADY been multiplied. Applying the multiplier to the learned price
     /// again squares it: a factor above 1 only makes the gate early, but a factor
     /// below 1 under-estimates by the same amount and lets spend slip through
@@ -1303,8 +1303,8 @@ mod tests {
 
     #[test]
     fn observe_learns_zero_for_a_free_model() {
-        // DESIGN section 3: free models must fall out as a zero rate so they
-        // never look like they are burning quota.
+        // Free models must fall out as a zero rate so they never look like they
+        // are burning quota.
         let mut table = PriceTable::new();
         table.observe(
             P,

@@ -380,8 +380,8 @@ pub fn set_model(body: &mut serde_json::Value, model: &str) -> Option<String> {
 /// A frame whose recognised counters are ALL zero comes back with
 /// measured = false. Providers emit those as pacing/keepalive noise, and
 /// taking one as a reading would hand the hard gate cost = 0 and push a 0 into
-/// the pool's recent-cost reserve -- DESIGN section 6's zero-accounting failure
-/// mode, which is what makes the whole local-ledger scheme fail. A genuinely
+/// the pool's recent-cost reserve -- the zero-accounting failure mode that makes
+/// the whole local-ledger scheme fail. A genuinely
 /// tiny request still carries at least one non-zero counter, so only the
 /// all-zero frame is demoted.
 pub fn usage_from_json(v: &Value) -> Option<TokenUsage> {
@@ -916,7 +916,7 @@ mod tests {
     /// Providers emit all-zero usage frames as pacing/keepalive noise. Taking
     /// one as a measurement hands the hard gate cost = 0 and pushes a 0 into the
     /// pool's recent-cost reserve, which pulls the safety margin down -- exactly
-    /// the zero-accounting failure mode DESIGN section 6 exists to prevent.
+    /// the zero-accounting failure mode the reserve exists to prevent.
     #[test]
     fn an_all_zero_usage_frame_is_not_a_measurement() {
         let mut m = SseMeter::new();
