@@ -42,25 +42,19 @@ everything cost.
 - **Shows you the numbers.** A terminal board of covered allowance against
   metered balance, with reset countdowns.
 
-Design and rationale: [docs/DESIGN.md](docs/DESIGN.md) (in Chinese). This file
-is the English reference; [README.zh-CN.md](README.zh-CN.md) is the Chinese one.
-The two mirror each other -- if they ever disagree, the English one is what the
-code does.
+Design and rationale: [docs/DESIGN.md](docs/DESIGN.md) (in Chinese).
 
 ## Install
 
-Requires Rust **1.88 or newer** -- declared as `rust-version`, so an older
-toolchain is told so plainly instead of failing on a syntax error. The credential
-store binds to macOS Keychain, Windows Credential Manager and the freedesktop
-Secret Service; only macOS needs the signing step below.
+Requires Rust **1.88 or newer**. The credential store binds to macOS Keychain,
+Windows Credential Manager and the freedesktop Secret Service; only macOS needs
+the signing step below.
 
-The build produces a single self-contained binary: no runtime, no interpreter,
-nothing to install alongside it.
+The build produces one self-contained binary: no runtime, no interpreter.
 
     cargo install --path . --locked
 
-That builds in release mode and puts lgw on your PATH (~/.cargo/bin), which is
-already there if you installed Rust with rustup. Check it:
+That builds in release mode and puts `lgw` on your PATH (`~/.cargo/bin`). Check it:
 
     lgw --version
 
@@ -68,9 +62,9 @@ already there if you installed Rust with rustup. Check it:
 
     scripts/lgw-install.sh
 
-It runs the same `cargo install` and then signs the result with a stable identity.
-Skip it and the keychain asks for your password once per stored key, on every run,
-forever -- see [Credentials](#credentials). The first time you need
+It runs the same `cargo install` and then signs the result. Skip it and the keychain
+asks for your password once per key, on every run -- see
+[Credentials](#credentials). The first time you also need
 `scripts/lgw-identity.sh`, which creates the certificate.
 
 Other ways to get the same binary:
@@ -119,26 +113,23 @@ Then point your client at it:
     POST /v1/chat/completions     the proxy: retries, account switching, the usage ledger
     GET  /v1/models               the models this gateway will serve, described by the provider
 
-`/v1/models` answers with your `[routes]` and nothing else: everything the
-provider sells but you have not routed is left out, because asking for one of
-those gets a "no route for model" error, and a model picker full of models that
-cannot be called is worse than a short one. The fields come from the provider's
-own `/v1/models` response, passed through unchanged -- context length, prices,
-capability flags, whatever that provider publishes -- with `id`, `object` and,
-when the provider does not name an owner itself, `owned_by` set to the provider:
+`/v1/models` answers with your `[routes]` and nothing else: a model the provider
+sells but you have not routed is left out, because asking for it gets a "no route
+for model" error. The fields come from the provider's own `/v1/models` response,
+passed through unchanged -- context length, prices, capability flags -- with `id`,
+`object` and, when the provider does not name an owner itself, `owned_by` set to
+the provider:
 
     curl http://127.0.0.1:8787/v1/models                     # every route
     curl "http://127.0.0.1:8787/v1/models?provider=xkiro"    # one provider's routes
 
 One upstream call per provider per request, made with an eligible account's key;
-a model list spends no tokens and gives the account's reservation straight back. A
-provider whose catalog cannot be read does
-not break the list: its routes are still returned, without that provider's
-fields, and the reason is logged. A route that the provider's catalog does not
-mention is still listed -- the route is what works, and its absence from the
-catalog is the provider's business -- but with `RUST_LOG=debug` the log prints the
-published ids closest to it, which is how a wrong vendor prefix gets found (ours
-had `glm/glm-5.3-flash` where xkiro publishes `z-ai/glm-5.3-flash`).
+a model list spends no tokens. A provider whose catalog cannot be read does not
+break the list: its routes are still returned, without that provider's fields, and
+the reason is logged. A route the provider's catalog does not mention is still
+listed -- the route is what works -- and `RUST_LOG=debug` prints the published ids
+closest to it, which is how a wrong vendor prefix gets found
+(`glm/glm-5.3-flash` where xkiro publishes `z-ai/glm-5.3-flash`).
 
 ## Credentials
 
@@ -156,9 +147,9 @@ by provider/account name.
 The key is read from a hidden prompt rather than a command-line argument, because
 arguments are visible to every process on the machine and land in shell history.
 
-The gateway has a token of its own as well: the one credential with no provider
-behind it, which clients must send once other machines (or other users) can reach
-the port. Any string you invent works; it is compared, never forwarded upstream:
+The gateway also has a token of its own: the one credential with no provider behind
+it, which clients must send once anything else can reach the port. Any string you
+invent works; it is never forwarded upstream:
 
     lgw keys add local gateway            # hidden prompt, same as any other key
     # then, under [server] in the config:
@@ -166,8 +157,7 @@ the port. Any string you invent works; it is compared, never forwarded upstream:
 
 `local/gateway` is the single reserved name that needs no `[providers.*]` entry.
 `lgw keys list` shows it next to the provider keys, `lgw doctor` checks that it
-actually resolves (not merely that the config mentions it), and `lgw keys test local
-gateway` reports that it is stored -- there is no upstream to probe for this one.
+resolves, and `lgw keys test local gateway` reports that it is stored.
 
 Explicit alternatives are still supported when you want them:
 key = { keychain = true }, key = { env = "X" }, key = { key_file = "/run/secrets/x" },
@@ -180,26 +170,21 @@ program asking for it. `cargo install` produces an *ad-hoc* signature, whose
 identity is the hash of the code itself, so every rebuild looks like a different
 application to the keychain and an "Always Allow" grant does not survive it.
 
-On top of that, a grant is per ITEM, and an older build kept one keychain item
-per account: a cold start asked once per account, and `status`, `accounts probe`
-and `doctor` asked again, because each is a new process reading the same items.
-A test on this checkout read every credential in 24 ms once that was fixed;
-before, it waited on three prompts.
+A grant is also per ITEM, and an older build kept one item per account: a cold start
+asked once per account, and once more per command, because each is a new process
+reading the same items.
 
 Two things fix it:
 
     scripts/lgw-identity.sh       # once: creates and trusts the certificate
     scripts/lgw-install.sh        # cargo install, then signs the result
 
-The first makes the grant stick, because the access-control entry then names a
-certificate that does not change when the code does; the second signs the binary
-that actually gets installed. Both are optional -- without them the gateway
-behaves identically, it just keeps asking.
+The first makes the grant stick: the access-control entry then names a certificate
+that does not change when the code does. The second signs the binary that gets
+installed. Both are optional.
 
-There is also only one item to grant: every key lives in a single `vault` entry,
-which is where `lgw keys add` has always written them, and `lgw keys list` shows
-which item each key came out of. Nothing needs migrating, and there is no command
-to remember.
+There is also only one item to grant: every key lives in a single `vault` entry.
+`lgw keys list` shows which item each key came out of.
 
 If you are upgrading from a build that predates the vault, its per-account items
 are no longer read: `lgw keys add <provider> <account>` stores the key in the
@@ -207,15 +192,15 @@ vault, and the old item can be deleted in Keychain Access.
 
 Note that a plain `cargo install --path .` replaces the signed binary with an
 ad-hoc one and brings the prompts back; use `scripts/lgw-install.sh` instead.
-Re-signing restores the existing grant, so there is nothing to re-authorise.
+Re-signing restores the existing grant.
 
 If you would rather not use the credential store at all:
 
     [providers.xkiro.accounts.acc-1]
     key = { key_file = "~/.light-ai-gateway/keys/xkiro-acc-1" }   # chmod 600
 
-A 0600 file keeps other users and accidental commits out. It does not keep a
-backup or a disk image out, which is the one thing the credential store adds.
+A 0600 file keeps other users and accidental commits out, but not a backup or a
+disk image -- that is what the credential store adds.
 
 ### What this actually protects
 
@@ -224,11 +209,9 @@ backup or a disk image out, which is the one thing the credential store adds.
 - **NOT protected:** a process already running as you. It can ask the OS for the
   same secret; macOS unlocks the login keychain for the session.
 
-A vault file encrypted with a key compiled into the binary would *look* like it
-covered that second case and would not: whoever has the binary has the key. That
-is obfuscation rather than encryption, so it is deliberately not implemented. If
-you need the credentials to travel between machines, export them from the OS
-store rather than committing a ciphertext.
+Encrypting a file with a key compiled into the binary would not cover that second
+case: whoever has the binary has the key. To move credentials between machines,
+export them from the OS store rather than committing a ciphertext.
 
 Set LGW_CREDENTIAL_BACKEND=memory to force an ephemeral store, which is useful
 for tests and dry runs and never touches your real keychain.
@@ -248,30 +231,26 @@ for tests and dry runs and never touches your real keychain.
 
 ## Reading the output
 
-Every table measures its own columns, so a model name that grows does not push
-the rest of the row out of line, and the numbers are printed at the scale they
-are read at: token counts as `921.4K` and `1.0M`, money with one decimal for a
-total and enough decimals for a per-request cost that a one-decimal rule would
-round away.
+Every table measures its own columns, so a longer name does not push the rest of the
+row out of line, and numbers are printed at the scale they are read at: token
+counts as `921.4K`, money with one decimal for a total and enough decimals for a
+per-request cost.
 
-Headings -- a table's header row, a section title, the model a price panel belongs
-to -- are bold cyan. Cyan is the one colour with no meaning attached to it, so a
-heading cannot be misread as a state: green is working, yellow is weakening, red
-is wrong. The dimmed lines are legends and fix-up advice, not readings.
+Headings are bold cyan. Cyan carries no meaning, so a heading cannot be misread as a
+state: green is working, yellow is weakening, red is wrong. Dimmed lines are
+legends and advice, not readings.
 
-Beyond that, colour marks the few readings that need attention -- a state that is
-not ACTIVE, a reading that is STALE or only estimated, a price that has drifted, a
-request that spent metered money -- and nothing else. It never carries information
-on its own: the words say the same thing with the colours off. Colour is off
-whenever the output is not a terminal, so a pipe, a redirect and a log file get
-exactly the bytes they got before:
+Colour marks only the readings that need attention -- a state that is not ACTIVE, a
+reading that is STALE or only estimated, a price that has drifted, a request that
+spent metered money -- and nothing else. It carries no information of its own, and
+it is off when the output is not a terminal, so pipes, redirects and logs get the
+bytes they always did:
 
     lgw --color always status     # colour a capture or an editor's run panel
     lgw --color never status      # never colour, whatever the terminal says
 
-`NO_COLOR=1` turns it off and `CLICOLOR_FORCE=1` turns it on, which is how a
-terminal that cannot be detected (`docker run -t`, a CI that captures the stream)
-keeps its colours.
+`NO_COLOR=1` turns it off and `CLICOLOR_FORCE=1` turns it on, for terminals that
+cannot be detected (`docker run -t`, a CI that captures the stream).
 
 ## Account recovery
 
@@ -284,9 +263,9 @@ probe shows it is both reachable and funded:
     lgw keys add <provider> <account>    # first, if the credential was the problem
     lgw accounts probe <id>
 
-A probe that comes back with headroom puts the account back on its own. One that
-succeeds but still shows nothing left does not, deliberately: an account that is
-out of money would otherwise re-enter rotation once per poll and fail every time.
+A probe with headroom puts the account back. One that succeeds but still shows
+nothing left does not: it would otherwise re-enter rotation every poll and fail
+every time.
 
 **An operator disables it** -- `lgw accounts disable <id>`. That is a decision,
 and a probe will not undo it: a probe proves the credential works, not that you
@@ -313,9 +292,8 @@ pricing page names it and in USD per million tokens:
     output = 1.20
     "cache read" = 0.03     # optional; defaults to input / 10
 
-`cache read` is a price, not a ratio, so it reads the same as the other two.
-Leaving it out assumes a tenth of input rather than zero: a cache read that looks
-free would under-estimate cost, and under-estimating is the direction that spends.
+`cache read` is a price, not a ratio, so it reads like the other two. Leaving it
+out assumes a tenth of input rather than zero.
 
 **Learned** is what the spend difference between two quota probes says it
 actually costs. Providers apply per-model multipliers, promotions and credit
@@ -329,10 +307,8 @@ easily in practice:
   spend per account, not per client. Use the same account from an editor and its
   spend lands in the interval and gets charged to the gateway's own tokens.
 - **The interval must carry a real token volume.** A spend figure divided by a
-  handful of tokens is a fixed per-request charge wearing a rate's clothes. One
-  live Command Code interval turned 47 tokens and 0.073 credits into 1559 USD
-  per million, which then refused every request over ~5,400 tokens. Rates above
-  1000 USD per million are now rejected rather than stored, and so is any such
+  handful of tokens is a fixed per-request charge wearing a rate's clothes. Rates
+  above 1000 USD per million are rejected rather than stored, and so is any such
   row read back from an older ledger.
 
 When either condition is doubtful, write the price down instead of waiting for it
@@ -349,23 +325,17 @@ EXPECTED is your configured prices applied to that mix, ACTUAL is what the
 observed spend works out to. Read together they say "I expected $0.26 per
 million and I am paying $0.9".
 
-The MIX column is not decoration. The same prices cost very different amounts
-per million on different mixes -- measured, $0.2166/M on an input-heavy mix
-against $0.9/M on an output-heavy one -- so a per-million figure only means
-something next to the mix it was measured on. Never compare one across mixes.
+The same prices cost very different amounts per million on different mixes
+($0.2166/M input-heavy against $0.9/M output-heavy), so never compare a
+per-million figure across mixes. DRIFT is the exception: it is zero whenever
+prices match, whatever the mix.
 
-DRIFT is the exception: it is zero whenever prices match, whatever the mix,
-which is why it is the thing to watch and the money columns are the explanation.
+A learned rate is one blended figure: input and output cannot be separated unless
+your usage mix varies, so the split is trusted only where you configured it.
 
-A learned rate is a single blended figure. One probe gives one equation for
-three unknown prices, so input and output cannot be separated unless your usage
-mix varies; the split is therefore trusted only where you configured it.
-
-That combination is a monitoring tool, not just a display. If the two agree,
-nothing has changed. If they diverge by 20% or more the row is flagged and a
-warning is logged, which means the upstream price is no longer what you were
-told -- a repricing you heard about, or one you did not. `--drift-only` prints
-just those rows.
+If the two agree, nothing has changed. If they diverge by 20% or more the row is
+flagged and a warning is logged: the upstream price is no longer what you
+configured. `--drift-only` prints just those rows.
 
 A model with no configured price and no observation yet is priced at a
 deliberately conservative default, so an unpriced model can never look free.
@@ -381,17 +351,14 @@ Every quota check is one of two kinds, and the gateway never conflates them:
 | **Covered** | xKiro 5h/7d spend windows, Command Code monthly credits | Prepaid by a subscription. Forfeited when the window resets. Preferred. |
 | **Metered** | xKiro wallet, Command Code purchased credits, DeepSeek balance | Real money. Permanent once spent. Refused unless the operator opts in. |
 
-A third kind sits outside this table: xKiro's daily **free-token allowance**. It
-is read and stored, but it is counted in tokens rather than money, so it takes no
-part in routing, in the hard gate or in the board. Exhausting it blocks free
-models only, and free models are not routed here; letting it retire an account
-would take paid models offline because an allowance nobody was spending ran out.
-It reaches the client as the provider's own 429.
+A third kind sits outside this table: xKiro's daily **free-token allowance**. It is
+read and stored, but counted in tokens rather than money, so it plays no part in
+routing, the hard gate or the board. It reaches the client as the provider's own
+429.
 
-The distinction is not cosmetic. Command Code does not return an error when a
-5-hour window is exhausted; it silently bills your purchased credits instead, so
-the request succeeds while your balance drops. A gateway that only reacts to 429s
-will spend money without ever telling you. The hard gate below is the guard.
+The distinction matters. Command Code does not return an error when a 5-hour window
+is exhausted; it silently bills your purchased credits, so the request succeeds
+while your balance drops. That is what the hard gate guards against.
 
 ## How an account is chosen
 
@@ -400,16 +367,13 @@ For each request:
 1. **Hard gate.** Only accounts whose covered headroom covers the estimated cost
    plus a reserve are candidates. The reserve is the larger of the p95 of recent
    request costs and what that account already has committed in flight, plus a
-   configured margin. That is what stops a burst from overflowing into paid
-   credits: twenty concurrent requests cannot each size the gate as though the
-   other nineteen were not there.
+   configured margin.
 2. **Sticky first.** If the session is already bound to a candidate, keep it.
    Moving a conversation discards the provider's prompt cache and re-bills the
    whole history at full input price.
 3. **Consume-first.** Among candidates below the soft threshold, take the most
    used. Draining one account before moving on minimises switches, and every
-   switch costs a cache miss. (Measured over a simulated 72 hours: consume-first
-   produced 27 switches where least-used-first produced about 1400.)
+   switch costs a cache miss.
 4. **Soft threshold is a preference, not a wall.** If every account is above 80%
    the least-used one is still used. A threshold you configured must not become
    an outage while headroom genuinely remains.
@@ -448,15 +412,12 @@ is what account switching destroys.
 Start with `lgw doctor`. It parses the config, resolves every credential, probes
 every provider, checks the two things a model name can silently disagree about --
 a price entry no route can reach, and a route the provider's own `/v1/models` does
-not publish (it names the closest id it does publish) -- flags a port other
-machines can reach, and exits non-zero with a count of what is wrong.
+not publish (naming the closest id it does publish) -- flags a port other machines
+can reach, and exits non-zero with a count of what is wrong.
 
-The second check is worth explaining: a route key is the model id sent upstream,
-so a wrong vendor prefix (`glm/glm-5.3-flash` where the provider has
-`z-ai/glm-5.3-flash`) is a request the provider refuses -- and it also orphans
-whatever price entry was written for the real id, leaving the route gated at the
-conservative default of 15 in / 75 out per million. Both halves of that are
-reported, separately, because either one can happen alone.
+A route key is the model id sent upstream, so a wrong vendor prefix is both a
+request the provider refuses and an orphaned price entry that leaves the route
+gated at the conservative default of 15 in / 75 out per million.
 
 | Symptom | Where to look |
 |---|---|
@@ -471,8 +432,7 @@ reported, separately, because either one can happen alone.
 
 Cross-provider fallback, cross-model downgrade, protocol translation, semantic
 caching, multi-user RBAC and a web UI are all deliberately out of scope. A model
-maps to exactly one provider; changing that is a product decision, not something
-the gateway should infer.
+maps to exactly one provider; changing that is a product decision.
 
 ## Development
 
@@ -506,7 +466,6 @@ no warranty, and it spends real money when you configure it to.
 - Probe hosts are pinned in configuration, and redirects are refused outright, so
   a credential cannot be sent to an address supplied with a request or named in a
   Location header.
-- A failed quota probe keeps the previous reading and marks it stale. It never
-  resets a reading to zero, which would both overstate availability and let the
-  CLI claim a funded account is empty.
+- A failed quota probe keeps the previous reading and marks it stale; it never
+  resets a reading to zero.
 - Prompt and response bodies are never stored.
