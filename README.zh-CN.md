@@ -201,6 +201,8 @@ macOS 把钥匙串条目的访问控制绑在**调用方的代码签名**上。`
     lgw status [--refresh]             账号看板
     lgw usage --since 7d --group-by provider,model,account
     lgw prices [--drift-only]          配置价 vs 从真实花费学到的价
+    lgw prices --forget [PROVIDER [MODEL]]
+                                       丢掉学到的价，回到配置价
     lgw keys add|list|remove|test      provider 凭据
     lgw accounts list|probe|disable    账号维护
     lgw accounts enable <id>           把被停用的账号放回池子
@@ -301,6 +303,21 @@ $0.26，实际在付 $0.9」。
 
 学到的价会持久化，重启不会掉回那个默认值。
 
+学到的价是全历史均值，一旦被外部用量污染，就会一直偏高。忘掉它，配置价立刻生效：
+
+    lgw prices --forget                          # 全部学到的行
+    lgw prices --forget xkiro                    # 某一个 provider
+    lgw prices --forget xkiro z-ai/glm-5.3-flash # 某一个模型
+
+    PROVIDER  MODEL               TIER  RATE     CACHE READ  SAMPLES
+    xkiro     z-ai/glm-5.3-flash     0  $0.4071  $0.0081          44
+
+跑着的 `lgw serve` 自己存着一份表，下次探测还会写回来，所以要重启才生效。忘掉一个本来就没
+配价的模型，它会掉到那个刻意定高的默认价 —— 要么先把价格写上，要么就别动它。
+
+某个区间里花费涨了，网关这边却没有 token 可以摊，这笔钱会被记成无法归属，并跳过学习：账号
+在别处也在用，而这正是学到的价失去意义的时刻。
+
 ## 两种钱
 
 每一次配额检查都属于两类之一，网关从不把它们混为一谈：
@@ -371,6 +388,7 @@ TTFT 测到第一个**内容** token，跳过只带 role 和开场白性质的�
 | 修好 key 之后账号仍是 DISABLED | 探测只会恢复同时还有余量的账号，而运维手工停用永远不会被探测撤销 —— 见 [账号恢复](#账号恢复) |
 | 每次运行都弹密码框（macOS） | 授权绑在代码签名上，ad-hoc 签名每次重建都会变：跑 `scripts/lgw-install.sh` |
 | 价格看着不对 | `lgw prices --drift-only`。学到的价是观测值，不是真理，而配置价永远不会被它覆盖 |
+| 学到的价明显高于价目表 | 账号在网关之外也被用过，那部分花费被算到了这些 token 上。`lgw prices --forget <provider> <model>`，然后重启 `lgw serve` |
 | 每个请求都是 429，Retry-After 还是几周 | 某个 covered 窗口用尽了，最早的窗口重置就有那么远。`lgw status` 会按闸门显示倒计时 |
 | 换过数据库位置后看板是空的 | 账本路径是配置里的 `server.db_path`。空看板的意思是「还没探测过」，不是「没有账号」 |
 

@@ -220,6 +220,8 @@ for tests and dry runs and never touches your real keychain.
     lgw status [--refresh]             account board
     lgw usage --since 7d --group-by provider,model,account
     lgw prices [--drift-only]          configured price vs the price learned from real spend
+    lgw prices --forget [PROVIDER [MODEL]]
+                                       drop learned prices, go back to the configured card
     lgw keys add|list|remove|test      provider credentials
     lgw accounts list|probe|disable    account maintenance
     lgw accounts enable <id>           put a disabled account back
@@ -340,6 +342,26 @@ deliberately conservative default, so an unpriced model can never look free.
 
 Learned prices are persisted, so a restart does not fall back to that default.
 
+A learned rate is the mean over the whole history, so a row polluted by outside
+usage stays too high forever. Forget it and the configured price is in effect
+again:
+
+    lgw prices --forget                          # every learned row
+    lgw prices --forget xkiro                    # one provider
+    lgw prices --forget xkiro z-ai/glm-5.3-flash # one model
+
+    PROVIDER  MODEL               TIER  RATE     CACHE READ  SAMPLES
+    xkiro     z-ai/glm-5.3-flash     0  $0.4071  $0.0081          44
+
+A running `lgw serve` keeps its own copy of the table and writes it back on the next
+probe, so restart it for the change to stick. Forgetting a model that has no
+configured price drops it to the conservative default -- write the price down
+first, or leave the row alone.
+
+Spend that moves between probes while the gateway has no tokens to charge it to is
+logged as unattributable and not learned: the account is being used somewhere else,
+which is exactly when a learned rate stops meaning anything.
+
 ## The two pots of money
 
 Every quota check is one of two kinds, and the gateway never conflates them:
@@ -423,6 +445,7 @@ gated at the conservative default of 15 in / 75 out per million.
 | An account stays DISABLED after you fixed the key | a probe only restores an account that also shows headroom, and an operator disable is never undone by one -- see [Account recovery](#account-recovery) |
 | A password prompt on every run (macOS) | the grant is bound to the code signature, and an ad-hoc one changes on every rebuild: run `scripts/lgw-install.sh` |
 | A price looks wrong | `lgw prices --drift-only`. A learned rate is an observation, not the truth, and a configured price is never overwritten by one |
+| A learned price reads far above the card | the account was used outside the gateway, so that spend was charged to these tokens: `lgw prices --forget <provider> <model>`, then restart `lgw serve` |
 | Every request is 429 with a Retry-After of weeks | a covered window is spent and the earliest reset is that far away. `lgw status` shows a countdown per gate |
 | The board is empty after moving the database | the ledger path is `server.db_path` in the config. An empty board means "not probed yet", never "no accounts" |
 

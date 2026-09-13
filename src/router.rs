@@ -52,6 +52,23 @@ fn interval_spend(
     delta
 }
 
+/// Add this interval's unattributed spend to the provider's running total.
+///
+/// Returns the new total. Split out from the warning so the accounting can be
+/// tested without building a gateway.
+fn add_unattributed(
+    totals: &Mutex<HashMap<String, Decimal>>,
+    provider: &str,
+    delta: Decimal,
+) -> Decimal {
+    let Ok(mut totals) = totals.lock() else {
+        return delta;
+    };
+    let entry = totals.entry(provider.to_string()).or_insert(Decimal::ZERO);
+    *entry += delta;
+    *entry
+}
+
 /// Provider spend observed at the last probe, for price learning.
 ///
 /// Keyed by account, then by gate kind, and both levels are load-bearing.
@@ -88,6 +105,13 @@ pub struct Gateway {
     /// being smeared across the peak and off-peak rates.
     pending: Mutex<HashMap<(String, String, u32), TokenUsage>>,
     last_spend: Mutex<HashMap<String, SpendSample>>,
+    /// Spend that moved with no local tokens to attribute it to, per provider,
+    /// since this process started.
+    ///
+    /// A single interval's worth is small enough to dismiss; a day's worth is the
+    /// answer to "where did the money go", which is the question the per-interval
+    /// warning cannot answer on its own.
+    unattributed: Mutex<HashMap<String, Decimal>>,
 }
 
 impl Gateway {
@@ -202,6 +226,7 @@ impl Gateway {
             probes,
             pending: Mutex::new(HashMap::new()),
             last_spend: Mutex::new(HashMap::new()),
+            unattributed: Mutex::new(HashMap::new()),
         });
 
         // Restore the persisted ledger. Accounts come back in Unknown state, so
@@ -557,6 +582,21 @@ impl Gateway {
                 .collect()
         };
         if drained.is_empty() {
+            // Spend moved and none of our tokens did. That is either an account
+            // used by something other than this gateway or traffic that predates
+            // this process, and either way the money cannot be attributed to a
+            // model: it is dropped from learning rather than smeared over these
+            // tokens. Silently dropping it is how the same thing hid for a week,
+            // so both the interval and the running total are reported -- the
+            // interval alone looks like rounding, the total is the real number.
+            let total = add_unattributed(&self.unattributed, provider, delta);
+            tracing::warn!(
+                provider,
+                interval_spend = %delta,
+                unattributed_total = %total,
+                "spend moved with no local tokens to attribute it to; price learning \
+                 skipped this interval. Is this account used outside the gateway?"
+            );
             return;
         }
 
@@ -789,6 +829,21 @@ mod tests {
 
         // p/a: max(+800 from weekly, -990 ignored) = 0.800; p/c: +0.250.
         assert_eq!(interval_spend(&previous, &current), d(1_050, 3));
+    }
+
+    /// Spend with no tokens accumulates, so the warning can report a total and
+    /// not just the interval that happens to be small.
+    #[test]
+    fn unattributed_spend_accumulates_per_provider() {
+        let totals = std::sync::Mutex::new(HashMap::new());
+        assert_eq!(add_unattributed(&totals, "commandcode", d(31, 3)), d(31, 3));
+        assert_eq!(add_unattributed(&totals, "commandcode", d(19, 3)), d(50, 3));
+        assert_eq!(
+            add_unattributed(&totals, "xkiro", d(2, 3)),
+            d(2, 3),
+            "one provider's leak is not another's"
+        );
+        assert_eq!(add_unattributed(&totals, "commandcode", d(1, 3)), d(51, 3));
     }
 
     /// Nothing moved: there is no interval spend to learn from.

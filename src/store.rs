@@ -304,6 +304,14 @@ pub fn open_readonly(path: &Path) -> Result<Connection> {
 pub enum WriteMsg {
     /// Replace the learned price table.
     Prices(Vec<crate::meter::PersistedPrice>),
+    /// Drop learned prices: all of them, one provider's, or one model's.
+    ///
+    /// Not expressed as `Prices(vec![])`: that would clear rows this process has
+    /// not loaded, and it cannot say "forget just this model" at all.
+    ForgetPrices {
+        provider: Option<String>,
+        model: Option<String>,
+    },
     Request(Box<RequestRecord>),
     Attempt(Box<AttemptRecord>),
     Accounts(Vec<Account>),
@@ -417,6 +425,22 @@ impl StoreHandle {
         }
     }
 
+    /// Forget learned prices, so the configured card is what the model costs
+    /// again.
+    ///
+    /// A running gateway holds its own in-memory table and writes it back on the
+    /// next probe, so this only sticks while `lgw serve` is stopped or after it
+    /// is restarted; the command that calls this says so.
+    pub fn forget_prices(&self, provider: Option<&str>, model: Option<&str>) {
+        let msg = WriteMsg::ForgetPrices {
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+        };
+        if self.tx.send(msg).is_err() {
+            tracing::error!("store writer is gone; learned prices were not forgotten");
+        }
+    }
+
     /// Persist learned prices. Sent after every probe that learned something.
     pub fn save_prices(&self, prices: Vec<crate::meter::PersistedPrice>) {
         if self.tx.send(WriteMsg::Prices(prices)).is_err() {
@@ -525,6 +549,9 @@ fn apply_batch(
                 save_accounts_tx(&tx, std::slice::from_ref(account.as_ref()))
             }
             WriteMsg::Prices(prices) => save_prices_tx(&tx, prices),
+            WriteMsg::ForgetPrices { provider, model } => {
+                forget_prices_tx(&tx, provider.as_deref(), model.as_deref()).map(|_| ())
+            }
             WriteMsg::Flush(ack) => {
                 flushes.push(ack.clone());
                 Ok(())
@@ -698,6 +725,31 @@ fn save_prices_tx(tx: &Transaction<'_>, prices: &[crate::meter::PersistedPrice])
         )?;
     }
     Ok(())
+}
+
+/// Drop learned prices.
+///
+/// Scoped rather than wholesale because the useful case is "this one model was
+/// learned from an account that is also used elsewhere -- forget it and go back
+/// to the card". A model with no provider cannot be expressed from the command
+/// line, but the wildcard case is handled here so the function stays total.
+fn forget_prices_tx(
+    tx: &Transaction<'_>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<u64> {
+    let removed = match (provider, model) {
+        (Some(provider), Some(model)) => tx.execute(
+            "DELETE FROM prices WHERE provider = ?1 AND model = ?2",
+            params![provider, model],
+        )?,
+        (Some(provider), None) => {
+            tx.execute("DELETE FROM prices WHERE provider = ?1", params![provider])?
+        }
+        (None, Some(model)) => tx.execute("DELETE FROM prices WHERE model = ?1", params![model])?,
+        (None, None) => tx.execute("DELETE FROM prices", [])?,
+    };
+    Ok(removed as u64)
 }
 
 /// Whether a table exists in this database.
@@ -1495,6 +1547,74 @@ mod tests {
             .unwrap();
         let loaded = load_prices(&conn).expect("a missing prices table is not a failure");
         assert!(loaded.is_empty());
+    }
+
+    /// Forgetting is scoped, and a scope that matches nothing removes nothing.
+    ///
+    /// The useful case is one model learned from a shared account, so the scope
+    /// has to be exact: "forget xkiro" must not touch commandcode, and "forget
+    /// xkiro/m" must leave that provider's other models alone.
+    #[test]
+    fn forgetting_learned_prices_is_scoped() {
+        fn row(provider: &str, model: &str, samples: u64) -> crate::meter::PersistedPrice {
+            crate::meter::PersistedPrice {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                tier: 0,
+                price: crate::meter::ModelPrice {
+                    input_per_token: dec("0.0000004"),
+                    output_per_token: dec("0.0000004"),
+                    cache_read_per_token: dec("0.000000008"),
+                    samples,
+                },
+                observed_prompt_tokens: 10,
+                observed_completion_tokens: 10,
+                observed_cached_tokens: 0,
+            }
+        }
+
+        let tmp = TempDb::new("forget");
+        let handle = StoreHandle::spawn(&tmp.path).expect("spawn writer");
+        handle.save_prices(vec![
+            row("xkiro", "m-one", 3),
+            row("xkiro", "m-two", 4),
+            row("commandcode", "m-one", 5),
+        ]);
+        handle.flush_blocking().expect("flush");
+
+        // A scope that matches nothing leaves the table alone.
+        handle.forget_prices(Some("xkiro"), Some("no-such-model"));
+        handle.flush_blocking().expect("flush");
+        let conn = open(&tmp.path).expect("reopen");
+        assert_eq!(load_prices(&conn).expect("load").len(), 3);
+
+        // One model of one provider.
+        handle.forget_prices(Some("xkiro"), Some("m-one"));
+        handle.flush_blocking().expect("flush");
+        let loaded = load_prices(&open(&tmp.path).expect("reopen")).expect("load");
+        assert_eq!(loaded.len(), 2);
+        assert!(
+            loaded
+                .iter()
+                .any(|p| p.provider == "commandcode" && p.model == "m-one"),
+            "the same model under another provider must survive"
+        );
+
+        // One provider: the other model goes, the other provider stays.
+        handle.forget_prices(Some("xkiro"), None);
+        handle.flush_blocking().expect("flush");
+        let loaded = load_prices(&open(&tmp.path).expect("reopen")).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].provider, "commandcode");
+
+        // Everything.
+        handle.forget_prices(None, None);
+        handle.flush_blocking().expect("flush");
+        assert!(
+            load_prices(&open(&tmp.path).expect("reopen"))
+                .expect("load")
+                .is_empty()
+        );
     }
 
     #[test]

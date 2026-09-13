@@ -134,6 +134,16 @@ pub struct PricesArgs {
     /// Show only models whose observed price has moved away from the configured one.
     #[arg(long)]
     pub drift_only: bool,
+
+    /// Forget learned prices and fall back to the configured card.
+    ///
+    /// With no value: every provider. With one: that provider. With two: that
+    /// provider and model. Learning is only sound while an account is used
+    /// exclusively through this gateway -- spend from anywhere else lands in the
+    /// same meter and gets attributed to these tokens -- so this is the way back
+    /// to the price the operator wrote down.
+    #[arg(long, value_names = ["PROVIDER", "MODEL"], num_args = 0..=2)]
+    pub forget: Option<Vec<String>>,
 }
 
 #[derive(Debug, Args)]
@@ -2562,8 +2572,117 @@ pub fn price_rows(table: &crate::meter::PriceTable, names: &TierNames) -> Vec<Pr
     rows
 }
 
+/// Forget learned prices and say what takes their place.
+///
+/// The learned table is only evidence about the model while the account is used
+/// exclusively through this gateway: the provider meters spend per ACCOUNT, so
+/// spend from an editor, another client, or the days before this gateway ran
+/// lands in the same delta and gets divided by these tokens. The rate that comes
+/// out is too high, the hard gate then over-estimates every request, and the
+/// DRIFT row stays flagged -- a permanent warning hiding the real one. Forgetting
+/// the row is the way back to the card.
+fn forget_learned_prices(config: &Config, scope: &[String], pal: &Palette) -> Result<()> {
+    let (provider, model) = match scope {
+        [] => (None, None),
+        [provider] => (Some(provider.as_str()), None),
+        [provider, model] => (Some(provider.as_str()), Some(model.as_str())),
+        _ => bail!("--forget takes at most a provider and a model"),
+    };
+
+    // Read what is there before deleting, so the command can show what it is
+    // giving up and can tell "nothing matched" from "done".
+    let table = load_price_table(config);
+    let matching: Vec<crate::meter::PersistedPrice> = table
+        .learned_rows()
+        .into_iter()
+        .filter(|row| provider.is_none_or(|p| row.provider == p))
+        .filter(|row| model.is_none_or(|m| row.model == m))
+        .collect();
+
+    if matching.is_empty() {
+        println!("no learned price matches that scope; nothing to forget");
+        return Ok(());
+    }
+
+    // One RATE column, not an input/output pair: a learned price is a single
+    // blended figure applied to both (see meter::PriceTable::observe), so the two
+    // columns would always hold the same number and read like a bug.
+    let mut rows = crate::table::Table::new(&[
+        ("PROVIDER", crate::table::Align::Left),
+        ("MODEL", crate::table::Align::Left),
+        ("TIER", crate::table::Align::Right),
+        ("RATE", crate::table::Align::Right),
+        ("CACHE READ", crate::table::Align::Right),
+        ("SAMPLES", crate::table::Align::Right),
+    ]);
+    for row in &matching {
+        let per_million =
+            |per_token: rust_decimal::Decimal| usd_rate(f64_of(per_token) * 1_000_000.0);
+        rows.push(vec![
+            row.provider.clone(),
+            row.model.clone(),
+            row.tier.to_string(),
+            per_million(row.price.input_per_token),
+            per_million(row.price.cache_read_per_token),
+            row.price.samples.to_string(),
+        ]);
+    }
+    println!("{}", pal.bold("FORGET   learned prices being dropped"));
+    println!("{}", rows.render(pal));
+    println!(
+        "{}",
+        pal.dim(
+            "RATE is the blended rate learned from spend over weighted tokens, USD per million"
+        )
+    );
+
+    let db = config.db_path();
+    let handle = store::StoreHandle::spawn(&db)?;
+    handle.forget_prices(provider, model);
+    handle.flush_blocking()?;
+
+    // What replaces them. A model with no configured price falls to the
+    // conservative default, which is worth saying out loud: forgetting a row is
+    // not free when nothing was written down instead.
+    let mut unplaced: Vec<(String, String)> = Vec::new();
+    for row in &matching {
+        let configured = config
+            .prices
+            .get(&row.provider)
+            .is_some_and(|models| models.contains_key(&row.model));
+        if !configured && !unplaced.contains(&(row.provider.clone(), row.model.clone())) {
+            unplaced.push((row.provider.clone(), row.model.clone()));
+        }
+    }
+
+    println!();
+    println!(
+        "forgot {} learned row(s); the configured price is in effect again",
+        matching.len()
+    );
+    for (provider, model) in &unplaced {
+        println!(
+            "  {} {provider}/{model} has no configured price: it is now priced at the \
+             conservative default, which is deliberately far above real rates",
+            pal.yellow("note:")
+        );
+    }
+    println!(
+        "{}",
+        pal.dim(
+            "note: a running lgw serve holds its own learned table and writes it back on the \
+             next probe; restart it so this sticks"
+        )
+    );
+    Ok(())
+}
+
 fn cmd_prices(path: &Path, args: &PricesArgs, pal: &Palette) -> Result<()> {
     let config = load_config(path)?;
+
+    if let Some(scope) = &args.forget {
+        return forget_learned_prices(&config, scope, pal);
+    }
 
     // Configured prices come from the config file; learned prices come from the
     // ledger, so this works whether or not a gateway is running.
@@ -3783,6 +3902,40 @@ key = {{ key_file = "{}" }}
         assert!(text.contains("850ms"));
         assert!(text.contains("45.2"));
         assert!(text.contains("covered"));
+    }
+
+    /// `--forget` takes zero, one or two values and nothing else.
+    ///
+    /// The scope is positional precisely so that "forget this model" cannot be
+    /// confused with "forget everything", and clap accepting a third value would
+    /// be silently ignored by the slow path.
+    #[test]
+    fn forget_parses_its_scope() {
+        use clap::Parser;
+
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("lgw").chain(args.iter().copied()))
+                .map(|cli| match cli.command {
+                    Command::Prices(p) => p.forget,
+                    _ => panic!("expected the prices command"),
+                })
+                .map_err(|e| e.to_string())
+        };
+
+        assert_eq!(parse(&["prices"]).unwrap(), None);
+        assert_eq!(parse(&["prices", "--forget"]).unwrap(), Some(Vec::new()));
+        assert_eq!(
+            parse(&["prices", "--forget", "xkiro"]).unwrap(),
+            Some(vec!["xkiro".to_string()])
+        );
+        assert_eq!(
+            parse(&["prices", "--forget", "xkiro", "z-ai/glm-5.3"]).unwrap(),
+            Some(vec!["xkiro".to_string(), "z-ai/glm-5.3".to_string()])
+        );
+        assert!(
+            parse(&["prices", "--forget", "a", "b", "c"]).is_err(),
+            "a third value is not a scope"
+        );
     }
 
     // ----------------------------------------------------------------- doctor
