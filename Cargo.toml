@@ -4,16 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "OpenAI-compatible gateway that pools provider accounts and routes around exhausted quota windows"
-# The floor is 1.88, not the 1.85 that edition 2024 alone asks for: the crate uses
-# let-chains throughout, and the highest rust-version any dependency declares is
-# 1.88.0 (time, icu_*). Declaring it means an old toolchain gets a clear message
-# instead of a parse error, and that cargo's MSRV-aware resolver keeps picking
-# dependency versions that still work.
 rust-version = "1.88"
-# The crate is light-ai-gateway, but the command every document, help text and
-# error message refers to is lgw. Declaring the binary explicitly is what makes
-# "cargo install" put a working lgw on PATH instead of a binary whose name
-# appears nowhere in the documentation.
 [[bin]]
 name = "lgw"
 path = "src/main.rs"
