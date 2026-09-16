@@ -391,7 +391,11 @@ const BOARD_HEADERS: [(&str, crate::table::Align); 6] = [
     ("ACCOUNT", crate::table::Align::Left),
     ("COVERED", crate::table::Align::Left),
     ("METERED", crate::table::Align::Left),
-    ("RESETS", crate::table::Align::Right),
+    // Left, not right: the cell now holds several labelled countdowns, and
+    // "which account resets first" is answered by reading those down one
+    // column. Right-aligning the whole cell shifted each row's entries by its
+    // own length, so they never lined up.
+    ("RESETS", crate::table::Align::Left),
     ("STATE", crate::table::Align::Left),
 ];
 
@@ -402,10 +406,11 @@ const BOARD_HEADERS: [(&str, crate::table::Align); 6] = [
 /// been touched. The two are deliberately different shapes so that an operator
 /// scanning the table cannot mistake one for the other.
 ///
-/// Both are composite columns: several readings, each with its own label, plus a
-/// unit. Their sub-columns are measured across the whole board (see BoardWidths)
-/// rather than per cell, so a fraction, a window label and a currency code line
-/// up down the page even though accounts hold different numbers of windows.
+/// All three are composite columns: several readings, each with its own label,
+/// plus a unit. Their sub-columns are measured across the whole board (see
+/// BoardWidths) rather than per cell, so a fraction, a window label and a
+/// currency code line up down the page even though accounts hold different
+/// numbers of windows.
 fn render_board(rows: &[AccountOverview], now: OffsetDateTime, pal: &Palette) -> String {
     // Measured widths, like every other table here. The board used to carry its
     // own [14, 18, 26, 26, 8], and an account whose state explanation ran long --
@@ -413,9 +418,11 @@ fn render_board(rows: &[AccountOverview], now: OffsetDateTime, pal: &Palette) ->
     // it out of line.
     let covered: Vec<Option<Covered>> = rows.iter().map(|r| covered_of(r, pal)).collect();
     let metered: Vec<Option<Metered>> = rows.iter().map(|r| metered_of(r, pal)).collect();
+    let resets: Vec<Option<Resets>> = rows.iter().map(|r| resets_of(r, now)).collect();
     let covered_refs: Vec<&Covered> = covered.iter().flatten().collect();
     let metered_refs: Vec<&Metered> = metered.iter().flatten().collect();
-    let widths = BoardWidths::measure(&covered_refs, &metered_refs);
+    let reset_refs: Vec<&Resets> = resets.iter().flatten().collect();
+    let widths = BoardWidths::measure(&covered_refs, &metered_refs, &reset_refs);
 
     let mut table = crate::table::Table::new(&BOARD_HEADERS);
     for (i, r) in rows.iter().enumerate() {
@@ -424,7 +431,7 @@ fn render_board(rows: &[AccountOverview], now: OffsetDateTime, pal: &Palette) ->
             r.account_id.clone(),
             render_or_dash(covered[i].as_ref(), |c| widths.covered(c)),
             render_or_dash(metered[i].as_ref(), |m| widths.metered(m)),
-            reset_cell(r, now),
+            render_or_dash(resets[i].as_ref(), |x| widths.resets(x)),
             state_cell(r, pal),
         ]);
     }
@@ -437,9 +444,10 @@ fn render_board(rows: &[AccountOverview], now: OffsetDateTime, pal: &Palette) ->
          metered = real money remaining (spending it is permanent)",
     ));
     out.push('\n');
-    out.push_str(
-        &pal.dim("~ = estimated reading   STALE = last probe failed, previous value carried over"),
-    );
+    out.push_str(&pal.dim(
+        "back = when a parked account can serve again   \
+         ~ = estimated reading   STALE = last probe failed, previous value carried over",
+    ));
     out.push('\n');
     out
 }
@@ -505,8 +513,8 @@ struct Metered {
     marks: String,
 }
 
-/// The widths of the sub-columns inside the two composite cells, measured across
-/// every row of the board.
+/// The widths of the sub-columns inside the three composite cells, measured
+/// across every row of the board.
 ///
 /// Without this each account brought its own widths: a "1320.1/1320" pushed that
 /// row's unit a column right of everyone else's, and two fractions could not be
@@ -524,10 +532,16 @@ struct BoardWidths {
     /// of windows, so the unit is another column that has to be lined up rather
     /// than simply appended.
     windows_part: usize,
+    /// Width of the window label inside the RESETS cell.
+    ///
+    /// Only the label is padded. The countdown that follows is left alone: its
+    /// own length is the reading, and padding it only pushes the digits that
+    /// matter further apart.
+    deadline_label: usize,
 }
 
 impl BoardWidths {
-    fn measure(covered: &[&Covered], metered: &[&Metered]) -> Self {
+    fn measure(covered: &[&Covered], metered: &[&Metered], resets: &[&Resets]) -> Self {
         let mut w = BoardWidths::default();
         for c in covered {
             for win in &c.windows {
@@ -542,12 +556,28 @@ impl BoardWidths {
                 w.left = w.left.max(p.left.chars().count());
             }
         }
+        for r in resets {
+            for e in &r.entries {
+                w.deadline_label = w.deadline_label.max(e.label.chars().count());
+            }
+        }
         // A second pass, because the width of the window part depends on the
         // widths just measured.
         for c in covered {
             w.windows_part = w.windows_part.max(c.windows_text(&w).chars().count());
         }
         w
+    }
+
+    /// The RESETS cell: every countdown on its own, label first, so two accounts
+    /// offering the same window can be compared by reading down one column.
+    fn resets(&self, r: &Resets) -> String {
+        let lw = self.deadline_label;
+        r.entries
+            .iter()
+            .map(|e| format!("{label:<lw$} {when}", label = e.label, when = e.when))
+            .collect::<Vec<_>>()
+            .join("  ")
     }
 
     fn covered(&self, c: &Covered) -> String {
@@ -657,7 +687,7 @@ fn metered_of(r: &AccountOverview, pal: &Palette) -> Option<Metered> {
 #[cfg(test)]
 fn covered_cell(r: &AccountOverview, pal: &Palette) -> String {
     match covered_of(r, pal) {
-        Some(c) => BoardWidths::measure(&[&c], &[]).covered(&c),
+        Some(c) => BoardWidths::measure(&[&c], &[], &[]).covered(&c),
         None => "-".to_string(),
     }
 }
@@ -665,7 +695,7 @@ fn covered_cell(r: &AccountOverview, pal: &Palette) -> String {
 #[cfg(test)]
 fn metered_cell(r: &AccountOverview, pal: &Palette) -> String {
     match metered_of(r, pal) {
-        Some(m) => BoardWidths::measure(&[], &[&m]).metered(&m),
+        Some(m) => BoardWidths::measure(&[], &[&m], &[]).metered(&m),
         None => "-".to_string(),
     }
 }
@@ -685,24 +715,71 @@ fn markers(gates: &[&Gate], pal: &Palette) -> String {
     }
 }
 
-fn reset_cell(r: &AccountOverview, now: OffsetDateTime) -> String {
-    match next_reset(r) {
-        Some(at) => format_countdown(now, at),
-        None => "-".to_string(),
-    }
+/// One countdown on the board: which allowance it belongs to, and how far off.
+struct Reset {
+    label: String,
+    when: String,
 }
 
-fn next_reset(r: &AccountOverview) -> Option<OffsetDateTime> {
-    let mut best = r.available_at;
-    for g in r.gates.iter().filter(|g| g.kind.is_window()) {
-        if let Some(t) = g.resets_at {
-            best = Some(match best {
-                Some(b) if b <= t => b,
-                _ => t,
+/// The RESETS column of one account, before the board's shared widths are known.
+struct Resets {
+    entries: Vec<Reset>,
+}
+
+/// The RESETS column: when each allowance comes back.
+///
+/// Every window gets its own labelled countdown rather than only the soonest
+/// one. The five-hour and the weekly window answer the same question at very
+/// different distances, and that pair is the whole difference between "spent
+/// until this evening" and "spent until Monday" -- which is the reason the
+/// weekly reading is probed at all. Showing only the minimum hid the second.
+fn resets_of(r: &AccountOverview, now: OffsetDateTime) -> Option<Resets> {
+    let mut windows: Vec<&Gate> = r
+        .gates
+        .iter()
+        .filter(|g| g.kind.is_window() && g.resets_at.is_some())
+        .collect();
+    if windows.is_empty() && r.available_at.is_none() {
+        return None;
+    }
+    windows.sort_by_key(|g| gate_rank(g.kind));
+
+    let mut entries: Vec<Reset> = Vec::new();
+    // The account's own return time is only news when no window already says it.
+    // A parked account is usually parked ON a window, and the same countdown
+    // printed twice under two names reads as two different facts.
+    if let Some(at) = r.available_at
+        && !windows.iter().any(|g| {
+            g.resets_at
+                .is_some_and(|t| (t - at).abs() <= time::Duration::seconds(60))
+        })
+    {
+        entries.push(Reset {
+            label: "back".to_string(),
+            when: format_countdown(now, at),
+        });
+    }
+    for g in windows {
+        if let Some(at) = g.resets_at {
+            entries.push(Reset {
+                label: g.kind.label().to_string(),
+                when: format_countdown(now, at),
             });
         }
     }
-    best
+    if entries.is_empty() {
+        return None;
+    }
+    Some(Resets { entries })
+}
+
+/// The RESETS cell as the board would render it for one account on its own.
+#[cfg(test)]
+fn resets_cell(r: &AccountOverview, now: OffsetDateTime) -> String {
+    match resets_of(r, now) {
+        Some(x) => BoardWidths::measure(&[], &[], &[&x]).resets(&x),
+        None => "-".to_string(),
+    }
 }
 
 fn format_countdown(now: OffsetDateTime, at: OffsetDateTime) -> String {
@@ -3610,7 +3687,7 @@ key = {{ key_file = "{}" }}
             "wallet 12.3 USD (unused)"
         );
         assert!(state_cell(&acct, &Palette::off()).contains("metered only"));
-        assert_eq!(reset_cell(&acct, t), "-", "a wallet has no reset");
+        assert_eq!(resets_cell(&acct, t), "-", "a wallet has no reset");
     }
 
     #[test]
@@ -3716,9 +3793,47 @@ key = {{ key_file = "{}" }}
                 ),
             ],
         );
-        // The earliest reset wins.
-        assert_eq!(reset_cell(&acct, t), "1h10m");
-        assert!(render_board(&[acct], t, &Palette::off()).contains("1h10m"));
+        // Every window is shown, each under its own label: the 5h window is the
+        // one an operator waits out tonight, the 7d one is the one that decides
+        // whether the account is usable this week.
+        assert_eq!(resets_cell(&acct, t), "5h 1h10m  7d 1d1h");
+        let board = render_board(&[acct], t, &Palette::off());
+        assert!(board.contains("5h 1h10m"), "{board}");
+        assert!(board.contains("7d 1d1h"), "{board}");
+    }
+
+    /// The account's own return time is shown as "back" only when no window
+    /// already covers it.
+    ///
+    /// A parked account is parked on a window, and that window's countdown is
+    /// already on the row: printing the same deadline twice under two names
+    /// would read as two different facts.
+    #[test]
+    fn the_account_return_time_is_not_repeated_when_a_window_already_says_it() {
+        let t = now();
+        let gates = vec![gate(
+            GateKind::FiveHour,
+            "200",
+            "200",
+            Some(4_200),
+            Confidence::Exact,
+            false,
+            t,
+        )];
+        let mut acct = overview("xkiro", "xk-1", "USD", AccountState::Parked, gates);
+        acct.available_at = Some(t + time::Duration::seconds(4_200));
+        assert_eq!(resets_cell(&acct, t), "5h 1h10m");
+
+        // A return time no window accounts for is its own entry: it is the only
+        // thing on the row that says when the account can serve again.
+        acct.available_at = Some(t + time::Duration::seconds(600));
+        // "back" widens the label column, so every label in the cell lines up
+        // under it -- that column alignment is the point of measuring it.
+        assert_eq!(resets_cell(&acct, t), "back 10m  5h   1h10m");
+
+        // No window at all: the return time stands alone.
+        acct.gates.clear();
+        assert_eq!(resets_cell(&acct, t), "back 10m");
     }
 
     #[test]
