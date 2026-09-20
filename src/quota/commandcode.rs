@@ -720,6 +720,28 @@ mod tests {
         );
     }
 
+    /// The shape a live account returns for a window nobody has spent into: a
+    /// cap, no usage, and a zero where the reset belongs. The window is real and
+    /// has to survive; the reset is not and must not be invented.
+    #[test]
+    fn commandcode_a_window_that_has_not_started_has_no_reset_time() {
+        let body = r#"{
+          "credits": { "monthlyCredits": 43.48, "purchasedCredits": 0 },
+          "windowLimits": {
+            "fiveHour": { "used": 0, "cap": 14, "exceeded": false, "resetAt": 0 },
+            "weekly": { "used": 4.822426987, "cap": 35, "exceeded": false, "resetAt": 1790314558 }
+          }
+        }"#;
+        let outcome = outcome_from_credits_body(body, None, None).expect("must parse");
+
+        let five = gate_of(&outcome, GateKind::FiveHour).expect("the window itself survives");
+        assert_eq!(five.cap, parse_money("14").unwrap());
+        assert_eq!(five.resets_at, None, "a zero reset is no reset, not 1970");
+
+        let weekly = gate_of(&outcome, GateKind::Weekly).expect("weekly gate");
+        assert!(weekly.resets_at.is_some(), "a real reset still arrives");
+    }
+
     #[test]
     fn commandcode_tolerates_missing_optional_fields() {
         // No windowLimits, no freeCredits, no plan: the two credit pools are

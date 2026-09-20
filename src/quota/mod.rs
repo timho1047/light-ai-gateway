@@ -358,7 +358,15 @@ fn parse_timestamp_str(raw: &str) -> Option<OffsetDateTime> {
 
 /// Epoch seconds, or milliseconds when the value is obviously too large to be
 /// seconds (anything past the year 5138).
+///
+/// Zero is the absence of a reset, not 1970. Command Code sends `resetAt: 0`
+/// for a five-hour window nobody has spent into yet, and a deadline in the past
+/// reads as "due now" on every surface that renders one -- a countdown, a
+/// dashboard's resetsAt, the retry-after a client is told to wait.
 fn epoch(value: i64) -> Option<OffsetDateTime> {
+    if value <= 0 {
+        return None;
+    }
     let seconds = if value >= 100_000_000_000 {
         value / 1000
     } else {
@@ -692,6 +700,30 @@ mod tests {
         assert_eq!(sat_add(huge, huge), Decimal::MAX);
         assert_eq!(sat_sub(negative, huge), Decimal::MIN);
         assert_eq!(sat_add(Decimal::ONE, Decimal::ONE), Decimal::from(2));
+    }
+
+    /// A provider that has no reset to report sends zero, and every adapter
+    /// reads its timestamps through here.
+    #[test]
+    fn a_zero_or_negative_timestamp_is_no_timestamp() {
+        use serde_json::json;
+        assert_eq!(json_timestamp(&json!(0)), None);
+        assert_eq!(json_timestamp(&json!(-1)), None);
+        assert_eq!(json_timestamp(&json!("0")), None);
+        assert_eq!(json_timestamp(&json!(0.0)), None);
+        assert_eq!(json_timestamp(&json!("")), None);
+
+        // A real reading still arrives, in either unit.
+        let seconds = json_timestamp(&json!(1_789_219_615)).expect("epoch seconds");
+        let millis = json_timestamp(&json!(1_789_219_615_705i64)).expect("epoch millis");
+        assert_eq!(seconds.unix_timestamp(), 1_789_219_615);
+        assert_eq!(millis.unix_timestamp(), 1_789_219_615);
+        assert_eq!(
+            json_timestamp(&json!("2026-04-08T16:30:00Z"))
+                .expect("rfc 3339")
+                .unix_timestamp(),
+            1_775_665_800
+        );
     }
 
     #[test]

@@ -1004,7 +1004,9 @@ fn load_gates(conn: &Connection, provider: &str, account_id: &str) -> Result<Vec
             kind,
             cap,
             used,
-            resets_at: resets_at.map(i2t),
+            // Same rule as the probe parser: zero is no reset, not 1970. A
+            // ledger written before that rule existed still holds those zeros.
+            resets_at: resets_at.filter(|secs| *secs > 0).map(i2t),
             confidence: parse_confidence(&confidence).unwrap_or(Confidence::Estimated),
             source: parse_source(&source).unwrap_or(GateSource::LocalLedger),
             checked_at: i2t(checked_at),
@@ -1685,6 +1687,31 @@ mod tests {
         let conn = open(&tmp.path).expect("reopen");
         let after = load_prices(&conn).expect("load_prices");
         assert_eq!(after.len(), 1, "a removed price must not linger: {after:?}");
+    }
+
+    /// A zero in the ledger is a reset the provider never reported. Read back
+    /// as 1970 it would put every window that has not started into the past.
+    #[test]
+    fn a_zero_reset_in_the_ledger_reads_back_as_no_reset() {
+        let tmp = TempDb::new("zero-reset");
+        let handle = StoreHandle::spawn(&tmp.path).expect("spawn writer");
+        let mut acct = account("acct-zero");
+        acct.gates = vec![gate(GateKind::FiveHour, "14", "0", Some(0))];
+        handle.save_accounts(std::slice::from_ref(&acct));
+        handle.flush_blocking().expect("flush");
+
+        let conn = open(&tmp.path).expect("reopen for read");
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT resets_at FROM gates WHERE account_id = 'acct-zero'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the gate row is there");
+        assert_eq!(stored, Some(0), "the zero really is on disk");
+
+        let loaded = load_accounts(&conn).expect("load_accounts");
+        assert_eq!(loaded[0].gates[0].resets_at, None);
     }
 
     #[test]
