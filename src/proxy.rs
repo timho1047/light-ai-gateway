@@ -26,6 +26,7 @@ use crate::domain::{
     Account, ApiKey, AttemptRecord, GateClass, RequestRecord, RequestStatus, TokenUsage, now,
 };
 use crate::error::{ErrorSignals, UpstreamErrorClass, parse_error_body, parse_retry_after};
+use crate::quota_report::{ReportError, Scope, usage_report};
 use crate::router::Gateway;
 use crate::sse::{MeterMode, StreamMeter, inject_include_usage};
 use anyhow::{Context, Result};
@@ -141,6 +142,13 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     /// Look up an account by canonical provider/id identity.
     fn account(&self, qualified_id: &str) -> Option<Account>;
+
+    /// Every account the pool knows, with its last-known gates.
+    ///
+    /// What the poller last saw, never a fresh probe. The usage report is read
+    /// on a dashboard's timer, and a report that costs an upstream call is one
+    /// nobody can afford to leave open.
+    fn snapshot(&self) -> Vec<Account>;
 
     /// Give back an attempt's reservation without recording it.
     ///
@@ -267,6 +275,10 @@ impl ProxyBackend for GatewayBackend {
 
     fn account(&self, qualified_id: &str) -> Option<Account> {
         self.gateway.pool.account(qualified_id)
+    }
+
+    fn snapshot(&self) -> Vec<Account> {
+        self.gateway.snapshot()
     }
 
     fn ensure_fresh<'a>(
@@ -397,6 +409,7 @@ pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
+        .route("/v1/usage", get(usage))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_local_key,
@@ -1164,6 +1177,62 @@ struct Failure {
     retry_after: Option<Duration>,
 }
 
+// ---------------------------------------------------------------------------
+// usage
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct UsageQuery {
+    /// Only the accounts of this provider.
+    #[serde(default)]
+    provider: Option<String>,
+    /// Only this account, named provider/account-id.
+    #[serde(default)]
+    account: Option<String>,
+}
+
+/// The pool's last-known quota, in the shape a dashboard reads.
+///
+/// Offline by construction: it renders the poller's last readings and calls no
+/// provider. A widget refreshing on a timer would otherwise turn its refresh
+/// interval into upstream traffic, and against an account metered per request
+/// that is a charge for looking at the bill.
+///
+/// Behind the same local key as every other route. This endpoint describes the
+/// pool, and the local key is already what opens the pool.
+async fn usage(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
+    let accounts = state.backend.snapshot();
+    let scope = Scope {
+        provider: query.provider.as_deref(),
+        account: query.account.as_deref(),
+    };
+    let report = match usage_report(&accounts, scope) {
+        Ok(report) => report,
+        Err(err) => return error_response(usage_status(&err), err.kind(), &err.to_string()),
+    };
+    match serde_json::to_value(&report) {
+        Ok(payload) => json_response(payload),
+        Err(e) => {
+            tracing::error!(error = %e, "the usage report could not be serialised");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "the usage report could not be serialised",
+            )
+        }
+    }
+}
+
+/// A scope nobody has probed is 503, not an empty 200: there are no numbers
+/// yet, and zeros are indistinguishable from an untouched allowance.
+fn usage_status(err: &ReportError) -> StatusCode {
+    match err {
+        ReportError::UnqualifiedAccount(_) => StatusCode::BAD_REQUEST,
+        ReportError::UnknownProvider(_) | ReportError::UnknownAccount(_) => StatusCode::NOT_FOUND,
+        ReportError::NeverProbed => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 fn should_retry(class: UpstreamErrorClass, attempt_no: u32, max_attempts: u32) -> bool {
     attempt_no < max_attempts && (class.retry_other_account() || class.retry_same_account())
 }
@@ -1804,6 +1873,10 @@ mod tests {
             self.pool.account(account_id)
         }
 
+        fn snapshot(&self) -> Vec<Account> {
+            self.pool.snapshot()
+        }
+
         fn retry_after_for(&self, provider: &str) -> Option<Duration> {
             self.pool.retry_after_for(provider)
         }
@@ -2241,6 +2314,135 @@ key = "sk-b1"
             .await
             .unwrap();
         assert_eq!(unknown.status(), 404);
+    }
+
+    /// The dashboard endpoint is a projection of what the poller already saw.
+    /// Reaching a provider from here would bill an operator for reading a widget.
+    #[tokio::test]
+    async fn the_usage_report_is_offline_and_never_looks_like_an_error() {
+        let (upstream_url, mock) = spawn_mock(MockMode::JsonOk).await;
+        let addr = spawn_router(build_router_with(fake_backend(&upstream_url))).await;
+        let client = reqwest::Client::new();
+
+        let response = client.get(format!("{addr}/v1/usage")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+
+        assert_eq!(body["object"], json!("usage"));
+        // The pool is probed at 1/100 and 0/100: half a percent of the
+        // inventory, not "the account we would pick next is empty".
+        assert_eq!(body["usage"]["rolling"]["percent"], json!(0.5));
+        assert_eq!(body["accounts"].as_array().unwrap().len(), 2);
+        assert!(
+            body.get("error").is_none(),
+            "a 200 body carrying an error object breaks a path client: {body}"
+        );
+        assert!(!body.to_string().contains("sk-a1"), "{body}");
+        assert!(
+            mock.bearers.lock().unwrap().is_empty(),
+            "the report must not reach the provider"
+        );
+
+        assert_eq!(
+            client
+                .get(format!("{addr}/v1/usage?provider=nope"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(
+            client
+                .get(format!("{addr}/v1/usage?account=a1"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400,
+            "a bare account id names a different account under each provider"
+        );
+
+        let one: Value = client
+            .get(format!("{addr}/v1/usage?provider=mock&account=mock/a1"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(one["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(one["accounts"][0]["id"], json!("mock/a1"));
+    }
+
+    #[tokio::test]
+    async fn the_usage_report_is_behind_the_local_key() {
+        let (upstream_url, _mock) = spawn_mock(MockMode::JsonOk).await;
+        let mut config = test_config(&upstream_url);
+        config.server.local_key = Some(SecretRef::Literal("sk-local".into()));
+        let accounts = config
+            .build_accounts(&crate::secrets::CredentialStore::memory())
+            .unwrap();
+        let pool = Pool::new(accounts, &config.policy);
+        activate(&pool, "mock/a1", 1);
+        activate(&pool, "mock/a2", 0);
+        let fake = Arc::new(FakeBackend::new(config, pool));
+        let addr = spawn_router(build_router_with(fake)).await;
+        let url = format!("{addr}/v1/usage");
+        let client = reqwest::Client::new();
+
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("sk-nope")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(&url)
+                .bearer_auth("sk-local")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+
+    /// A pool nobody has probed says so, instead of answering with zeros that
+    /// read exactly like an untouched allowance.
+    #[tokio::test]
+    async fn an_unprobed_pool_reports_that_it_has_no_reading() {
+        let (upstream_url, _mock) = spawn_mock(MockMode::JsonOk).await;
+        let config = test_config(&upstream_url);
+        let accounts = config
+            .build_accounts(&crate::secrets::CredentialStore::memory())
+            .unwrap();
+        let fake = Arc::new(FakeBackend::new(
+            config.clone(),
+            Pool::new(accounts, &config.policy),
+        ));
+        let addr = spawn_router(build_router_with(fake)).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{addr}/v1/usage"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        let body: Value = response.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("probed"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

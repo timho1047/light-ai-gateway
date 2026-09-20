@@ -10,6 +10,7 @@ pub mod error;
 pub mod meter;
 pub mod proxy;
 pub mod quota;
+pub mod quota_report;
 pub mod router;
 pub mod secrets;
 pub mod sse;

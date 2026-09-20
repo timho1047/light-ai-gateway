@@ -110,6 +110,7 @@ Then point your client at it:
 
     POST /v1/chat/completions     the proxy: retries, account switching, the usage ledger
     GET  /v1/models               the models this gateway will serve, described by the provider
+    GET  /v1/usage                how much of the pool's allowance is gone, and when it comes back
 
 `/v1/models` answers with your `[routes]` and nothing else: a model the provider
 sells but you have not routed is left out, because asking for it gets a "no route
@@ -128,6 +129,25 @@ the reason is logged. A route the provider's catalog does not mention is still
 listed -- the route is what works -- and `RUST_LOG=debug` prints the published ids
 closest to it, which is how a wrong vendor prefix gets found
 (`glm/glm-5.3-flash` where xkiro publishes `z-ai/glm-5.3-flash`).
+
+`/v1/usage` is for a dashboard: what the poller last saw, turned into
+percentages. It calls no provider, so a widget can refresh on a timer without
+spending anything. The windows are named rather than indexed (`rolling`,
+`weekly`, `monthly`) so a client that can only follow a JSON path can read them,
+and a window with no reading is left out rather than sent as `0`:
+
+    curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8787/v1/usage
+    curl -H "Authorization: Bearer $KEY" "http://127.0.0.1:8787/v1/usage?provider=xkiro"
+    curl -H "Authorization: Bearer $KEY" "http://127.0.0.1:8787/v1/usage?account=xkiro/acc-1"
+
+The percentages are inventory across the whole scope -- sum(used) over sum(cap),
+parked accounts included -- so one spent account beside one fresh one reads 50%,
+not 0%. `usage` and `balance` carry JSON numbers, for drawing; the same figures
+under `accounts[]` keep their exact decimals as text, for auditing. Covered
+allowance never lands in `balance`, because a subscription's headroom is not
+money you can spend anywhere else. A scope nobody has probed yet answers 503:
+zeros and an untouched allowance look identical. The full shape is in
+[docs/usage-endpoint.md](docs/usage-endpoint.md).
 
 ## Credentials
 
