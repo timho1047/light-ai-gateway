@@ -504,9 +504,9 @@ no warranty, and it spends real money when you configure it to.
 
 ## Safety notes
 
-- Binds to loopback by default and holds paid credentials; set a local key if
-  anything else can reach the port. `lgw doctor` reports both a missing
-  `local_key` and a non-loopback listen address as problems.
+- Binds to loopback by default and holds paid credentials. Anything that is not
+  loopback needs a local key: the configuration is refused without one, rather
+  than left to a warning in the log.
 - Keys come from the environment or a dedicated file, are never logged, and are
   redacted in every debug or display path.
 - Probe hosts are pinned in configuration, and redirects are refused outright, so

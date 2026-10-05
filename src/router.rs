@@ -157,10 +157,10 @@ impl Gateway {
             }
         }
 
+        // The ledger's directory and file modes are the store's business: it
+        // creates both private, and a second create_dir_all here would make the
+        // directory exist first and take that decision away from it.
         let db_path = config.db_path();
-        if let Some(parent) = db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         let store = StoreHandle::spawn(&db_path)
             .with_context(|| format!("opening database {}", db_path.display()))?;
 

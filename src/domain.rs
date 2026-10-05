@@ -190,6 +190,16 @@ impl ApiKey {
     pub fn new(s: impl Into<String>) -> Self {
         ApiKey(s.into())
     }
+    /// This text with the key replaced by ***, for anything that leaves the
+    /// process: a provider that echoes the credential it was given must not
+    /// turn an error message into a leak.
+    pub fn redact(&self, text: &str) -> String {
+        if self.0.is_empty() {
+            return text.to_string();
+        }
+        text.replace(&self.0, "***")
+    }
+
     /// Explicit accessor; greppable so key use stays auditable.
     pub fn expose(&self) -> &str {
         &self.0

@@ -2024,7 +2024,9 @@ fn cmd_keys_add(
     // Read it back: a store that silently drops writes is worse than one that
     // fails, because the operator only discovers it at request time.
     match creds.get(provider, account)? {
-        Some(stored) if stored.expose() == secret => {
+        Some(stored)
+            if crate::secrets::constant_time_eq(stored.expose().as_bytes(), secret.as_bytes()) =>
+        {
             println!(
                 "{} {provider}/{account} in {} ({})",
                 pal.green("stored"),

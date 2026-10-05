@@ -47,6 +47,22 @@ pub const SERVICE: &str = "light-ai-gateway";
 pub const LOCAL_KEY_PROVIDER: &str = "local";
 pub const LOCAL_KEY_ACCOUNT: &str = "gateway";
 
+/// Compare two secrets without an early return.
+///
+/// The length is folded into the result rather than tested up front: returning
+/// early on a length mismatch tells the caller how long the stored secret is,
+/// and a loop that stops at the first differing byte tells them how much of it
+/// was right.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u64;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= u64::from(x ^ y);
+    }
+    diff == 0
+}
+
 /// Result of asking whether a credential is available.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialStatus {

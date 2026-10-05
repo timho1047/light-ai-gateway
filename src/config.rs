@@ -616,6 +616,23 @@ impl Config {
             );
         }
 
+        // A loopback bind with no local key is a deliberate local-trust
+        // decision; anything else is a door. The key is what stands between the
+        // network and the pooled subscription quota, and a warning in the log is
+        // not a control. The unreadable-key case already fails closed when the
+        // router is built; this is the other half of the same rule.
+        if self.server.local_key.is_none()
+            && let Ok(addr) = self.server.listen.parse::<std::net::SocketAddr>()
+            && !addr.ip().is_loopback()
+        {
+            bail!(
+                "server.listen {} is not loopback and [server] local_key is unset, so anything \
+                 able to reach that address could spend the pooled quota. Set local_key (lgw \
+                 keys add local gateway) or bind 127.0.0.1",
+                self.server.listen
+            );
+        }
+
         if self.providers.is_empty() {
             bail!("no providers configured");
         }
@@ -676,8 +693,19 @@ impl Config {
                 if !matches!(parsed.scheme(), "http" | "https") {
                     bail!("provider {name}: {field} {url:?} must use http or https");
                 }
-                if parsed.host_str().is_none() {
+                let Some(host) = parsed.host_str() else {
                     bail!("provider {name}: {field} {url:?} names no host");
+                };
+                // The key rides this URL in an Authorization header. Cleartext
+                // to a remote host hands it to anything on the path; loopback is
+                // the one case where that wire belongs to the operator.
+                if parsed.scheme() == "http" && !is_loopback_host(host) {
+                    tracing::warn!(
+                        provider = %name,
+                        %field,
+                        "provider URL is http:// to a non-loopback host: the API key crosses \
+                         the network in the clear"
+                    );
                 }
             }
             for multiplier in [p.credit_multiplier]
@@ -1029,6 +1057,15 @@ fn build_one(
     }
 }
 
+/// Whether a URL host names this machine's own loopback interface.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Drop a trailing "/v1" (or "/v1beta" style) segment from an API root.
 ///
 /// The OpenAI-compatible base_url points at the versioned root while quota
@@ -1075,6 +1112,100 @@ key = { keychain = true }
 "#,
         )
         .unwrap()
+    }
+
+    /// A routable bind without a local key is refused, not warned about.
+    ///
+    /// The key is the only thing between the network and the pooled quota, and
+    /// the default bind is loopback for exactly that reason; accepting
+    /// 0.0.0.0 while merely logging a warning made the missing key a footnote.
+    #[test]
+    fn a_non_loopback_listen_without_a_local_key_is_refused() {
+        let cfg = |listen: &str, key: &str| {
+            format!(
+                r#"
+[server]
+listen = "{listen}"
+db_path = "gateway.db"
+{key}
+
+[providers.p]
+adapter = "xkiro"
+base_url = "https://api.example.invalid/v1"
+
+[providers.p.accounts.a]
+key = "k"
+
+[routes]
+"m" = "p"
+"#
+            )
+        };
+
+        let err = Config::from_toml_str(&cfg("0.0.0.0:8787", ""))
+            .expect_err("a routable bind with no key must not validate")
+            .to_string();
+        assert!(err.contains("not loopback"), "got: {err}");
+
+        Config::from_toml_str(&cfg("0.0.0.0:8787", "local_key = { env = \"LGW_LOCAL\" }"))
+            .expect("with a key, the bind is the operator's decision");
+        Config::from_toml_str(&cfg("127.0.0.1:8787", "")).expect("loopback needs no key");
+        Config::from_toml_str(&cfg("[::1]:8787", "")).expect("v6 loopback is loopback too");
+    }
+
+    /// A cleartext URL to a remote host is named, not waved through.
+    ///
+    /// The key rides this URL in an Authorization header, so an http:// target
+    /// that is not this machine puts it on the wire for anything on the path.
+    /// The warning is the only trace an operator gets, which makes it the
+    /// behaviour worth pinning -- and the loopback and https cases are pinned
+    /// too, because a warning that cries wolf gets ignored.
+    #[tokio::test]
+    async fn an_http_provider_url_to_a_remote_host_is_warned_about() {
+        let toml = |url: &str| {
+            format!(
+                r#"
+[providers.p]
+adapter = "xkiro"
+base_url = "{url}"
+
+[providers.p.accounts.a]
+key = "k"
+
+[routes]
+"m" = "p"
+"#
+            )
+        };
+        let warnings = |url: &'static str| async move {
+            crate::quota::testutil::capture_warnings(
+                async move { Config::from_toml_str(&toml(url)) },
+            )
+            .await
+        };
+
+        let (lines, remote) = warnings("http://api.example.invalid/v1").await;
+        remote.expect("http to a remote host is a warning, not a refusal");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("http:// to a non-loopback host")),
+            "expected the cleartext warning, got {lines:?}"
+        );
+
+        let (lines, local) = warnings("http://127.0.0.1:8080/v1").await;
+        local.expect("loopback is the operator's own wire");
+        assert!(
+            !lines.iter().any(|l| l.contains("non-loopback host")),
+            "loopback must not be warned about: {lines:?}"
+        );
+
+        let (lines, secure) = warnings("https://api.example.invalid/v1").await;
+        secure.expect("https to a remote host is fine");
+        assert!(
+            !lines.iter().any(|l| l.contains("non-loopback host")),
+            "https is not cleartext: {lines:?}"
+        );
     }
 
     /// The provider-level switch reaches its accounts, and an account can still

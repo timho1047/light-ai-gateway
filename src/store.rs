@@ -268,14 +268,84 @@ fn configure(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Restrict a path to the operator, on the platforms that have modes.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting mode {mode:o} on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+/// Whether other users can reach into this directory.
+#[cfg(unix)]
+fn shared_by_others(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir)
+        .map(|m| m.permissions().mode() & 0o077 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn shared_by_others(_dir: &Path) -> bool {
+    false
+}
+
 /// Open (creating if needed) the database and apply the schema.
+///
+/// The ledger holds request history -- client session keys, account ids, model
+/// names, spend -- so it gets the config file's treatment: the directory is
+/// created 0700, and the database file 0600 before SQLite ever writes to it.
+/// SQLite gives -wal and -shm the database's mode, which is why the database
+/// file is the one that has to be private. A ledger written before this rule is
+/// pulled in line on the way in; a directory somebody else created is reported
+/// rather than chmod'ed, because the configured path may point somewhere shared.
 pub fn open(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
-        && !parent.exists()
     {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating database directory {}", parent.display()))?;
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating database directory {}", parent.display()))?;
+            restrict(parent, 0o700)?;
+        } else if shared_by_others(parent) {
+            tracing::warn!(
+                dir = %parent.display(),
+                "the ledger directory is reachable by other users; chmod 700 it to hide the \
+                 request history it holds (the database file itself is kept 0600)"
+            );
+        }
+    }
+    let created_here = if path.exists() {
+        restrict(path, 0o600)?;
+        false
+    } else {
+        true
+    };
+    if created_here {
+        // Created private first rather than chmod'ed after SQLite opened it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("creating {}", path.display()))?;
+        }
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut sibling = path.as_os_str().to_os_string();
+        sibling.push(suffix);
+        let sibling = PathBuf::from(sibling);
+        if sibling.exists() {
+            restrict(&sibling, 0o600)?;
+        }
     }
     let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
     configure(&conn)?;
@@ -1334,6 +1404,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// The ledger is request history: session keys, account ids, model names,
+    /// spend. It is created private from the start, like the config file.
+    #[cfg(unix)]
+    #[test]
+    fn the_ledger_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDb::new("modes");
+        let dir = tmp.dir.join("ledger");
+        let db = dir.join("gateway.db");
+
+        let _conn = open(&db).expect("open");
+
+        let mode = |p: &Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700, "the ledger directory is the operator's");
+        assert_eq!(mode(&db), 0o600, "the ledger file is the operator's");
+    }
+
+    /// A ledger written before that rule is pulled in line on the way in.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_ledger_is_tightened_on_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDb::new("tighten");
+        open(&tmp.path).expect("open");
+        std::fs::set_permissions(&tmp.path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen");
+
+        drop(open(&tmp.path).expect("reopen"));
+
+        let mode = std::fs::metadata(&tmp.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     fn mem() -> Connection {

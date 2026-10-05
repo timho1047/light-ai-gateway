@@ -7,8 +7,10 @@
 # Loopback by default: this process holds paid provider credentials.
 listen = "127.0.0.1:8787"
 db_path = "~/.light-ai-gateway/gateway.db"
-# Strongly recommended. Without it any local process can spend your quota.
-# The value is a token you invent; register it with: lgw keys add local gateway
+# Required for any listen address that is not loopback: validation refuses to
+# start without it, because anything able to reach the port could spend your
+# quota. The value is a token you invent; register it with:
+#     lgw keys add local gateway
 # local_key = { keychain = true }
 
 [policy]

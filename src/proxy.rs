@@ -456,14 +456,7 @@ impl LocalAuth {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    crate::secrets::constant_time_eq(a, b)
 }
 
 async fn require_local_key(
@@ -782,7 +775,7 @@ async fn chat_completions(
                 &request_id,
             );
 
-            let detail = upstream_error_message(&text)
+            let detail = upstream_error_message(&text, &account.api_key)
                 .unwrap_or_else(|| format!("upstream returned HTTP {}", status.as_u16()));
             // Other maps back to whatever the upstream said; the rest are
             // remapped so the client sees a class, not a provider quirk.
@@ -1153,7 +1146,7 @@ pub async fn fetch_catalog(
     let status = response.status();
     if !status.is_success() {
         let text = read_bounded(response, 8 * 1024).await;
-        return Err(upstream_error_message(&text)
+        return Err(upstream_error_message(&text, api_key)
             .unwrap_or_else(|| format!("{url} returned HTTP {}", status.as_u16())));
     }
 
@@ -1380,7 +1373,7 @@ async fn read_bounded(mut response: reqwest::Response, limit: usize) -> String {
 }
 
 /// Pull the human-readable message out of an OpenAI/Anthropic error envelope.
-fn upstream_error_message(body: &str) -> Option<String> {
+fn upstream_error_message(body: &str, key: &ApiKey) -> Option<String> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return None;
@@ -1395,7 +1388,11 @@ fn upstream_error_message(body: &str) -> Option<String> {
     if message.is_empty() {
         None
     } else {
-        Some(message.to_string())
+        // The text comes from the upstream, so it goes through the presented
+        // key's redaction before it can reach the client: a provider that
+        // echoes the credential back in its error body would otherwise hand it
+        // to anyone who asked. The probe path has always done this.
+        Some(key.redact(message))
     }
 }
 
@@ -1666,6 +1663,12 @@ mod tests {
         Rotate429ThenStream,
         /// Always a non-streaming JSON completion.
         JsonOk,
+        /// Always HTTP 400 whose body echoes the credential it was sent, the way
+        /// a provider with a chatty request error does. 400 rather than 401 on
+        /// purpose: an auth failure disables the account, so the request is then
+        /// refused at planning time and the upstream text never reaches a
+        /// client at all.
+        EchoKeyOn400,
     }
 
     /// What a provider answers `GET /models` with. The default is the one model
@@ -1722,6 +1725,31 @@ mod tests {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, "3600".parse().unwrap());
+            return response;
+        }
+
+        if m.mode == MockMode::EchoKeyOn400 {
+            // Read the credential back out of the record rather than keeping a
+            // second copy of it.
+            let sent = m
+                .bearers
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default();
+            let body = json!({
+                "error": {
+                    "message": format!("request rejected, the key {sent} is not accepted here"),
+                    "type": "invalid_request_error",
+                    "code": "invalid_request_error"
+                }
+            });
+            let mut response = Response::new(Body::from(body.to_string()));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
             return response;
         }
 
@@ -2041,6 +2069,40 @@ key = "sk-b1"
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("timed out waiting for {want} recorded successes");
+    }
+
+    /// A provider that echoes the key back must not hand it to the client.
+    ///
+    /// The upstream message is relayed on purpose -- the client needs to know
+    /// why the request failed -- so redacting the presented key is the only
+    /// thing between a chatty authentication error and a credential on the
+    /// client's screen.
+    #[tokio::test]
+    async fn an_upstream_error_that_echoes_the_key_never_reaches_the_client() {
+        let (upstream_url, _mock) = spawn_mock(MockMode::EchoKeyOn400).await;
+        let addr = spawn_router(build_router_with(fake_backend(&upstream_url))).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{addr}/v1/chat/completions"))
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(
+            status, 400,
+            "the upstream's own status is what the client hears: {text}"
+        );
+        assert!(
+            !text.contains("sk-a1") && !text.contains("sk-a2"),
+            "the provider's key was relayed back: {text}"
+        );
+        assert!(
+            text.contains("***"),
+            "the upstream message is still relayed, with the key masked: {text}"
+        );
     }
 
     fn chat_body(stream: bool) -> Value {

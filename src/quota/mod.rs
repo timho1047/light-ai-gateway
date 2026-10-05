@@ -112,14 +112,7 @@ pub(crate) const MAX_PROBE_BODY_BYTES: usize = 512 * 1024;
 /// Every message that could contain upstream-controlled text passes through
 /// here, so no adapter can leak a credential through a log line.
 pub(crate) fn probe_error(key: &ApiKey, message: impl AsRef<str>) -> ProbeError {
-    let secret = key.expose();
-    let message = message.as_ref();
-    let redacted = if secret.is_empty() {
-        message.to_string()
-    } else {
-        message.replace(secret, "***")
-    };
-    ProbeError::new(redacted)
+    ProbeError::new(key.redact(message.as_ref()))
 }
 
 /// GET a provider endpoint with the account's bearer token and return the body.
