@@ -226,9 +226,12 @@ pub fn usage_report(accounts: &[Account], scope: Scope<'_>) -> Result<UsageRepor
     // Never probed is not an empty report. A dashboard cannot tell "nothing is
     // used" from "nobody has looked yet", and only one of those is safe to act
     // on, so the scope reports itself unavailable instead.
+    // Both halves are required: gates restored from the ledger are readings a
+    // previous process took, and a scope serving those says "here is what was
+    // true once", which is the answer this check exists to withhold.
     if !selected
         .iter()
-        .any(|a| a.last_probe_at.is_some() || !a.gates.is_empty())
+        .any(|a| a.last_probe_at.is_some() && !a.gates.is_empty())
     {
         return Err(ReportError::NeverProbed);
     }
@@ -688,6 +691,21 @@ mod tests {
         assert!(out.stale);
         assert!(out.accounts[0].stale);
         assert_eq!(rolling(&out).percent, 80.0, "the carried-over number stays");
+    }
+
+    /// Gates restored from the ledger are not a probe.
+    ///
+    /// A restart brings back the gates a previous process wrote and no
+    /// last_probe_at, so "has gates" is not evidence that anybody has looked at
+    /// this account in THIS process -- which is what the scope answers for.
+    #[test]
+    fn gates_without_a_probe_are_still_never_probed() {
+        let mut restored = account("xkiro", "a", vec![five_hour(100, 20)]);
+        restored.last_probe_at = None;
+        assert_eq!(
+            usage_report(std::slice::from_ref(&restored), Scope::default()),
+            Err(ReportError::NeverProbed)
+        );
     }
 
     #[test]

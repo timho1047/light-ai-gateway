@@ -25,6 +25,11 @@ soft_threshold = 0.80
 # flag is the only thing standing between a window limit and real money.
 allow_metered = false
 
+# How far a learned price may sit from the configured one before the gateway
+# logs a drift warning. The board marks a row from 20% regardless; this is the
+# lower, quieter line.
+# drift_threshold = 0.05
+
 # Probe cadence. Tightens while traffic is flowing, relaxes when idle.
 poll_interval_secs = 1200
 poll_interval_active_secs = 300

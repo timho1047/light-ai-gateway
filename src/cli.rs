@@ -1137,6 +1137,20 @@ fn usage_rows_multi(
     Ok(acc.into_values().collect())
 }
 
+/// Cached tokens with the hit rate beside them.
+///
+/// The raw count says how much was read from cache; the rate says whether the
+/// cache is working at all, and it is the one to watch when a cost looks wrong
+/// (a cached token is billed at a fraction of a fresh one).
+fn cached_cell(row: &UsageRow) -> String {
+    let tokens = crate::table::tokens(row.cached_tokens);
+    if row.input_tokens == 0 {
+        return tokens;
+    }
+    let hit = row.cached_tokens as f64 / row.input_tokens as f64;
+    format!("{tokens} ({:.0}%)", hit * 100.0)
+}
+
 fn render_usage(
     rows: &[UsageRow],
     dims: &[GroupBy],
@@ -1200,7 +1214,7 @@ fn render_usage(
             r.requests.to_string(),
             crate::table::tokens(r.input_tokens),
             crate::table::tokens(r.output_tokens),
-            crate::table::tokens(r.cached_tokens),
+            cached_cell(r),
             crate::table::money_with(r.cost, &r.currency),
         ]);
     }
@@ -1577,9 +1591,11 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
         config.routes.len()
     );
     println!(
-        "policy      : soft={:.2} allow_metered={} probe_before_switch={} max_retries={}",
+        "policy      : soft={:.2} allow_metered={} drift={:.2} probe_before_switch={} \
+         max_retries={}",
         config.policy.soft_threshold,
         config.policy.allow_metered,
+        config.policy.drift_threshold,
         config.policy.probe_before_switch,
         config.policy.max_retries
     );

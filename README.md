@@ -99,7 +99,9 @@ Where things live:
     the OS credential store                     API keys
 
 Config resolution order: --config PATH, then $LGW_CONFIG, then ./lgw.toml,
-then ~/.light-ai-gateway/config.toml. lgw doctor prints which one it used.
+then ~/.light-ai-gateway/config.toml. lgw doctor prints which one it used. The
+pre-rename spellings ($AI_GW_CONFIG, $AI_GW_CREDENTIAL_BACKEND) still work and
+log a deprecation warning.
 
 Then point your client at it:
 
@@ -354,8 +356,9 @@ A learned rate is one blended figure: input and output cannot be separated unles
 your usage mix varies, so the split is trusted only where you configured it.
 
 If the two agree, nothing has changed. If they diverge by 20% or more the row is
-flagged and a warning is logged: the upstream price is no longer what you
-configured. `--drift-only` prints just those rows.
+flagged. A warning is logged from a lower line, `policy.drift_threshold`
+(default 0.05), so a repricing is named in the log before the board marks it.
+`--drift-only` prints just the marked rows.
 
 A model with no configured price and no observation yet is priced at a
 deliberately conservative default, so an unpriced model can never look free.
@@ -415,7 +418,9 @@ For each request:
    configured margin.
 2. **Sticky first.** If the session is already bound to a candidate, keep it.
    Moving a conversation discards the provider's prompt cache and re-bills the
-   whole history at full input price.
+   whole history at full input price. The session key is the first non-empty of
+   `x-session-id`, `x-session-key`, `x-conversation-id`, or the `user` field
+   of the JSON body.
 3. **Consume-first.** Among candidates below the soft threshold, take the most
    used. Draining one account before moving on minimises switches, and every
    switch costs a cache miss.
@@ -432,9 +437,9 @@ A 429 means several different things and each needs a different response:
 
 | Signal | Meaning | Action |
 |---|---|---|
-| 429 with a short Retry-After | pacing | retry the **same** account; keep the cache warm |
+| 429 with a short Retry-After | pacing | retry, preferring an account this request has not used; the same one only when nothing else is eligible |
 | 429 with a long Retry-After, or a quota-shaped code | window exhausted | park the account, move on |
-| 402 / insufficient_quota | out of money | disable the account, alert; never retry |
+| 402 / insufficient_quota | out of money | disable the account, alert, and never send it another request; this request is replanned elsewhere if an account is eligible |
 | 401 / 403 | bad credentials | disable the account |
 | 529 / 5xx | upstream trouble | bounded retry on a **different** account |
 | 400 / 404 | bad request | never retried |
