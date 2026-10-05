@@ -1083,12 +1083,30 @@ impl Pool {
             acct.last_error = Some(OPERATOR_DISABLED.to_string());
         }
 
-        // Reflect the soft threshold against freshly probed numbers.
-        if acct.state == AccountState::Active
-            && let Some(u) = acct.peak_covered_utilization()
-            && u >= soft
-        {
-            acct.state = AccountState::Draining;
+        // Reflect the soft threshold against freshly probed numbers, in BOTH
+        // directions.
+        //
+        // The way back out matters as much as the way in. Draining used to be a
+        // one-way door: it was set here and in settle() when the threshold was
+        // crossed, and nothing ever cleared it -- not the poller, not a probe
+        // showing the window rolled back to zero -- while every save persisted
+        // the stale state. New sessions then stayed off an account that had
+        // full headroom again for the life of the process, and the board
+        // reported DRAINING the whole time. Only a restart cleared it, because
+        // restore() maps Draining to Unknown and the startup probe settles the
+        // question again. Headroom decides both directions: the same reading
+        // that retires an account has to be able to bring it back once the
+        // reading itself says the window is whole.
+        //
+        // A reading with no account-level covered gate at all (None) changes
+        // nothing, exactly as before: absence of evidence is not evidence the
+        // window came back.
+        if let Some(u) = acct.peak_covered_utilization() {
+            acct.state = match acct.state {
+                AccountState::Active if u >= soft => AccountState::Draining,
+                AccountState::Draining if u < soft => AccountState::Active,
+                other => other,
+            };
         }
     }
 
@@ -1713,6 +1731,76 @@ mod tests {
         let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
         p.settle(&plan, Decimal::from(85), true);
         assert_eq!(p.account("p/a").unwrap().state, AccountState::Draining);
+    }
+
+    /// A window that rolls over must put the account back in rotation.
+    ///
+    /// Draining used to be a one-way door. settle() and apply_probe() set it
+    /// when the soft threshold was crossed and nothing ever cleared it -- not
+    /// the poller, not a probe showing the window whole again -- while every
+    /// save persisted the stale state. The board then reported DRAINING for an
+    /// account with full headroom, and the account stayed out of consume-first
+    /// ordering for the life of the process: only a restart cleared it, because
+    /// restore() maps Draining to Unknown and the startup probe settles it.
+    #[test]
+    fn a_probe_that_shows_the_window_reset_clears_draining() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 95)], AccountState::Draining)],
+            &policy(),
+        );
+
+        // The window rolled over: the provider now reports it whole.
+        p.apply_probe("p/a", vec![cover(100, 0)], now());
+        assert_eq!(
+            p.account("p/a").unwrap().state,
+            AccountState::Active,
+            "an account whose window just reset is not draining anything"
+        );
+
+        // The way in must keep working, or the reset would be a one-way door
+        // in the other direction.
+        p.apply_probe("p/a", vec![cover(100, 90)], now());
+        assert_eq!(p.account("p/a").unwrap().state, AccountState::Draining);
+    }
+
+    /// Draining is a preference about where new sessions go, never a refusal.
+    ///
+    /// This is why the stale state had to be fixed rather than tolerated: it
+    /// never surfaces as an error, the account is simply never chosen again.
+    /// It is also the behaviour that must survive the fix, so a future change
+    /// cannot "clear" Draining by turning it into an outage instead.
+    #[test]
+    fn a_draining_account_yields_to_one_that_is_still_filling_up() {
+        let p = Pool::new(
+            vec![
+                acct("drained", "p", vec![cover(100, 70)], AccountState::Draining),
+                acct("filling", "p", vec![cover(100, 20)], AccountState::Active),
+            ],
+            &policy(),
+        );
+        let plan = p.select("p", "m", None, Decimal::ONE, "r", 1, &[]).unwrap();
+        assert_eq!(
+            plan.account_id, "filling",
+            "consume-first should pass over the draining account for now"
+        );
+
+        // It still serves when it is the only account left standing.
+        let only = Pool::new(
+            vec![acct(
+                "drained",
+                "p",
+                vec![cover(100, 70)],
+                AccountState::Draining,
+            )],
+            &policy(),
+        );
+        let plan = only
+            .select("p", "m", None, Decimal::ONE, "r", 1, &[])
+            .unwrap();
+        assert_eq!(
+            plan.account_id, "drained",
+            "draining must never become a hard outage"
+        );
     }
 
     #[test]
