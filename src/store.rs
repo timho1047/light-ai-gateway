@@ -170,21 +170,19 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (provider, model, tier)
 );
 
+-- Only ts is indexed. account_id and session_key are written and never
+-- filtered on; attempts(request_id) and usage_daily(day) duplicate the leftmost
+-- column of their table's primary key, which already has an index.
 CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
-CREATE INDEX IF NOT EXISTS idx_requests_account  ON requests(account_id);
-CREATE INDEX IF NOT EXISTS idx_requests_session  ON requests(session_key);
-CREATE INDEX IF NOT EXISTS idx_attempts_request  ON attempts(request_id);
-CREATE INDEX IF NOT EXISTS idx_usage_daily_day   ON usage_daily(day);
 "#;
 
-/// Apply the schema. Safe to call repeatedly.
 /// Bumped whenever a change cannot be applied to existing rows in place.
 ///
 /// 1 -> 2: account identity changed from id alone to (provider, id). Rows
 /// written under the old key cannot be attributed to a provider, so the account
 /// and gate tables are rebuilt rather than guessed at. Usage history already
 /// carried provider and is preserved.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// The version at which account identity changed from id alone to
 /// (provider, id). Only a database older than THIS needs the rebuild; later
@@ -234,7 +232,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         tracing::warn!(
             from = version,
             to = SCHEMA_VERSION,
-            "store: account identity changed to (provider, id); rebuilding the              account and quota tables. Usage history is preserved."
+            "store: account identity changed to (provider, id); rebuilding the account and \
+             quota tables. Usage history is preserved."
         );
         conn.execute_batch("DROP TABLE IF EXISTS gates; DROP TABLE IF EXISTS accounts;")
             .context("dropping pre-v2 account tables")?;
@@ -246,7 +245,21 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         // re-learn, so they are rebuilt rather than migrated.
         tracing::warn!("store: rebuilding the learned price table after a column change");
         conn.execute_batch("DROP TABLE IF EXISTS prices;")
-            .context("dropping the pre-v4 price table")?;
+            .context("dropping the older price table")?;
+    }
+
+    if version < 6 {
+        // Four indexes with no reader: account_id and session_key are written
+        // and never filtered on, and attempts(request_id) and usage_daily(day)
+        // duplicate the leftmost column of their table's primary key. Each one
+        // is an insert cost on every ledger write.
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_requests_account;
+             DROP INDEX IF EXISTS idx_requests_session;
+             DROP INDEX IF EXISTS idx_attempts_request;
+             DROP INDEX IF EXISTS idx_usage_daily_day;",
+        )
+        .context("dropping the write-only indexes")?;
     }
 
     conn.execute_batch(SCHEMA)

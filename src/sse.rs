@@ -282,12 +282,22 @@ impl StreamMeter {
 
     fn drain_lines(&mut self, at_end: bool) -> bool {
         let mut first = false;
-        while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.line_buf.drain(..=pos).collect();
-            let text = String::from_utf8_lossy(&line[..line.len().saturating_sub(1)]).into_owned();
+        let mut consumed = 0;
+        // The scan resumes where the last line ended instead of restarting at 0,
+        // and the buffer is compacted once per push instead of once per line:
+        // each drain moved every byte after the newline and allocated a Vec and
+        // a String, which is quadratic in the lines a chunk carries -- and this
+        // runs inside poll_next, so it is relay latency.
+        while let Some(offset) = self.line_buf[consumed..].iter().position(|b| *b == b'\n') {
+            let end = consumed + offset;
+            let text = String::from_utf8_lossy(&self.line_buf[consumed..end]).into_owned();
             if self.sse.feed_line(&text).first_content {
                 first = true;
             }
+            consumed = end + 1;
+        }
+        if consumed > 0 {
+            self.line_buf.drain(..consumed);
         }
         if at_end && !self.line_buf.is_empty() {
             let text = String::from_utf8_lossy(&self.line_buf).into_owned();

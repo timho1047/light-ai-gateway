@@ -467,6 +467,15 @@ impl Pool {
     /// pacing, not quota, so a held-back account is simply not a candidate --
     /// it is not parked and it does not fail the request.
     fn pacing_blocks(inner: &mut PoolInner, at: Instant) -> std::collections::HashSet<String> {
+        // Nothing to look at when no account has a limit, which is the usual
+        // case: this runs under the pool lock on every request.
+        if !inner
+            .accounts
+            .iter()
+            .any(|a| a.rpm_limit.is_some() || a.concurrency_limit.is_some())
+        {
+            return std::collections::HashSet::new();
+        }
         let PoolInner {
             accounts,
             inflight,

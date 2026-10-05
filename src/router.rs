@@ -356,7 +356,7 @@ impl Gateway {
         // state transition. A lost ledger is not just a stale display -- on
         // restart it means re-spending quota already consumed, which on
         // Command Code silently becomes real money.
-        self.save_accounts();
+        self.save_account(&plan.qualified_account());
         self.store.record_attempt(attempt);
         self.store.record_request(record);
     }
@@ -377,7 +377,7 @@ impl Gateway {
         self.pool.settle(plan, Decimal::ZERO, billed);
         self.pool
             .note_error(&plan.qualified_account(), class, retry_after, window_reset);
-        self.save_accounts();
+        self.save_account(&plan.qualified_account());
         self.store.record_attempt(attempt);
     }
 
@@ -683,6 +683,19 @@ impl Gateway {
     }
 
     /// Persist the current ledger.
+    /// Persist the one account an attempt touched.
+    ///
+    /// save_accounts() is for probes and operator actions, where the whole pool
+    /// is the subject. On the request path it rewrote every account and every
+    /// one of their gates for one account's change -- work proportional to the
+    /// pool, done on every completed request.
+    fn save_account(&self, qualified: &str) {
+        let Some(account) = self.pool.account(qualified) else {
+            return;
+        };
+        self.store.save_account(&account);
+    }
+
     pub fn save_accounts(&self) {
         self.store.save_accounts(&self.pool.snapshot());
     }
