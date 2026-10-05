@@ -107,6 +107,21 @@ currency = "USD"
 [providers.deepseek.accounts.main]
 label = "deepseek"
 
+[providers.haoai]
+# Prepaid wallet only: no plan windows, so every request here is real money and
+# there is no covered allowance to switch away from. The probe reads "balance"
+# (USD) from GET /v1/user/balance on the bare host.
+adapter = "haoai"
+base_url = "https://api.hao.ai/v1"
+currency = "USD"
+# The wallet stays locked while [policy] allow_metered is false. Uncomment for
+# the narrower opt-in: flipping the policy flag instead would also unlock
+# Command Code's purchased credits whenever a 5-hour window runs out.
+# allow_metered = true
+
+[providers.haoai.accounts.acc-1]
+label = "haoai"
+
 # ---------------------------------------------------------------------------
 # Routes: a model maps to exactly ONE provider.
 #
@@ -139,6 +154,10 @@ label = "deepseek"
 # and the configured value is kept unchanged as the expectation to compare
 # against. Run  lgw prices  to see the two side by side; a persistent gap means
 # the upstream changed its rates, quietly or otherwise.
+#
+# A wallet-only provider (DeepSeek, HaoAI) is the exception. Learning reads the
+# spend of COVERED windows, and a wallet has none, so nothing is ever learned
+# for it: the numbers written here stay in force until someone edits them.
 #
 # Models with no entry here and no observation yet are priced at a deliberately
 # conservative fallback. Under-estimating cost makes the hard gate too

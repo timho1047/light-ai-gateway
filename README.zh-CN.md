@@ -34,7 +34,8 @@
 - **按 provider 汇账号池。** 同一家 provider、同一个模型，可以挂好几把 key。
 - **在你察觉之前就换号。** 用量到 80% 的账号不再接新会话，请求转给下一个；窗口重置后它
   再回来。
-- **不烧真钱。** 充值余额和钱包支出默认锁死，只有你显式打开才会动用。
+- **不烧真钱。** 充值余额和钱包支出默认锁死，只有你显式打开才会动用，而且可以只对某一家
+  provider 打开。
 - **把用量记全。** 输入、输出、缓存、推理 token，加 TTFT、TPS、成本和缓存命中率，逐次
   尝试分别记。
 - **把数字摆出来。** 终端里一块看板：订阅额度还剩多少、真钱余额还剩多少，都带重置倒计时。
@@ -341,7 +342,7 @@ $0.26，实际在付 $0.9」。
 | 类别 | 例子 | 行为 |
 |---|---|---|
 | **Covered** | xKiro 的 5h/7d 花费窗口、Command Code 的月度额度 | 订阅已预付。窗口重置即作废。优先使用。 |
-| **Metered** | xKiro 钱包、Command Code 购买的 credits、DeepSeek 余额 | 真钱。花掉就不再回来。运维没显式开启就拒绝。 |
+| **Metered** | xKiro 钱包、Command Code 购买的 credits、DeepSeek 余额、HaoAI 余额 | 真钱。花掉就不再回来。运维没显式开启就拒绝。 |
 
 第三类不在这张表里：xKiro 每天的**免费 token 额度**。它会被读取、会被存储，但单位是 token
 而不是钱，所以不参与路由、不参与硬闸门、也不上看板。它只会以 provider 自己的 429 形式到达
@@ -349,6 +350,10 @@ $0.26，实际在付 $0.9」。
 
 这个区分很重要。Command Code 在 5 小时窗口用尽时不报错，它会悄悄从你买的 credits 里扣钱
 —— 请求成功了，余额却少了。下面那道硬闸门防的就是这个。
+
+开不开放按 provider 逐家回答：`[policy] allow_metered` 对所有人生效，`[providers.<name>]
+allow_metered` 针对一家覆盖它，两个方向都算。只有它存在，纯钱包的 provider（DeepSeek、
+HaoAI）才能接流量，而不用顺手把 Command Code 的溢出扣费也打开。
 
 ## 账号是怎么选的
 
@@ -424,7 +429,7 @@ TTFT 测到第一个**内容** token，跳过只带 role 和开场白性质的�
 
 各家 provider 的配额适配器在 src/quota。加一家 provider = 实现一个 trait，再声明它的
 base URL、凭据和错误词表。`adapter = "none"` 刻意不支持：账号只有探测成功后才进池子，
-所以没有配额来源的 provider 永远选不中。请用 xkiro、command-code 或 deepseek。
+所以没有配额来源的 provider 永远选不中。请用 xkiro、command-code、deepseek 或 haoai。
 
 ## 许可证
 

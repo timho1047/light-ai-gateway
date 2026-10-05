@@ -231,6 +231,14 @@ pub struct Account {
     pub credit_multiplier: Decimal,
     pub rpm_limit: Option<u32>,
     pub concurrency_limit: Option<u32>,
+    /// Whether this account's wallet may be spent, when its provider says
+    /// something different from `[policy] allow_metered`.
+    ///
+    /// None follows the policy. The override exists because the policy flag is
+    /// all-or-nothing: admitting one wallet-only provider by turning it on also
+    /// unlocks the overflow path for every other provider, Command Code's
+    /// purchased credits among them.
+    pub allow_metered: Option<bool>,
     pub last_probe_at: Option<OffsetDateTime>,
     pub last_error: Option<String>,
 }

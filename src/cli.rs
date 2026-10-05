@@ -1591,6 +1591,20 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
             )
         );
     }
+    // A provider that answers for itself is the reason the line above can be
+    // off while real money is still being spent.
+    for (name, p) in &config.providers {
+        if let Some(on) = p.allow_metered {
+            println!(
+                "              provider {name}: allow_metered={} (overrides [policy])",
+                if on {
+                    pal.yellow("on")
+                } else {
+                    pal.green("off")
+                }
+            );
+        }
+    }
 
     // Offline, and about the config rather than a credential: a price the routes
     // cannot reach, which is how a mistyped route name hides.
@@ -2228,6 +2242,7 @@ async fn cmd_keys_test(
         credit_multiplier: rust_decimal::Decimal::ONE,
         rpm_limit: None,
         concurrency_limit: None,
+        allow_metered: None,
         last_probe_at: None,
         last_error: None,
     };

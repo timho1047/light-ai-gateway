@@ -24,6 +24,8 @@ pub enum QuotaAdapter {
     CommandCode,
     /// GET /user/balance on api.deepseek.com.
     Deepseek,
+    /// GET /v1/user/balance on api.hao.ai.
+    Haoai,
     /// No probe available.
     ///
     /// Warned about in validate() and counted as a problem by doctor: an
@@ -32,6 +34,18 @@ pub enum QuotaAdapter {
     /// can never be selected. Accepting the setting silently produced a
     /// permanently idle account and a doctor line describing it as fine.
     None,
+}
+
+impl QuotaAdapter {
+    /// Whether every gate this provider can report is a wallet.
+    ///
+    /// A wallet-only provider has nothing to admit an account with while
+    /// real-money spending is disabled for it, so none of its accounts can ever
+    /// be selected. validate() warns about that combination rather than leaving
+    /// the operator to work out why a configured provider serves nothing.
+    pub fn wallet_only(self) -> bool {
+        matches!(self, QuotaAdapter::Haoai | QuotaAdapter::Deepseek)
+    }
 }
 
 /// Where a secret comes from.
@@ -321,6 +335,9 @@ pub struct AccountConfig {
     pub concurrency_limit: Option<u32>,
     #[serde(default)]
     pub rpm_limit: Option<u32>,
+    /// Overrides `[policy] allow_metered` for this account only.
+    #[serde(default)]
+    pub allow_metered: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -337,6 +354,16 @@ pub struct ProviderConfig {
     pub currency: String,
     #[serde(default)]
     pub credit_multiplier: Option<f64>,
+    /// Whether this provider's accounts may spend real money, when the answer
+    /// differs from `[policy] allow_metered`.
+    ///
+    /// The policy flag is all-or-nothing, and turning it on to admit one
+    /// wallet-only provider also unlocks the overflow path for every other
+    /// provider -- Command Code's purchased credits among them. This is the
+    /// narrower switch: omitted follows the policy, set decides for this
+    /// provider alone.
+    #[serde(default)]
+    pub allow_metered: Option<bool>,
     #[serde(default)]
     pub accounts: BTreeMap<String, AccountConfig>,
 }
@@ -609,7 +636,21 @@ impl Config {
                     "adapter = \"none\" cannot serve traffic: an account is admitted to the \
                      pool only after a successful quota probe, and with no probe source \
                      there is nothing to admit it. This account will stay UNKNOWN forever. \
-                     Use one of: xkiro, command-code, deepseek, or remove the provider."
+                     Use one of: xkiro, command-code, deepseek, haoai, or remove the provider."
+                );
+            }
+            // The mirror of the case above: every gate a wallet-only provider
+            // can report is metered, so with real-money spending off for it
+            // there is nothing to admit an account with and none of its
+            // accounts can ever be selected. Say so, rather than leave a
+            // configured provider sitting idle with no explanation.
+            if p.adapter.wallet_only() && !p.allow_metered.unwrap_or(self.policy.allow_metered) {
+                tracing::warn!(
+                    provider = %name,
+                    "provider {name} has no covered allowance, only a wallet, and spending real \
+                     money is off for it, so no account here can ever be selected. Set \
+                     [providers.{name}] allow_metered = true to spend THIS provider's wallet \
+                     without unlocking the others."
                 );
             }
             // Credential-store entries are keyed by "provider/account". A slash
@@ -760,6 +801,7 @@ impl Config {
                     credit_multiplier: multiplier,
                     rpm_limit: a.rpm_limit,
                     concurrency_limit: a.concurrency_limit,
+                    allow_metered: a.allow_metered.or(p.allow_metered),
                     last_probe_at: None,
                     last_error: None,
                 });
@@ -831,6 +873,7 @@ impl Config {
                         .unwrap_or(Decimal::ONE),
                     rpm_limit: a.rpm_limit,
                     concurrency_limit: a.concurrency_limit,
+                    allow_metered: a.allow_metered.or(p.allow_metered),
                     last_probe_at: None,
                     last_error: None,
                 });
@@ -980,6 +1023,7 @@ fn build_one(
             .unwrap_or(Decimal::ONE),
         rpm_limit: a.rpm_limit,
         concurrency_limit: a.concurrency_limit,
+        allow_metered: a.allow_metered.or(p.allow_metered),
         last_probe_at: None,
         last_error: None,
     }
@@ -1031,6 +1075,53 @@ key = { keychain = true }
 "#,
         )
         .unwrap()
+    }
+
+    /// The provider-level switch reaches its accounts, and an account can still
+    /// answer for itself; anything without an override follows the policy.
+    #[test]
+    fn a_provider_metered_override_is_inherited_and_an_account_can_overrule_it() {
+        let cfg = Config::from_toml_str(
+            r#"
+[policy]
+allow_metered = false
+
+[providers.haoai]
+adapter = "haoai"
+base_url = "https://api.hao.ai/v1"
+currency = "USD"
+allow_metered = true
+
+[providers.haoai.accounts.acc-1]
+
+[providers.haoai.accounts.acc-2]
+allow_metered = false
+
+[providers.deepseek]
+adapter = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+
+[providers.deepseek.accounts.main]
+"#,
+        )
+        .expect("config must parse");
+
+        let accounts = cfg.build_accounts_unresolved().expect("accounts");
+        let flag = |qualified: &str| {
+            accounts
+                .iter()
+                .find(|a| a.qualified() == qualified)
+                .unwrap_or_else(|| panic!("no account {qualified}"))
+                .allow_metered
+        };
+
+        assert_eq!(flag("haoai/acc-1"), Some(true));
+        assert_eq!(flag("haoai/acc-2"), Some(false));
+        assert_eq!(
+            flag("deepseek/main"),
+            None,
+            "with no override the account follows the policy"
+        );
     }
 
     #[test]
@@ -1378,7 +1469,7 @@ output = 2.0
         // The example is documentation people copy; keep it honest.
         let raw = include_str!("../config.example.toml");
         let cfg = Config::from_toml_str(raw).expect("config.example.toml must stay valid");
-        assert_eq!(cfg.providers.len(), 3);
+        assert_eq!(cfg.providers.len(), 4);
         assert!(!cfg.routes.is_empty(), "the example must route something");
 
         // A model name gets copied out of here into a real config, so both of the
@@ -1505,6 +1596,7 @@ base_url = "https://api.xkiro.com/v1"
                 credit_multiplier: None,
                 concurrency_limit: None,
                 rpm_limit: None,
+                allow_metered: None,
             },
         );
         let err = cfg.validate().unwrap_err().to_string();

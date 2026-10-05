@@ -7,6 +7,7 @@
 //!   - Xkiro        GET {probe_base}/v1/usage
 //!   - CommandCode  GET api.commandcode.ai/alpha/billing/credits (+ subscriptions, usage/summary, whoami)
 //!   - Deepseek     GET {probe_base}/user/balance
+//!   - Haoai        GET {probe_base}/v1/user/balance
 //!
 //! Rules every adapter must follow:
 //!   - Treat upstream JSON as UNTRUSTED: parse defensively, tolerate missing
@@ -33,6 +34,7 @@ use time::OffsetDateTime;
 
 pub mod commandcode;
 pub mod deepseek;
+pub mod haoai;
 pub mod xkiro;
 
 /// A successful probe.
@@ -84,6 +86,7 @@ pub fn probe_for(adapter: QuotaAdapter, probe_base_url: &str) -> Option<Arc<dyn 
         QuotaAdapter::Xkiro => Some(Arc::new(xkiro::XkiroProbe::new(base))),
         QuotaAdapter::CommandCode => Some(Arc::new(commandcode::CommandCodeProbe::new(base))),
         QuotaAdapter::Deepseek => Some(Arc::new(deepseek::DeepseekProbe::new(base))),
+        QuotaAdapter::Haoai => Some(Arc::new(haoai::HaoaiProbe::new(base))),
         QuotaAdapter::None => None,
     }
 }
@@ -91,10 +94,10 @@ pub fn probe_for(adapter: QuotaAdapter, probe_base_url: &str) -> Option<Arc<dyn 
 // ---------------------------------------------------------------------------
 // Shared HTTP + JSON helpers.
 //
-// All three adapters read a pinned host with a bearer token, cap the response,
-// refuse redirects and must never write a credential into an error message, so
-// that part lives here rather than being repeated (and slowly diverging) three
-// times.
+// Every adapter reads a pinned host with a bearer token, caps the response,
+// refuses redirects and must never write a credential into an error message, so
+// that part lives here rather than being repeated (and slowly diverging) once
+// per provider.
 // ---------------------------------------------------------------------------
 
 /// Hard ceiling on any probe request. A hung provider must not stall the poller.
@@ -286,9 +289,18 @@ pub(crate) fn sat_add(a: Decimal, b: Decimal) -> Decimal {
     a.checked_add(b).unwrap_or(Decimal::MAX)
 }
 
-/// Subtraction that saturates instead of panicking (Decimal::MIN side).
+/// Subtraction that saturates instead of panicking.
+///
+/// The overflow goes either way and the direction decides whether the reading
+/// looks rich or poor, so it is derived rather than assumed: a - b can only
+/// exceed Decimal::MAX when b is negative, and can only fall below Decimal::MIN
+/// when it is positive.
 pub(crate) fn sat_sub(a: Decimal, b: Decimal) -> Decimal {
-    a.checked_sub(b).unwrap_or(Decimal::MIN)
+    a.checked_sub(b).unwrap_or(if b.is_sign_negative() {
+        Decimal::MAX
+    } else {
+        Decimal::MIN
+    })
 }
 
 /// A non-negative integer from a JSON scalar (counts, seconds, token limits).
@@ -599,6 +611,7 @@ pub(crate) mod testutil {
             credit_multiplier: Decimal::ONE,
             rpm_limit: None,
             concurrency_limit: None,
+            allow_metered: None,
             last_probe_at: None,
             last_error: None,
         }
@@ -660,6 +673,10 @@ mod tests {
                 "deepseek",
                 probe_for(QuotaAdapter::Deepseek, base).expect("deepseek adapter"),
             ),
+            (
+                "haoai",
+                probe_for(QuotaAdapter::Haoai, base).expect("haoai adapter"),
+            ),
         ]
     }
 
@@ -699,6 +716,7 @@ mod tests {
 
         assert_eq!(sat_add(huge, huge), Decimal::MAX);
         assert_eq!(sat_sub(negative, huge), Decimal::MIN);
+        assert_eq!(sat_sub(huge, negative), Decimal::MAX);
         assert_eq!(sat_add(Decimal::ONE, Decimal::ONE), Decimal::from(2));
     }
 
@@ -732,6 +750,7 @@ mod tests {
             (QuotaAdapter::Xkiro, "xkiro"),
             (QuotaAdapter::CommandCode, "command-code"),
             (QuotaAdapter::Deepseek, "deepseek"),
+            (QuotaAdapter::Haoai, "haoai"),
         ] {
             let probe =
                 probe_for(adapter, "https://api.example.invalid/").expect("adapter must exist");
@@ -748,11 +767,18 @@ mod tests {
             r#"{"plan":"pro","windows":[{"window_sec":18000,"spent_usd":"0","cap_usd":"10"}]}"#,
         )])
         .await;
+        // One entry per probe REQUEST, not per adapter: Command Code alone makes
+        // three, and the surplus keeps this independent of that count.
+        let redirect = || Reply::redirect(format!("{}/v1/usage", target.base_url));
         let source = TestServer::start(vec![
-            Reply::redirect(format!("{}/v1/usage", target.base_url)),
-            Reply::redirect(format!("{}/v1/usage", target.base_url)),
-            Reply::redirect(format!("{}/v1/usage", target.base_url)),
-            Reply::redirect(format!("{}/v1/usage", target.base_url)),
+            redirect(),
+            redirect(),
+            redirect(),
+            redirect(),
+            redirect(),
+            redirect(),
+            redirect(),
+            redirect(),
         ])
         .await;
 
@@ -786,11 +812,16 @@ mod tests {
         let echoing = format!(
             r#"{{"error":{{"type":"authentication_error","code":"invalid_api_key {KEY}","message":"bad key {KEY}"}}}}"#
         );
+        let rejecting = || Reply::status(401, echoing.clone());
         let server = TestServer::start(vec![
-            Reply::status(401, echoing.clone()),
-            Reply::status(401, echoing.clone()),
-            Reply::status(401, echoing.clone()),
-            Reply::status(401, echoing.clone()),
+            rejecting(),
+            rejecting(),
+            rejecting(),
+            rejecting(),
+            rejecting(),
+            rejecting(),
+            rejecting(),
+            rejecting(),
         ])
         .await;
 

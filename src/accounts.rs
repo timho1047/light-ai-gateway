@@ -427,6 +427,9 @@ impl Pool {
         }
 
         let needed = est_cost + reserve;
+        // Spending real money is a per-account question: the provider's own
+        // answer outranks the policy, in both directions.
+        let allow_metered = acct.allow_metered.unwrap_or(self.allow_metered);
 
         if acct.has_covered() {
             match self.covered_headroom(acct) {
@@ -434,18 +437,14 @@ impl Pool {
                 // Covered is exhausted; whether metered may absorb the overflow
                 // is a policy question, and the default answer is no.
                 Some(_) => {
-                    if self.allow_metered
-                        && self.metered_headroom(acct).is_some_and(|m| m >= needed)
-                    {
+                    if allow_metered && self.metered_headroom(acct).is_some_and(|m| m >= needed) {
                         return GateDecision::Metered;
                     }
                     return GateDecision::Reject(RejectReason::InsufficientHeadroom);
                 }
                 // No money-denominated covered gate at all.
                 None => {
-                    if self.allow_metered
-                        && self.metered_headroom(acct).is_some_and(|m| m >= needed)
-                    {
+                    if allow_metered && self.metered_headroom(acct).is_some_and(|m| m >= needed) {
                         return GateDecision::Metered;
                     }
                     return GateDecision::Reject(RejectReason::InsufficientHeadroom);
@@ -453,9 +452,9 @@ impl Pool {
             }
         }
 
-        // Pure metered provider (for example DeepSeek): nothing is prepaid, so
-        // every request costs real money.
-        if self.allow_metered && self.metered_headroom(acct).is_some_and(|m| m >= needed) {
+        // Pure metered provider (for example DeepSeek, HaoAI): nothing is
+        // prepaid, so every request costs real money.
+        if allow_metered && self.metered_headroom(acct).is_some_and(|m| m >= needed) {
             return GateDecision::Metered;
         }
         GateDecision::Reject(RejectReason::MeteredNotAllowed)
@@ -1028,7 +1027,7 @@ impl Pool {
     /// Apply fresh gate readings from a quota probe.
     pub fn apply_probe(&self, qualified_id: &str, gates: Vec<Gate>, at: OffsetDateTime) {
         let mut inner = self.inner.lock().unwrap();
-        let allow_metered = self.allow_metered;
+        let policy_metered = self.allow_metered;
         let soft = self.soft_threshold;
         let Some(acct) = find_mut(&mut inner.accounts, qualified_id) else {
             return;
@@ -1054,6 +1053,7 @@ impl Pool {
             .covered_gates()
             .any(|g| g.kind != GateKind::FreeTokens && g.remaining() > Decimal::ZERO);
         let has_metered = acct.metered_gates().any(|g| g.remaining() > Decimal::ZERO);
+        let allow_metered = acct.allow_metered.unwrap_or(policy_metered);
         let usable = has_room || (allow_metered && has_metered);
 
         // An account parked because its window was spent comes back once the
@@ -1284,6 +1284,7 @@ mod tests {
             credit_multiplier: Decimal::ONE,
             rpm_limit: None,
             concurrency_limit: None,
+            allow_metered: None,
             last_probe_at: None,
             last_error: None,
         }
@@ -2189,6 +2190,96 @@ mod tests {
         );
         p.apply_probe("p/a", vec![cover(100, 100), wallet(0, 0)], now());
         assert_eq!(p.account("p/a").unwrap().state, AccountState::Disabled);
+    }
+
+    /// A wallet-only provider can be admitted without unlocking everyone else.
+    ///
+    /// The policy flag is all-or-nothing: turning it on to use one prepaid
+    /// wallet also opens the overflow path for every other provider, Command
+    /// Code's purchased credits among them. The per-provider override is what
+    /// makes the narrow answer possible, so its wallet must be spendable with
+    /// the policy off while a policy-governed wallet in the same pool is not.
+    #[test]
+    fn an_account_override_admits_its_wallet_while_the_policy_refuses_the_others() {
+        let mut allowed = acct("acc-1", "haoai", vec![wallet(50, 0)], AccountState::Active);
+        allowed.allow_metered = Some(true);
+        let locked = acct(
+            "acc-1",
+            "commandcode",
+            vec![wallet(50, 0)],
+            AccountState::Active,
+        );
+        let p = Pool::new(vec![allowed, locked], &policy());
+        assert!(!p.allow_metered(), "the policy itself stays off");
+
+        let overridden = p.account("haoai/acc-1").unwrap();
+        assert_eq!(
+            p.evaluate(&overridden, Decimal::ONE, Decimal::ZERO),
+            GateDecision::Metered
+        );
+        let governed = p.account("commandcode/acc-1").unwrap();
+        assert_eq!(
+            p.evaluate(&governed, Decimal::ONE, Decimal::ZERO),
+            GateDecision::Reject(RejectReason::MeteredNotAllowed)
+        );
+
+        let plan = p
+            .select("haoai", "m", None, Decimal::ONE, "r", 1, &[])
+            .unwrap();
+        assert_eq!(plan.coverage, GateClass::Metered);
+        assert!(
+            p.select("commandcode", "m", None, Decimal::ONE, "r", 1, &[])
+                .is_err(),
+            "one provider's override is not a global unlock"
+        );
+    }
+
+    /// ... and the override can also say no: a provider's wallet stays shut
+    /// while metered spending is allowed everywhere else.
+    #[test]
+    fn an_account_override_of_false_keeps_its_wallet_locked_while_the_policy_allows_it() {
+        let mut locked = acct("acc-1", "haoai", vec![wallet(50, 0)], AccountState::Active);
+        locked.allow_metered = Some(false);
+        let mut pol = policy();
+        pol.allow_metered = true;
+        let p = Pool::new(vec![locked], &pol);
+
+        let only = p.account("haoai/acc-1").unwrap();
+        assert_eq!(
+            p.evaluate(&only, Decimal::ONE, Decimal::ZERO),
+            GateDecision::Reject(RejectReason::MeteredNotAllowed)
+        );
+        assert!(
+            p.select("haoai", "m", None, Decimal::ONE, "r", 1, &[])
+                .is_err()
+        );
+    }
+
+    /// A probe only revives a parked wallet account when its provider may spend.
+    ///
+    /// apply_probe requires the reading to show the account can actually pay;
+    /// for a wallet-only provider with real money off there is nothing to pay
+    /// with, so a successful probe still leaves it out of rotation.
+    #[test]
+    fn a_probe_revives_a_parked_wallet_only_when_its_provider_may_spend() {
+        let mut locked = acct("acc-1", "haoai", vec![wallet(1, 1)], AccountState::Parked);
+        locked.allow_metered = None;
+        let mut allowed = acct("acc-2", "haoai", vec![wallet(1, 1)], AccountState::Parked);
+        allowed.allow_metered = Some(true);
+        let p = Pool::new(vec![locked, allowed], &policy());
+
+        p.apply_probe("haoai/acc-1", vec![wallet(50, 0)], now());
+        p.apply_probe("haoai/acc-2", vec![wallet(50, 0)], now());
+
+        assert_eq!(
+            p.account("haoai/acc-1").unwrap().state,
+            AccountState::Parked,
+            "nothing may pay for this account's traffic"
+        );
+        assert_eq!(
+            p.account("haoai/acc-2").unwrap().state,
+            AccountState::Active
+        );
     }
 
     /// rpm_limit and concurrency_limit were parsed, stored and then never read,

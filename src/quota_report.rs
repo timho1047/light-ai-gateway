@@ -466,6 +466,7 @@ mod tests {
             credit_multiplier: Decimal::ONE,
             rpm_limit: None,
             concurrency_limit: None,
+            allow_metered: None,
             last_probe_at: Some(ts(0)),
             last_error: None,
         }

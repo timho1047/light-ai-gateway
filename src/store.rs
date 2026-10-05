@@ -1390,6 +1390,7 @@ mod tests {
             credit_multiplier: dec("0.000356"),
             rpm_limit: Some(600),
             concurrency_limit: Some(4),
+            allow_metered: None,
             last_probe_at: Some(ts(DAY1 + 30)),
             last_error: None,
         }

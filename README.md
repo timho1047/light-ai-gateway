@@ -36,7 +36,7 @@ everything cost.
 - **Switches before you notice.** Accounts at 80% stop taking new sessions;
   requests move to the next account and come back when a window resets.
 - **Refuses to burn real money.** Paid-credit and wallet spend is fenced off
-  behind an explicit opt-in.
+  behind an explicit opt-in, and that opt-in can be granted per provider.
 - **Records usage.** Input, output, cached and reasoning tokens, TTFT, TPS, cost,
   cache hit rate, per attempt.
 - **Shows you the numbers.** A terminal board of covered allowance against
@@ -389,7 +389,7 @@ Every quota check is one of two kinds, and the gateway never conflates them:
 | Class | Examples | Behaviour |
 |---|---|---|
 | **Covered** | xKiro 5h/7d spend windows, Command Code monthly credits | Prepaid by a subscription. Forfeited when the window resets. Preferred. |
-| **Metered** | xKiro wallet, Command Code purchased credits, DeepSeek balance | Real money. Permanent once spent. Refused unless the operator opts in. |
+| **Metered** | xKiro wallet, Command Code purchased credits, DeepSeek balance, HaoAI balance | Real money. Permanent once spent. Refused unless the operator opts in. |
 
 A third kind sits outside this table: xKiro's daily **free-token allowance**. It is
 read and stored, but counted in tokens rather than money, so it plays no part in
@@ -399,6 +399,11 @@ routing, the hard gate or the board. It reaches the client as the provider's own
 The distinction matters. Command Code does not return an error when a 5-hour window
 is exhausted; it silently bills your purchased credits, so the request succeeds
 while your balance drops. That is what the hard gate guards against.
+
+The opt-in is answered per provider. `[policy] allow_metered` decides for
+everyone, and `[providers.<name>] allow_metered` overrides it for one provider,
+in either direction -- which is what lets a wallet-only provider such as DeepSeek
+or HaoAI serve without also unlocking Command Code's overflow.
 
 ## How an account is chosen
 
@@ -490,7 +495,7 @@ Provider quota adapters live in src/quota. Adding a provider means implementing
 one trait and declaring its base URL, credentials and error vocabulary.
 `adapter = "none"` is deliberately not supported: an account is admitted to the
 pool only after a successful probe, so a provider with no quota source can never
-be selected. Use xkiro, command-code or deepseek.
+be selected. Use xkiro, command-code, deepseek or haoai.
 
 ## License
 
