@@ -1,7 +1,5 @@
 //! HTTP front end: the OpenAI-compatible endpoint and the retry loop.
 //!
-//! FILE OWNER: teammate proxy-dev. Replace stub bodies; keep public signatures.
-//!
 //! Hard rules:
 //!   - An account switch may only happen BEFORE the first byte is written to
 //!     the client. Connect upstream, inspect the status, and only then start
@@ -1269,6 +1267,10 @@ fn plan_error_response(err: &PlanError, backend: &dyn ProxyBackend) -> Response 
     }
 }
 
+// Seven arguments, and each one is a different fact about the attempt: which
+// plan, how it failed, what the upstream said, when it started, and which
+// attempt and request it belongs to. Bundling them into a struct would move the
+// same list one line up without making anything clearer.
 #[allow(clippy::too_many_arguments)]
 fn record_attempt_failure(
     backend: &dyn ProxyBackend,

@@ -1,7 +1,5 @@
 //! Server-sent-events metering.
 //!
-//! FILE OWNER: teammate proxy-dev. Replace stub bodies; keep public signatures.
-//!
 //! Two details from provider documentation drive this module:
 //!   1. Without stream_options.include_usage the upstream sends NO usage frame
 //!      at all and self-metering records zero forever. The gateway must inject

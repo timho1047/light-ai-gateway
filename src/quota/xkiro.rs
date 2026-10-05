@@ -1,7 +1,5 @@
 //! xKiro quota adapter.
 //!
-//! FILE OWNER: quota-dev.
-//!
 //! Endpoint: GET {pinned probe host}/v1/usage with Authorization: Bearer <key>.
 //!
 //! Recorded payload shape (docs.xkiro.com/api/usage):

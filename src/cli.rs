@@ -1,7 +1,5 @@
 //! Command-line interface.
 //!
-//! FILE OWNER: teammate meter-dev.
-//!
 //! Commands: serve, status, usage, accounts, tail, doctor, init.
 //!
 //! The status view keeps covered and metered allowances visually distinct and
@@ -1467,13 +1465,12 @@ fn cmd_accounts_disable(path: &Path, account_id: &str, pal: &Palette) -> Result<
 
     // Overlay what the ledger already knows before writing anything back.
     //
-    // This command used to save a full pool snapshot built from configuration
-    // alone: those accounts carry no gates and state Unknown, so the upsert
-    // deleted the gate rows of EVERY account in the file and reset their state
-    // and reset times. Disabling one account quietly erased the quota readings
-    // of all the others -- hours of probing, and on Command Code the difference
-    // between routing on real numbers and routing blind. It also created a
-    // fresh empty ledger on a machine that had none.
+    // A snapshot built from configuration alone carries no gates and state
+    // Unknown, and the upsert would then delete the gate rows of EVERY account
+    // in the file and reset their state and reset times: disabling one account
+    // would quietly erase the quota readings of all the others -- hours of
+    // probing, and on Command Code the difference between routing on real
+    // numbers and routing blind.
     if let Ok(conn) = store::open_readonly(&db)
         && let Ok(rows) = store::load_accounts(&conn)
         && let Some(row) = rows

@@ -1,7 +1,5 @@
 //! Time-window price tiers.
 //!
-//! FILE OWNER: Lead.
-//!
 //! Some providers charge different rates by time of day: Command Code bills
 //! deepseek-v4.1-flash at double the rate Mon-Fri 01:00-04:00 and 06:00-10:00
 //! UTC, and the off-peak rate at every other hour. A gateway that assumes one

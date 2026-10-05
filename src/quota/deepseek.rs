@@ -1,7 +1,5 @@
 //! DeepSeek quota adapter.
 //!
-//! FILE OWNER: quota-dev.
-//!
 //! Endpoint: GET {pinned probe host}/user/balance with Authorization: Bearer.
 //!
 //! Recorded payload shape (api-docs.deepseek.com/api/get-user-balance):

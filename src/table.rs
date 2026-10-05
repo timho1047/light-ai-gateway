@@ -1,11 +1,11 @@
 //! Text tables, and the scale numbers are read at.
 //!
-//! Every table in this program used to spell its column widths out inside the
-//! format string -- [14, 18, 26, 26, 8] and friends. That is a promise about the
-//! data that the data does not keep: one model name a few characters longer than
-//! its column and every later column slides right while the header stays where it
-//! was. A 30-digit cost did the same thing to the usage table, and a nine-digit
-//! token count pushed three columns out of line.
+//! A hard-coded width is a promise about the data that the data does not keep:
+//! one model name a few characters longer than its column and every later column
+//! slides right while the header stays where it was. A 30-digit cost does the
+//! same thing to the usage table, and a nine-digit token count pushes three
+//! columns out of line. Widths spelled out inside the format string --
+//! [14, 18, 26, 26, 8] and friends -- cannot hold that promise.
 //!
 //! Widths here are measured from the content, so a table cannot go crooked. The
 //! only remaining question is how wide the content is, which is what tokens() and

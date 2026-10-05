@@ -1,7 +1,5 @@
 //! SQLite persistence.
 //!
-//! FILE OWNER: teammate store-dev. Replace stub bodies; keep public signatures.
-//!
 //! Requirements:
 //!   - rusqlite, WAL mode, busy_timeout set.
 //!   - Writes go through a single writer task fed by an unbounded channel.
@@ -487,6 +485,11 @@ impl StoreHandle {
     ///
     /// Must be called after every probe and every settle; see the module docs
     /// for why the ledger is written eagerly while telemetry is batched.
+    ///
+    /// Destructive by nature: it replaces the rows of every account it covers,
+    /// so an account in the slice that carries no gates loses the gates the
+    /// ledger holds for it. Pass a snapshot whose accounts were read from the
+    /// pool, never one built from configuration alone.
     pub fn save_accounts(&self, accounts: &[Account]) {
         if self.tx.send(WriteMsg::Accounts(accounts.to_vec())).is_err() {
             tracing::error!("store writer is gone; dropping account ledger snapshot");

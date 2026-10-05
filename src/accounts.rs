@@ -1,6 +1,6 @@
 //! The account pool: gate evaluation, selection, and the local ledger.
 //!
-//! FROZEN CONTRACT (Lead-owned).
+//! FROZEN CONTRACT: the router's decisions and the ledger read this pool's interface.
 //!
 //! This is where every economic decision happens. Three rules drive it:
 //!
@@ -1775,10 +1775,10 @@ mod tests {
 
     /// Draining is a preference about where new sessions go, never a refusal.
     ///
-    /// This is why the stale state had to be fixed rather than tolerated: it
-    /// never surfaces as an error, the account is simply never chosen again.
-    /// It is also the behaviour that must survive the fix, so a future change
-    /// cannot "clear" Draining by turning it into an outage instead.
+    /// The preference never surfaces as an error: a draining account is simply
+    /// chosen last. A change that "cleared" Draining by refusing instead would
+    /// turn a routing preference into an outage, and this is the test that says
+    /// so.
     #[test]
     fn a_draining_account_yields_to_one_that_is_still_filling_up() {
         let p = Pool::new(
@@ -1920,8 +1920,6 @@ mod tests {
             "a rolled window starts whole again"
         );
     }
-
-    // ------------------------------------------------- fixes for the review
 
     /// One transient 401 used to remove an account for good.
     ///

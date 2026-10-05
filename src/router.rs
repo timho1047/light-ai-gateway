@@ -1,14 +1,12 @@
 //! Integration layer: routing, probe orchestration, and persistence glue.
 //!
-//! FILE OWNER: Lead.
-//!
 //! The Gateway is the single object the HTTP layer talks to. It owns the account
 //! pool, the price table, the quota probes, and the database writer, and it is
 //! the only place that decides which pot of money pays for a request.
 
 use crate::accounts::{AttemptPlan, PlanError, Pool};
 use crate::config::{Config, ResolvedRoute};
-use crate::domain::{Account, AttemptRecord, GateClass, GateKind, RequestRecord, TokenUsage, now};
+use crate::domain::{Account, AttemptRecord, GateKind, RequestRecord, TokenUsage, now};
 use crate::error::UpstreamErrorClass;
 use crate::meter::PriceTable;
 use crate::quota::{QuotaProbe, probe_for};
@@ -142,7 +140,8 @@ impl Gateway {
         }
         if accounts.is_empty() {
             anyhow::bail!(
-                "no account could be loaded: every configured account is missing a credential.                  Run lgw keys list to see which ones, then lgw keys add <provider> <account>"
+                "no account could be loaded: every configured account is missing a credential. \
+                 Run lgw keys list to see which ones, then lgw keys add <provider> <account>"
             );
         }
         accounts.extend(unusable);
@@ -293,10 +292,6 @@ impl Gateway {
         Ok((route, plan))
     }
 
-    /// Estimated cost of a request, used to size the hard gate.
-    ///
-    /// Unknown models are priced at the conservative fallback rather than at
-    /// zero, so an unpriced model can never silently drain a wallet.
     /// Which price tier a request starting now falls into.
     ///
     /// Tier 0 is the default price. A configured window makes a request cost
@@ -315,6 +310,10 @@ impl Gateway {
         }
     }
 
+    /// Estimated cost of a request, used to size the hard gate.
+    ///
+    /// Unknown models are priced at the conservative fallback rather than at
+    /// zero, so an unpriced model can never silently drain a wallet.
     pub fn estimate_cost(
         &self,
         provider: &str,
@@ -737,15 +736,6 @@ impl Gateway {
 
     pub fn snapshot(&self) -> Vec<Account> {
         self.pool.snapshot()
-    }
-
-    /// Which pot will pay for an account's next request, for display.
-    pub fn coverage_of(&self, account: &Account) -> GateClass {
-        if account.has_covered() {
-            GateClass::Covered
-        } else {
-            GateClass::Metered
-        }
     }
 }
 

@@ -1,8 +1,5 @@
 //! Quota probing: turn each provider's account state into Gates.
 //!
-//! FILE OWNER: teammate quota-dev. Replace the stub bodies; keep the public
-//! signatures stable so router.rs and the poller keep compiling.
-//!
 //! Adapters implemented here:
 //!   - Xkiro        GET {probe_base}/v1/usage
 //!   - CommandCode  GET api.commandcode.ai/alpha/billing/credits (+ subscriptions, usage/summary, whoami)

@@ -1,7 +1,5 @@
 //! Metering: cost estimation, price learning, and TPS/TTFT math.
 //!
-//! FILE OWNER: teammate meter-dev.
-//!
 //! The local ledger is the primary source of truth for spend between probes.
 //! The gateway sees every request's real usage, so threshold decisions must be
 //! driven per-request rather than by polling frequency.
@@ -935,11 +933,10 @@ fn default_cached_discount() -> Decimal {
 ///
 /// Above this a figure is not a price, it is a mis-attribution: a fixed
 /// per-request charge, or another client's traffic on a shared account, divided
-/// by an interval that happened to carry almost no tokens. The bound used to be
-/// one dollar per TOKEN -- a million dollars per million -- which nothing could
-/// reach, so it never guarded anything. The dearest production models bill
-/// around 150 USD/M, so 1000 leaves an order of magnitude of room and still
-/// catches a rate like the 1559 USD/M that a 47-token interval produced once.
+/// by an interval that happened to carry almost no tokens. A bound nothing can
+/// reach guards nothing, so this one sits an order of magnitude above the dearest
+/// production models (around 150 USD/M) and still catches a mis-attribution like
+/// 47 tokens billed at 1559 USD/M.
 pub const MAX_PLAUSIBLE_PER_MILLION: u64 = 1000;
 
 fn max_plausible_per_token() -> Decimal {

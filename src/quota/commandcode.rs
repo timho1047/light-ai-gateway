@@ -1,7 +1,5 @@
 //! Command Code quota adapter.
 //!
-//! FILE OWNER: quota-dev.
-//!
 //! Command Code exposes a small set of undocumented /alpha endpoints. The host
 //! is pinned from configuration (probe_base_url) because the credential must
 //! never follow a URL that arrived with a client request.

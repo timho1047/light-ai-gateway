@@ -1,7 +1,5 @@
 //! Credential storage for provider API keys.
 //!
-//! FILE OWNER: Lead.
-//!
 //! Why this module exists: asking the operator to export an environment variable
 //! per account before every start is friction, and the obvious fix -- a file of
 //! keys -- is a plaintext secret on disk.
@@ -244,7 +242,9 @@ impl<S: ItemStore> VaultBackend<S> {
 fn parse_vault(text: &str) -> Result<HashMap<String, String>> {
     serde_json::from_str(text).with_context(|| {
         format!(
-            "the '{VAULT_ITEM}' item in the OS credential store is not readable as a JSON              object of provider/account to secret. Refusing to treat every credential as              missing. Restore the item from a backup, or delete it and re-add the keys."
+            "the '{VAULT_ITEM}' item in the OS credential store is not readable as a JSON \
+             object of provider/account to secret. Refusing to treat every credential as \
+             missing. Restore the item from a backup, or delete it and re-add the keys."
         )
     })
 }

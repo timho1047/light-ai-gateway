@@ -1,6 +1,6 @@
 //! Upstream error classification.
 //!
-//! FROZEN CONTRACT (Lead-owned).
+//! FROZEN CONTRACT: every module classifies upstream failures through these shapes.
 //!
 //! Why this exists: a 429 has several completely different meanings and the
 //! correct reaction to each is different. Treating a burst rate limit as

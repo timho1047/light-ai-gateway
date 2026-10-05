@@ -1,7 +1,7 @@
 //! Core domain types shared by every module.
 //!
-//! FROZEN CONTRACT (Lead-owned). Other modules depend on these shapes;
-//! changing them requires a coordinated update across the crate.
+//! FROZEN CONTRACT: other modules depend on these shapes; changing them requires a
+//! coordinated update across the crate.
 //!
 //! Central model:
 //!   - An account holds a set of Gates. EVERY gate must pass for a request
@@ -145,11 +145,6 @@ impl Gate {
     pub fn utilization_f64(&self) -> f64 {
         use rust_decimal::prelude::ToPrimitive;
         self.utilization().to_f64().unwrap_or(0.0)
-    }
-
-    pub fn remaining_usd(&self) -> f64 {
-        use rust_decimal::prelude::ToPrimitive;
-        self.remaining().to_f64().unwrap_or(0.0)
     }
 }
 

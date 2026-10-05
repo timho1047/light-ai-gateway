@@ -1,6 +1,6 @@
 //! Configuration: TOML schema, validation, and account construction.
 //!
-//! FROZEN CONTRACT (Lead-owned).
+//! FROZEN CONTRACT: the CLI, the router and the proxy are written against this shape.
 //!
 //! Model routing is deliberately static: a model name maps to exactly one
 //! provider. Cross-provider fallback and cross-model downgrade are out of
@@ -375,10 +375,9 @@ fn default_currency() -> String {
 impl ProviderConfig {
     /// The bare host every quota adapter appends its documented path to.
     ///
-    /// This is the single source of truth: it was previously duplicated, and the
-    /// copy in the CLI bypassed the version-suffix normalisation, so lgw keys
-    /// test kept calling https://api.xkiro.com/v1/v1/usage after the gateway
-    /// itself had been fixed.
+    /// The single source of truth: a second copy of this normalisation drifts,
+    /// and the version-suffix rule is what such a copy gets wrong -- it turns
+    /// https://api.xkiro.com/v1 into /v1/v1/usage.
     pub fn probe_base(&self) -> String {
         match &self.probe_base_url {
             Some(explicit) => explicit.trim_end_matches('/').to_string(),
@@ -809,30 +808,7 @@ impl Config {
                 let key = secret_ref
                     .resolve(store, provider_name, account_id)
                     .with_context(|| format!("provider {provider_name} account {account_id}"))?;
-                let currency = a.currency.clone().unwrap_or_else(|| p.currency.clone());
-                let multiplier = a
-                    .credit_multiplier
-                    .or(p.credit_multiplier)
-                    .map(|f| Decimal::try_from(f).unwrap_or(Decimal::ONE))
-                    .unwrap_or(Decimal::ONE);
-                out.push(Account {
-                    id: account_id.clone(),
-                    provider: provider_name.clone(),
-                    label: a.label.clone().unwrap_or_else(|| account_id.clone()),
-                    base_url: p.base_url.trim_end_matches('/').to_string(),
-                    api_key: key,
-                    currency,
-                    gates: Vec::new(),
-                    state: AccountState::Unknown,
-                    available_at: None,
-                    window_started_at: None,
-                    credit_multiplier: multiplier,
-                    rpm_limit: a.rpm_limit,
-                    concurrency_limit: a.concurrency_limit,
-                    allow_metered: a.allow_metered.or(p.allow_metered),
-                    last_probe_at: None,
-                    last_error: None,
-                });
+                out.push(build_one(provider_name, p, account_id, a, key));
             }
         }
         if out.is_empty() {
