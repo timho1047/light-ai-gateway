@@ -291,7 +291,7 @@ mod tests {
         let free = gate_of(&outcome, GateKind::FreeTokens);
         assert_eq!(free.cap, Decimal::from(10_000u64));
         assert_eq!(free.used, Decimal::from(1_200u64));
-        assert_eq!(free.class(), GateClass::Covered);
+        assert_eq!(free.class(), GateClass::TokenAllowance);
 
         // The wallet is real money: cap is the balance, nothing spent yet.
         let wallet = gate_of(&outcome, GateKind::Wallet);

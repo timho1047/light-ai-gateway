@@ -48,6 +48,7 @@ use crate::domain::{
     Account, AccountOverview, AccountState, AttemptRecord, Confidence, Gate, GateClass, GateKind,
     GateSource, GroupBy, RequestRecord, RequestStatus, RequestSummary, UsageRow,
 };
+use crate::tier::TierKey;
 
 /// How long a writer waits for a competing process lock before giving up.
 const BUSY_TIMEOUT: StdDuration = StdDuration::from_millis(5_000);
@@ -156,7 +157,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 CREATE TABLE IF NOT EXISTS prices (
     provider                  TEXT    NOT NULL,
     model                     TEXT    NOT NULL,
-    tier                      INTEGER NOT NULL,
+    tier                      TEXT    NOT NULL,
     input_per_token           TEXT    NOT NULL,
     output_per_token          TEXT    NOT NULL,
     cache_read_per_token      TEXT    NOT NULL,
@@ -180,7 +181,7 @@ CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
 /// written under the old key cannot be attributed to a provider, so the account
 /// and gate tables are rebuilt rather than guessed at. Usage history already
 /// carried provider and is preserved.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// The version at which account identity changed from id alone to
 /// (provider, id). Only a database older than THIS needs the rebuild; later
@@ -244,6 +245,17 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         tracing::warn!("store: rebuilding the learned price table after a column change");
         conn.execute_batch("DROP TABLE IF EXISTS prices;")
             .context("dropping the older price table")?;
+    }
+
+    if version < 7 && table_exists(conn, "prices")? {
+        // A learned rate used to be identified by the tier's POSITION in the
+        // configuration, so reordering two [[tiers]] blocks re-associated every
+        // rate with another window's price. The key is the window's name now,
+        // and a positional row cannot be mapped to one -- the store does not
+        // know the config. Learned prices are re-derived on the next probe.
+        tracing::warn!("store: rebuilding the learned price table to key it by window name");
+        conn.execute_batch("DROP TABLE IF EXISTS prices;")
+            .context("dropping the positionally-keyed price table")?;
     }
 
     if version < 6 {
@@ -370,7 +382,7 @@ pub fn open(path: &Path) -> Result<Connection> {
 }
 
 /// Open an existing database read-only, for CLI commands.
-pub fn open_readonly(path: &Path) -> Result<Connection> {
+fn open_readonly(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -798,7 +810,7 @@ fn save_prices_tx(tx: &Transaction<'_>, prices: &[crate::meter::PersistedPrice])
             params![
                 p.provider,
                 p.model,
-                i64::from(p.tier),
+                p.tier.as_key(),
                 dec_str(p.price.input_per_token),
                 dec_str(p.price.output_per_token),
                 dec_str(p.price.cache_read_per_token),
@@ -854,7 +866,7 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
 /// table. That is a normal state, not a failure, so it reads as "nothing learned
 /// yet" rather than surfacing an error the operator can do nothing about. Any
 /// other read failure still propagates.
-pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice>> {
+fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice>> {
     use crate::meter::{ModelPrice, PersistedPrice};
 
     if !table_exists(conn, "prices")? {
@@ -866,7 +878,7 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
     type PriceRowTuple = (
         String,
         String,
-        i64,
+        String,
         String,
         String,
         String,
@@ -916,7 +928,7 @@ pub fn load_prices(conn: &Connection) -> Result<Vec<crate::meter::PersistedPrice
         out.push(PersistedPrice {
             provider,
             model,
-            tier: tier.max(0) as u32,
+            tier: TierKey::from_key(&tier),
             price: ModelPrice {
                 input_per_token: input,
                 output_per_token: output,
@@ -1003,7 +1015,7 @@ fn save_accounts_tx(tx: &Transaction<'_>, accounts: &[Account]) -> Result<()> {
 }
 
 /// Accounts plus gates, for the status command.
-pub fn load_accounts(conn: &Connection) -> Result<Vec<AccountOverview>> {
+fn load_accounts(conn: &Connection) -> Result<Vec<AccountOverview>> {
     type AccountRow = (
         String,
         String,
@@ -1102,89 +1114,149 @@ fn load_gates(conn: &Connection, provider: &str, account_id: &str) -> Result<Vec
     Ok(gates)
 }
 
-/// Aggregated usage rows.
+/// A read-only handle to the ledger.
 ///
-/// The grouping key comes from GroupBy::as_sql_expr(), so the CLI contract and
-/// the SQL cannot drift apart. Integer token counters are summed in SQLite;
-/// money is folded in Rust because cost is stored as TEXT and a SUM() over it
-/// would silently go through a float.
-pub fn usage_rows(
+/// The write side is StoreHandle; this is the read side, and it exists so a
+/// reader asks questions instead of holding a Connection. The schema, the column
+/// names and the aggregate SQL stay in this module, and a caller that wants usage
+/// by two dimensions no longer writes the query itself.
+pub struct Ledger {
+    conn: Connection,
+}
+
+/// Why a ledger could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    /// Nothing has ever been written here.
+    ///
+    /// A distinct answer rather than an empty ledger: an empty board reads as
+    /// "no accounts" when the truth is "never probed", and on Command Code that
+    /// confusion is how real money gets spent.
+    #[error("no ledger yet")]
+    Missing(PathBuf),
+    #[error(transparent)]
+    Sql(anyhow::Error),
+}
+
+impl Ledger {
+    pub fn open(path: &Path) -> std::result::Result<Ledger, LedgerError> {
+        if !db_exists(path) {
+            return Err(LedgerError::Missing(path.to_path_buf()));
+        }
+        let conn = open_readonly(path)
+            .with_context(|| format!("opening ledger {}", path.display()))
+            .map_err(LedgerError::Sql)?;
+        Ok(Ledger { conn })
+    }
+
+    pub fn accounts(&self) -> Result<Vec<AccountOverview>> {
+        load_accounts(&self.conn)
+    }
+
+    pub fn prices(&self) -> Result<Vec<crate::meter::PersistedPrice>> {
+        load_prices(&self.conn)
+    }
+
+    pub fn tail(&self, limit: u32) -> Result<Vec<RequestSummary>> {
+        recent_requests(&self.conn, limit)
+    }
+
+    /// Usage aggregated by the dimensions asked for, in order.
+    ///
+    /// The grouping key is built by concatenating the dimensions, which SQLite
+    /// cannot do in a GROUP BY, so the rows are folded in Rust. Money is folded
+    /// there too, because cost is stored as TEXT and a SUM() over it would
+    /// silently go through a float.
+    pub fn usage_by(&self, since: OffsetDateTime, dims: &[GroupBy]) -> Result<Vec<UsageRow>> {
+        usage_rows_multi(&self.conn, since, dims)
+    }
+}
+
+/// The column a usage dimension groups by.
+///
+/// A migration changes this and the queries together; nothing outside this
+/// module has to know a column name.
+fn group_by_sql(d: GroupBy) -> &'static str {
+    match d {
+        GroupBy::Provider => "provider",
+        GroupBy::Model => "model",
+        GroupBy::Account => "account_id",
+        GroupBy::Day => "date(ts, 'unixepoch')",
+    }
+}
+
+/// Aggregated usage rows for a composite grouping key.
+fn usage_rows_multi(
+    conn: &Connection,
+    since: OffsetDateTime,
+    dims: &[GroupBy],
+) -> Result<Vec<UsageRow>> {
+    let key_expr = if dims.is_empty() {
+        "currency".to_string()
+    } else {
+        dims.iter()
+            .map(|d| format!("COALESCE({}, '')", group_by_sql(*d)))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ")
+    };
+    let sql = format!(
+        "SELECT {key_expr} AS k, currency, prompt_tokens, completion_tokens, cached_tokens, cost \
+         FROM requests WHERE ts >= ?1"
+    );
+
+    let mut acc: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
+    let mut stmt = conn.prepare(&sql).context("preparing usage query")?;
+    let mut rows = stmt.query(rusqlite::params![since.unix_timestamp()])?;
+    while let Some(row) = rows.next()? {
+        let key: String = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+        let currency: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        let prompt = row.get::<_, i64>(2)?.max(0) as u64;
+        let completion = row.get::<_, i64>(3)?.max(0) as u64;
+        let cached = row.get::<_, i64>(4)?.max(0) as u64;
+        let cost = row
+            .get::<_, Option<String>>(5)?
+            .as_deref()
+            .and_then(crate::domain::parse_money)
+            .unwrap_or(Decimal::ZERO);
+
+        let entry = acc
+            .entry((key.clone(), currency.clone()))
+            .or_insert_with(|| UsageRow {
+                key,
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                cost: Decimal::ZERO,
+                currency,
+            });
+        entry.requests += 1;
+        entry.input_tokens += prompt;
+        entry.output_tokens += completion;
+        entry.cached_tokens += cached;
+        entry.cost += cost;
+    }
+    Ok(acc.into_values().collect())
+}
+
+/// Aggregated usage rows for one dimension, read by the tests.
+///
+/// The same composite query as the multi-dimension form, so the aggregation and
+/// the column names have exactly one implementation.
+#[cfg(test)]
+fn usage_rows(
     conn: &Connection,
     since: OffsetDateTime,
     group_by: GroupBy,
 ) -> Result<Vec<UsageRow>> {
-    let expr = group_by.as_sql_expr();
-    let since_ts = since.unix_timestamp();
-
-    let count_sql = format!(
-        "SELECT {expr} AS k, currency, COUNT(*), \
-                COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), \
-                COALESCE(SUM(cached_tokens), 0) \
-         FROM requests WHERE ts >= ?1 GROUP BY k, currency"
-    );
-    let mut counts: BTreeMap<(String, String), (u64, u64, u64, u64)> = BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(&count_sql)?;
-        let mapped = stmt.query_map(params![since_ts], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
-        for row in mapped {
-            let (key, currency, requests, prompt, completion, cached) = row?;
-            counts.insert(
-                (key, currency),
-                (i2u(requests), i2u(prompt), i2u(completion), i2u(cached)),
-            );
-        }
-    }
-
-    let money_sql = format!("SELECT {expr} AS k, currency, cost FROM requests WHERE ts >= ?1");
-    let mut costs: BTreeMap<(String, String), Decimal> = BTreeMap::new();
-    {
-        let mut stmt = conn.prepare(&money_sql)?;
-        let mapped = stmt.query_map(params![since_ts], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        for row in mapped {
-            let (key, currency, cost) = row?;
-            let amount = cost.as_deref().map(parse_dec).unwrap_or(Decimal::ZERO);
-            *costs.entry((key, currency)).or_insert(Decimal::ZERO) += amount;
-        }
-    }
-
-    let mut out = Vec::with_capacity(counts.len());
-    for ((key, currency), (requests, input_tokens, output_tokens, cached_tokens)) in counts {
-        let cost = costs
-            .remove(&(key.clone(), currency.clone()))
-            .unwrap_or(Decimal::ZERO);
-        out.push(UsageRow {
-            key,
-            requests,
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            cost,
-            currency,
-        });
-    }
-    Ok(out)
+    usage_rows_multi(conn, since, &[group_by])
 }
 
 /// Most recent requests, newest first.
 ///
 /// ts only has one-second resolution, so ties are broken by insertion order
 /// (rowid) to keep the tail stable across calls.
-pub fn recent_requests(conn: &Connection, limit: u32) -> Result<Vec<RequestSummary>> {
+fn recent_requests(conn: &Connection, limit: u32) -> Result<Vec<RequestSummary>> {
     let mut stmt = conn.prepare(
         "SELECT ts, id, provider, account_id, model, prompt_tokens, completion_tokens,
                 cached_tokens, ttft_ms, tps, coverage, status
@@ -1354,6 +1426,10 @@ fn coverage_str(c: GateClass) -> &'static str {
     match c {
         GateClass::Covered => "covered",
         GateClass::Metered => "metered",
+        // Routing never pays from an allowance, so no request carries this yet.
+        // Spelled out anyway: the column is a persisted vocabulary, and a class
+        // with no spelling would round-trip as nothing the day one does.
+        GateClass::TokenAllowance => "token_allowance",
         GateClass::RateLimit => "rate_limit",
     }
 }
@@ -1362,6 +1438,7 @@ fn parse_coverage(s: &str) -> Option<GateClass> {
     Some(match s {
         "covered" => GateClass::Covered,
         "metered" => GateClass::Metered,
+        "token_allowance" => GateClass::TokenAllowance,
         "rate_limit" => GateClass::RateLimit,
         _ => return None,
     })
@@ -1389,6 +1466,7 @@ mod tests {
     use super::*;
     use crate::domain::{ApiKey, TokenUsage};
     use crate::error::UpstreamErrorClass;
+    use crate::tier::TierKey;
     use std::str::FromStr;
 
     /// 2023-11-14, 2023-11-15 and an instant far before both.
@@ -1682,7 +1760,7 @@ mod tests {
             crate::meter::PersistedPrice {
                 provider: provider.to_string(),
                 model: model.to_string(),
-                tier: 0,
+                tier: TierKey::Default,
                 price: crate::meter::ModelPrice {
                     input_per_token: dec("0.0000004"),
                     output_per_token: dec("0.0000004"),
@@ -1748,7 +1826,7 @@ mod tests {
             crate::meter::PersistedPrice {
                 provider: "xkiro".to_string(),
                 model: "z-ai/glm-5.3-flash".to_string(),
-                tier: 0,
+                tier: TierKey::Default,
                 price: crate::meter::ModelPrice {
                     input_per_token: dec("0.0000004"),
                     output_per_token: dec("0.0000012"),
@@ -1762,7 +1840,7 @@ mod tests {
             crate::meter::PersistedPrice {
                 provider: "commandcode".to_string(),
                 model: "z-ai/glm-5.3-flash".to_string(),
-                tier: 0,
+                tier: TierKey::Default,
                 price: crate::meter::ModelPrice {
                     input_per_token: dec("0.0000041"),
                     output_per_token: dec("0.0000041"),
@@ -2048,6 +2126,50 @@ mod tests {
         // Without a filter the out-of-window request shows up again.
         let all = usage_rows(&conn, ts(0), GroupBy::Provider).expect("all");
         assert_eq!(all.len(), 3);
+    }
+
+    /// A price table keyed by the tier's POSITION is rebuilt, not migrated.
+    ///
+    /// The store cannot map an index to a window name -- only the config knows
+    /// the order -- so the old rows could only be guessed at, and a guessed rate
+    /// sizes the hard gate for every later request. Learned prices are re-derived
+    /// on the next probe.
+    #[test]
+    fn a_positionally_keyed_price_table_is_rebuilt() {
+        let db = TempDb::new("migrate-v7");
+        drop(crate::store::open(&db.path).expect("create"));
+        {
+            // Put the v6 shape back by hand: tier was an INTEGER position.
+            let conn = crate::store::open(&db.path).expect("reopen");
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS prices;
+                 CREATE TABLE prices (
+                     provider TEXT NOT NULL, model TEXT NOT NULL, tier INTEGER NOT NULL,
+                     input_per_token TEXT NOT NULL, output_per_token TEXT NOT NULL,
+                     cache_read_per_token TEXT NOT NULL, samples INTEGER NOT NULL,
+                     observed_prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                     observed_completion_tokens INTEGER NOT NULL DEFAULT 0,
+                     observed_cached_tokens INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY (provider, model, tier)
+                 );
+                 INSERT INTO prices VALUES ('p', 'm', 1, '0.1', '0.2', '0.01', 5, 1, 1, 0, 0);
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '6')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            )
+            .expect("a v6 price table");
+        }
+
+        // Opening for write is what migrates.
+        drop(crate::store::open(&db.path).expect("migrate"));
+
+        let ledger = Ledger::open(&db.path).expect("open the ledger");
+        assert!(
+            ledger.prices().expect("prices").is_empty(),
+            "a positional rate cannot be mapped to a window, so it is dropped"
+        );
+        let conn = crate::store::open(&db.path).expect("reopen");
+        assert_eq!(schema_version(&conn).expect("version"), SCHEMA_VERSION);
     }
 
     #[test]

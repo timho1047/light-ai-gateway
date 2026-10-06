@@ -23,9 +23,11 @@
 //!    the upstream prompt cache.
 //!
 //! Unit note: gate arithmetic assumes a money-like unit (USD or credits).
-//! FreeTokens gates are counted in tokens, so they are excluded from every
-//! account-level decision here -- the hard gate, the soft threshold and the
-//! consume-first ordering. Exhausting a free allowance blocks free models only;
+//! FreeTokens gates are a token allowance rather than money
+//! (GateClass::TokenAllowance), so every account-level decision here -- the hard
+//! gate, the soft threshold and the consume-first ordering -- excludes them by
+//! class instead of by a filter each site has to remember.
+//! Exhausting a free allowance blocks free models only;
 //! letting it retire the account would take paid models offline because an
 //! allowance nobody was spending ran out. It reaches the client as the
 //! provider's own 429.
@@ -36,9 +38,10 @@ use crate::domain::{
     ProviderId, now,
 };
 use crate::error::UpstreamErrorClass;
+use crate::tier::TierKey;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -126,9 +129,10 @@ pub struct AttemptPlan {
     pub session_key: Option<String>,
     /// Which pot the router expects to pay from.
     pub coverage: GateClass,
-    /// Price tier this request was priced at, decided when it was planned.
-    /// 0 is the default tier; higher values are configured time windows.
-    pub tier: u32,
+    /// Price window this request was priced at, decided when it was planned.
+    /// The pool knows nothing about schedules, so it starts at the default and
+    /// the router fixes it.
+    pub tier: TierKey,
     pub attempt_no: u32,
     /// What this attempt committed against its account's hard gate when it was
     /// planned. Released on settle, and read by the next request's reserve.
@@ -149,6 +153,72 @@ impl AttemptPlan {
     /// Canonical identity of the account this plan targets: provider/id.
     pub fn qualified_account(&self) -> String {
         crate::domain::qualified_id(&self.provider, &self.account_id)
+    }
+}
+
+/// A committed attempt: the account that was chosen, and the obligation to give
+/// its commitment back.
+///
+/// select() commits the estimate under the lock that chose the account, and this
+/// value owns that commitment. settle() spends it against what the attempt
+/// actually cost; dropping it unsettled returns it. It is deliberately not
+/// Clone, so two owners cannot each return the same commitment: settle()
+/// reconciles on the account alone, and a second return would decrement the
+/// in-flight count twice and hand the next request headroom that is not there.
+pub struct Reservation {
+    pool: Pool,
+    plan: AttemptPlan,
+    settled: bool,
+}
+
+impl Reservation {
+    /// What this attempt committed, for reading or describing.
+    pub fn plan(&self) -> &AttemptPlan {
+        &self.plan
+    }
+
+    /// Fix the price tier, once the router has resolved the model's schedule.
+    ///
+    /// The rest of the plan is read-only: the committed estimate is what the
+    /// hard gate sized itself against, and letting a caller revise it afterwards
+    /// would unbalance the in-flight total that settle() subtracts.
+    pub fn set_tier(&mut self, tier: TierKey) {
+        self.plan.tier = tier;
+    }
+
+    /// Reconcile the commitment with what the attempt actually cost.
+    pub fn settle(mut self, actual_cost: Decimal, billed: bool) {
+        self.pool.settle(&self.plan, actual_cost, billed);
+        self.settled = true;
+    }
+}
+
+/// Debug prints the plan and whether the commitment is still outstanding.
+///
+/// Pool is a handle to shared state, not something worth printing, and a test
+/// that unwraps a select() needs to see which account it got.
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reservation")
+            .field("plan", &self.plan)
+            .field("settled", &self.settled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.pool.settle(&self.plan, Decimal::ZERO, false);
+        }
+    }
+}
+
+impl std::ops::Deref for Reservation {
+    type Target = AttemptPlan;
+
+    fn deref(&self) -> &AttemptPlan {
+        &self.plan
     }
 }
 
@@ -272,30 +342,35 @@ struct PoolInner {
 
 /// The pool. All methods are synchronous and short; state is guarded by a
 /// plain Mutex that is never held across an await point.
+///
+/// Clone is a second handle to the same pool, not a copy of it: a Reservation
+/// carries one so it can give its commitment back without borrowing the pool it
+/// came from.
+#[derive(Clone)]
 pub struct Pool {
-    inner: Mutex<PoolInner>,
+    inner: Arc<Mutex<PoolInner>>,
     soft_threshold: f64,
     allow_metered: bool,
     hard_margin: Decimal,
     /// Last time a request was served, used to pick the polling cadence.
-    last_activity: Mutex<Instant>,
+    last_activity: Arc<Mutex<Instant>>,
 }
 
 impl Pool {
     pub fn new(accounts: Vec<Account>, policy: &PolicyConfig) -> Self {
         Pool {
-            inner: Mutex::new(PoolInner {
+            inner: Arc::new(Mutex::new(PoolInner {
                 accounts,
                 sticky: HashMap::new(),
                 sticky_order: std::collections::VecDeque::new(),
                 inflight: HashMap::new(),
                 recent_costs: std::collections::VecDeque::new(),
                 rpm_window: HashMap::new(),
-            }),
+            })),
             soft_threshold: policy.soft_threshold,
             allow_metered: policy.allow_metered,
             hard_margin: Decimal::try_from(policy.hard_margin).unwrap_or(Decimal::ZERO),
-            last_activity: Mutex::new(Instant::now()),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -379,11 +454,11 @@ impl Pool {
 
     /// Headroom on covered gates only, in gate units.
     ///
-    /// account_gates() already drops the token-denominated allowance: comparing
-    /// a USD estimate against a token cap would be meaningless.
+    /// A token allowance is not in this class, so a USD estimate is never
+    /// compared against a token cap.
     fn covered_headroom(&self, acct: &Account) -> Option<Decimal> {
         let mut min: Option<Decimal> = None;
-        for g in acct.account_gates() {
+        for g in acct.covered_gates() {
             if g.cap <= Decimal::ZERO {
                 continue;
             }
@@ -580,7 +655,7 @@ impl Pool {
         // keeps its bounded retry while a multi-account pool finally reaches the
         // healthy account instead of spending every attempt on the fault.
         exclude: &[String],
-    ) -> Result<AttemptPlan, PlanError> {
+    ) -> Result<Reservation, PlanError> {
         let at = now();
         let mut inner = self.inner.lock().unwrap();
         self.reap(&mut inner, at);
@@ -626,7 +701,7 @@ impl Pool {
             // and without this the 429 we return would carry no Retry-After.
             let next_ready = acct.available_at.or_else(|| {
                 acct.covered_gates()
-                    .filter(|g| g.kind != GateKind::FreeTokens && g.remaining() <= Decimal::ZERO)
+                    .filter(|g| g.remaining() <= Decimal::ZERO)
                     .filter_map(|g| g.resets_at)
                     .min()
             });
@@ -733,13 +808,13 @@ impl Pool {
                     session_key: session_key.map(str::to_string),
                     coverage,
                     // The pool knows nothing about price windows; the router
-                    // overwrites this once it has resolved the schedule.
-                    tier: 0,
+                    // sets this once it has resolved the schedule.
+                    tier: TierKey::Default,
                     attempt_no,
                     estimated_cost: est_cost,
                 };
                 self.commit(&mut inner, &plan);
-                return Ok(plan);
+                return Ok(self.reservation(plan));
             }
             // Bound account no longer acceptable: fall through and rebind.
         }
@@ -834,14 +909,23 @@ impl Pool {
             model: model.to_string(),
             session_key: session_key.map(str::to_string),
             coverage,
-            tier: 0,
+            tier: TierKey::Default,
             attempt_no,
             estimated_cost: est_cost,
         };
         // Committed under the very lock that chose the account, so a burst
         // cannot all read the same headroom before any of it is recorded.
         self.commit(&mut inner, &plan);
-        Ok(plan)
+        Ok(self.reservation(plan))
+    }
+
+    /// Wrap a committed plan in the one value that can return the commitment.
+    fn reservation(&self, plan: AttemptPlan) -> Reservation {
+        Reservation {
+            pool: self.clone(),
+            plan,
+            settled: false,
+        }
     }
 
     /// Commit an attempt's estimated cost against its account.
@@ -879,7 +963,10 @@ impl Pool {
     ///
     /// When the billed flag is false the attempt failed before the upstream did
     /// any work, so the gate must not be charged for it.
-    pub fn settle(&self, plan: &AttemptPlan, actual_cost: Decimal, billed: bool) {
+    ///
+    /// Private: the only way to reach it is through the Reservation that owns the
+    /// commitment, which is what makes a double return unexpressible.
+    fn settle(&self, plan: &AttemptPlan, actual_cost: Decimal, billed: bool) {
         let mut inner = self.inner.lock().unwrap();
         let qualified = plan.qualified_account();
 
@@ -906,14 +993,7 @@ impl Pool {
                 if left <= Decimal::ZERO {
                     break;
                 }
-                // FreeTokens is covered by class but its cap is a TOKEN count,
-                // not money. Charging dollars into it corrupted a token counter
-                // and, once the money windows were exhausted, swallowed the cost
-                // before the metered gates below could be debited at all.
-                if g.kind.class() != GateClass::Covered
-                    || g.kind == GateKind::FreeTokens
-                    || g.cap <= Decimal::ZERO
-                {
+                if g.kind.class() != GateClass::Covered || g.cap <= Decimal::ZERO {
                     continue;
                 }
                 let head = g.remaining();
@@ -1058,9 +1138,7 @@ impl Pool {
             acct.state = AccountState::Active;
         }
 
-        let has_room = acct
-            .covered_gates()
-            .any(|g| g.kind != GateKind::FreeTokens && g.remaining() > Decimal::ZERO);
+        let has_room = acct.covered_gates().any(|g| g.remaining() > Decimal::ZERO);
         let has_metered = acct.metered_gates().any(|g| g.remaining() > Decimal::ZERO);
         let allow_metered = acct.allow_metered.unwrap_or(policy_metered);
         let usable = has_room || (allow_metered && has_metered);
@@ -1190,16 +1268,6 @@ impl Pool {
         })
     }
 
-    /// Whether any account for this provider is live and has covered headroom.
-    pub fn has_covered_capacity(&self, provider: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .accounts
-            .iter()
-            .filter(|a| a.provider == provider)
-            .any(|a| a.has_covered() && a.state == AccountState::Active)
-    }
-
     /// Replace the sticky binding for a session, used when a switch happens.
     pub fn rebind(&self, session_key: &str, qualified_id: &str) {
         self.inner
@@ -1231,19 +1299,6 @@ impl Pool {
                 };
             }
         }
-    }
-
-    /// Number of accounts currently able to serve.
-    pub fn eligible_count(&self, provider: &str) -> usize {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .accounts
-            .iter()
-            .filter(|a| {
-                a.provider == provider
-                    && matches!(a.state, AccountState::Active | AccountState::Draining)
-            })
-            .count()
     }
 }
 
@@ -1319,6 +1374,92 @@ mod tests {
 
     fn policy() -> PolicyConfig {
         PolicyConfig::default()
+    }
+
+    /// A free-token allowance is not covered money.
+    ///
+    /// It gates free models only and never pays for a request, so an account
+    /// whose only allowance is that pot is refused for the same reason a
+    /// wallet-only provider is: the pot that could have paid is metered, and
+    /// spending it is off. Before the class split this account reported
+    /// has_covered() == true and was refused as "headroom below the estimate",
+    /// naming a covered window that does not exist.
+    #[test]
+    fn a_free_allowance_alone_is_not_covered_money() {
+        let p = Pool::new(
+            vec![acct(
+                "a",
+                "xkiro",
+                vec![gate(
+                    GateKind::FreeTokens,
+                    Decimal::from(1_000),
+                    Decimal::ZERO,
+                    None,
+                )],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        let only = p.account("xkiro/a").unwrap();
+        assert_eq!(
+            only.covered_gates().count(),
+            0,
+            "an allowance is not covered"
+        );
+        assert_eq!(
+            p.evaluate(&only, Decimal::ONE, Decimal::ZERO),
+            GateDecision::Reject(RejectReason::MeteredNotAllowed)
+        );
+    }
+
+    /// A reservation holds its commitment, and gives it back exactly once --
+    /// whether it settles or is dropped.
+    ///
+    /// This is the invariant a hand-written `lease.settled()` at each exit could
+    /// not hold: a path that forgot one left the estimate committed for the life
+    /// of the process, and the in-flight term kept shrinking that account's
+    /// headroom until nothing was eligible and only a restart could clear it.
+    #[test]
+    fn a_reservation_returns_its_commitment_exactly_once() {
+        let p = Pool::new(
+            vec![acct("a", "p", vec![cover(100, 0)], AccountState::Active)],
+            &policy(),
+        );
+
+        let held = p
+            .select("p", "m", None, Decimal::from(90), "r1", 1, &[])
+            .unwrap();
+        assert_eq!(p.inflight_count("p/a"), 1, "a live reservation holds one");
+        assert!(
+            p.select("p", "m", None, Decimal::from(90), "r2", 1, &[])
+                .is_err(),
+            "headroom a live reservation holds is not available to the next request"
+        );
+
+        // Abandoned without settling: the client hung up, or an early return.
+        drop(held);
+        assert_eq!(
+            p.inflight_count("p/a"),
+            0,
+            "dropping releases the commitment"
+        );
+
+        // Settled: the same single release, not a second one.
+        let settled = p
+            .select("p", "m", None, Decimal::from(90), "r3", 1, &[])
+            .unwrap();
+        settled.settle(Decimal::from(1), true);
+        assert_eq!(
+            p.inflight_count("p/a"),
+            0,
+            "settling releases the commitment"
+        );
+
+        assert!(
+            p.select("p", "m", None, Decimal::from(90), "r4", 1, &[])
+                .is_ok(),
+            "both commitments came back, so the pool is whole again"
+        );
     }
 
     /// Regression, found against a real configuration holding both
@@ -2153,7 +2294,7 @@ mod tests {
             model: "m".into(),
             session_key: None,
             coverage: GateClass::Covered,
-            tier: 0,
+            tier: TierKey::Default,
             attempt_no: 1,
             estimated_cost: Decimal::ZERO,
         };

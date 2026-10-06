@@ -29,6 +29,14 @@ pub enum GateClass {
     Covered,
     /// Real money or purchased credit. Spending it is permanent.
     Metered,
+    /// A daily token allowance. Not money: it gates free models only, never pays
+    /// for a request, and never retires an Account from paid traffic.
+    ///
+    /// Separate from Covered because every account-level decision -- the hard
+    /// gate, the soft threshold, consume-first ordering, and the Board -- has to
+    /// exclude it, and a class that groups it with money leaves each of those
+    /// sites to remember the exception on its own.
+    TokenAllowance,
     /// Not money at all (requests-per-minute and similar pacing limits).
     RateLimit,
 }
@@ -52,10 +60,9 @@ pub enum GateKind {
 impl GateKind {
     pub fn class(self) -> GateClass {
         match self {
-            GateKind::FiveHour | GateKind::Weekly | GateKind::Monthly | GateKind::FreeTokens => {
-                GateClass::Covered
-            }
+            GateKind::FiveHour | GateKind::Weekly | GateKind::Monthly => GateClass::Covered,
             GateKind::Wallet | GateKind::PurchasedCredits => GateClass::Metered,
+            GateKind::FreeTokens => GateClass::TokenAllowance,
             GateKind::Rpm => GateClass::RateLimit,
         }
     }
@@ -279,39 +286,29 @@ impl Account {
             .filter(|g| g.class() == GateClass::Metered)
     }
 
-    /// Covered gates that gate the ACCOUNT itself, which means the
-    /// money-denominated ones.
-    ///
-    /// The free-token allowance is deliberately excluded. Exhausting it blocks
-    /// only free models; paid models keep working. Letting it drive the account
-    /// threshold would retire an account from paid traffic because an allowance
-    /// nobody was using ran out, which is not what that limit means.
-    pub fn account_gates(&self) -> impl Iterator<Item = &Gate> {
-        self.covered_gates()
-            .filter(|g| g.kind != GateKind::FreeTokens)
-    }
-
     /// Highest utilization across the gates that actually gate the account.
+    ///
+    /// Covered gates only: the free-token allowance is not money, so letting it
+    /// drive the threshold would retire an account from paid traffic because an
+    /// allowance nobody was using ran out.
     pub fn peak_covered_utilization(&self) -> Option<f64> {
-        self.account_gates()
+        self.covered_gates()
             .map(|g| g.utilization_f64())
             .reduce(f64::max)
     }
 
     /// Lowest account-level covered remaining, for consume-first ordering.
     pub fn min_covered_remaining(&self) -> Option<Decimal> {
-        self.account_gates()
+        self.covered_gates()
             .map(|g| g.remaining())
             .reduce(Decimal::min)
     }
 
-    /// Whether any prepaid allowance is reported at all.
+    /// Whether any prepaid money is reported at all.
     ///
-    /// Any covered gate counts, including the free-token allowance, because this
-    /// answers "did the provider report a prepaid pot". Whether that pot may be
-    /// spent is a different question -- see account_gates() and the headroom
-    /// calculation in the pool, which returns None for a free-only account and
-    /// so routes it down the metered path.
+    /// A token allowance does not count: it gates free models only, so an
+    /// account that reports nothing but an allowance has no covered money and is
+    /// routed down the metered path like any other.
     pub fn has_covered(&self) -> bool {
         self.covered_gates().next().is_some()
     }
@@ -422,14 +419,6 @@ impl GroupBy {
             "account" => Some(GroupBy::Account),
             "day" => Some(GroupBy::Day),
             _ => None,
-        }
-    }
-    pub fn as_sql_expr(self) -> &'static str {
-        match self {
-            GroupBy::Provider => "provider",
-            GroupBy::Model => "model",
-            GroupBy::Account => "account_id",
-            GroupBy::Day => "date(ts, 'unixepoch')",
         }
     }
     pub fn column_header(self) -> &'static str {

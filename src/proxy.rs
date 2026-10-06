@@ -18,7 +18,7 @@
 //!      every chunk unchanged, feeds a StreamMeter on the side, stamps TTFT,
 //!      and records the request when the stream ends or the client goes away.
 
-use crate::accounts::{AttemptPlan, PlanError};
+use crate::accounts::{AttemptPlan, PlanError, Reservation};
 use crate::config::{Config, ResolvedRoute};
 use crate::domain::{
     Account, ApiKey, AttemptRecord, GateClass, RequestRecord, RequestStatus, TokenUsage, now,
@@ -27,6 +27,7 @@ use crate::error::{ErrorSignals, UpstreamErrorClass, parse_error_body, parse_ret
 use crate::quota_report::{ReportError, Scope, usage_report};
 use crate::router::Gateway;
 use crate::sse::{MeterMode, StreamMeter, inject_include_usage};
+use crate::tier::TierKey;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -48,44 +49,6 @@ use time::OffsetDateTime;
 /// Longest backoff the retry loop will sleep. A quota window is handled by
 /// rotating accounts, not by stalling the client for an hour.
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
-
-/// Gives an attempt's reservation back if the request never reaches settle.
-///
-/// select() commits the estimate the moment it picks an account, and only
-/// settle() returns it. Everything between that choice and the response -- the
-/// pre-switch probe, the wait for headers -- can be interrupted by the client
-/// hanging up, which drops this future and runs no cleanup of ours. The
-/// commitment then stayed on the books for the life of the process, and the
-/// in-flight term in the hard gate kept shrinking every account's headroom
-/// until nothing was eligible and only a restart could clear it.
-struct AttemptLease<'a> {
-    backend: &'a dyn ProxyBackend,
-    plan: AttemptPlan,
-    armed: bool,
-}
-
-impl<'a> AttemptLease<'a> {
-    fn new(backend: &'a dyn ProxyBackend, plan: &AttemptPlan) -> Self {
-        Self {
-            backend,
-            plan: plan.clone(),
-            armed: true,
-        }
-    }
-
-    /// The attempt reached a path that settles it itself.
-    fn settled(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for AttemptLease<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.backend.release(&self.plan);
-        }
-    }
-}
 
 /// How long to wait before the next attempt.
 ///
@@ -126,7 +89,7 @@ pub trait ProxyBackend: Send + Sync + 'static {
         request_id: &str,
         attempt_no: u32,
         exclude: &[String],
-    ) -> std::result::Result<(ResolvedRoute, AttemptPlan), PlanError>;
+    ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError>;
 
     /// Pick an account for a request that has no model of its own, such as the
     /// model-list passthrough.
@@ -148,12 +111,6 @@ pub trait ProxyBackend: Send + Sync + 'static {
     /// nobody can afford to leave open.
     fn snapshot(&self) -> Vec<Account>;
 
-    /// Give back an attempt's reservation without recording it.
-    ///
-    /// Called by AttemptLease when a request never reaches settle. A no-op by
-    /// default so a test backend that commits nothing needs nothing.
-    fn release(&self, _plan: &AttemptPlan) {}
-
     /// Refresh an account's quota reading immediately before switching to it.
     ///
     /// A boxed future rather than an async-trait method so the default can be a
@@ -173,23 +130,23 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     fn http(&self) -> reqwest::Client;
 
+    /// Which price window a request starting now falls into.
+    fn tier_at(&self, provider: &str, model: &str) -> TierKey;
+
     /// Price a usage sample through the learned price table. None means the
     /// model is unknown and the caller must fall back conservatively.
-    /// Which price tier a request starting now falls into. 0 is the default.
-    fn tier_at(&self, provider: &str, model: &str) -> u32;
-
     fn estimate_cost(
         &self,
         provider: &str,
         model: &str,
-        tier: u32,
+        tier: &TierKey,
         usage: &TokenUsage,
         multiplier: Decimal,
     ) -> Option<Decimal>;
 
     fn record_success(
         &self,
-        plan: &AttemptPlan,
+        reservation: Reservation,
         usage: &TokenUsage,
         cost: Decimal,
         attempt: AttemptRecord,
@@ -198,7 +155,7 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     fn record_failure(
         &self,
-        plan: &AttemptPlan,
+        reservation: Reservation,
         class: UpstreamErrorClass,
         retry_after: Option<Duration>,
         window_reset: Option<OffsetDateTime>,
@@ -241,7 +198,7 @@ impl ProxyBackend for GatewayBackend {
         request_id: &str,
         attempt_no: u32,
         exclude: &[String],
-    ) -> std::result::Result<(ResolvedRoute, AttemptPlan), PlanError> {
+    ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError> {
         self.gateway.plan(
             client_model,
             session_key,
@@ -259,15 +216,16 @@ impl ProxyBackend for GatewayBackend {
         request_id: &str,
         attempt_no: u32,
     ) -> std::result::Result<AttemptPlan, PlanError> {
-        let plan =
+        let reservation =
             self.gateway
                 .pool
                 .select(provider, "", None, est_cost, request_id, attempt_no, &[])?;
-        // A model-list passthrough spends no tokens, so it gives the reservation
+        // A model-list passthrough spends no tokens, so it gives the commitment
         // straight back. Leaving it committed burned one concurrency slot per
         // call against the account's own concurrency_limit, and after N calls
         // that account could never be chosen again.
-        self.gateway.pool.settle(&plan, Decimal::ZERO, false);
+        let plan = reservation.plan().clone();
+        reservation.settle(Decimal::ZERO, false);
         Ok(plan)
     }
 
@@ -289,10 +247,6 @@ impl ProxyBackend for GatewayBackend {
         })
     }
 
-    fn release(&self, plan: &AttemptPlan) {
-        self.gateway.pool.settle(plan, Decimal::ZERO, false);
-    }
-
     fn retry_after_for(&self, provider: &str) -> Option<Duration> {
         self.gateway.pool.retry_after_for(provider)
     }
@@ -301,7 +255,7 @@ impl ProxyBackend for GatewayBackend {
         self.gateway.http.clone()
     }
 
-    fn tier_at(&self, provider: &str, model: &str) -> u32 {
+    fn tier_at(&self, provider: &str, model: &str) -> TierKey {
         self.gateway.tier_at(provider, model, crate::domain::now())
     }
 
@@ -309,7 +263,7 @@ impl ProxyBackend for GatewayBackend {
         &self,
         provider: &str,
         model: &str,
-        tier: u32,
+        tier: &TierKey,
         usage: &TokenUsage,
         multiplier: Decimal,
     ) -> Option<Decimal> {
@@ -322,26 +276,26 @@ impl ProxyBackend for GatewayBackend {
 
     fn record_success(
         &self,
-        plan: &AttemptPlan,
+        reservation: Reservation,
         usage: &TokenUsage,
         cost: Decimal,
         attempt: AttemptRecord,
         record: RequestRecord,
     ) {
         self.gateway
-            .record_success(plan, usage, cost, attempt, record);
+            .record_success(reservation, usage, cost, attempt, record);
     }
 
     fn record_failure(
         &self,
-        plan: &AttemptPlan,
+        reservation: Reservation,
         class: UpstreamErrorClass,
         retry_after: Option<Duration>,
         window_reset: Option<OffsetDateTime>,
         attempt: AttemptRecord,
     ) {
         self.gateway
-            .record_failure(plan, class, retry_after, window_reset, attempt);
+            .record_failure(reservation, class, retry_after, window_reset, attempt);
     }
 
     fn record_failed_request(&self, record: RequestRecord) {
@@ -563,7 +517,7 @@ async fn chat_completions(
     let mut previous_account: Option<String> = None;
 
     while attempt_no <= max_attempts {
-        let plan = match state.backend.plan(
+        let reservation = match state.backend.plan(
             &client_model,
             session_key.as_deref(),
             est_cost,
@@ -571,43 +525,43 @@ async fn chat_completions(
             attempt_no,
             &tried,
         ) {
-            Ok((_route, plan)) => plan,
+            Ok((_route, reservation)) => reservation,
             Err(err) => return plan_error_response(&err, state.backend.as_ref()),
         };
         // Switching accounts is worth one extra round trip: it happens only
         // after the previous account has already failed, so the client is
         // waiting anyway, and it stops a switch from landing on an account whose
         // window filled up since the last poll.
-        let qualified = plan.qualified_account();
+        let qualified = reservation.qualified_account();
         if let Some(previous) = previous_account.as_deref()
             && previous != qualified
         {
             state
                 .backend
-                .ensure_fresh(&plan.provider, &plan.account_id)
+                .ensure_fresh(&reservation.provider, &reservation.account_id)
                 .await;
         }
         previous_account = Some(qualified.clone());
         // Recorded before the attempt, not after: whatever the outcome, this
         // account has now been used by this request.
         tried.push(qualified);
-        last_plan = Some(plan.clone());
+        // A description of the last attempt, for the failure record at the end
+        // of the loop. It carries no claim: only the reservation can settle.
+        last_plan = Some(reservation.plan().clone());
         // Any exit from this iteration that does not settle -- an early return,
-        // or the client hanging up while we wait -- gives the reservation back
-        // through this lease.
-        let mut lease = AttemptLease::new(state.backend.as_ref(), &plan);
+        // or the client hanging up while we wait -- gives the commitment back
+        // through the reservation's Drop.
 
-        let Some(account) = state.backend.account(&plan.qualified_account()) else {
-            tracing::error!(account = %plan.account_id, "the planned account vanished from the pool");
+        let Some(account) = state.backend.account(&reservation.qualified_account()) else {
+            tracing::error!(account = %reservation.account_id, "the planned account vanished from the pool");
             // Release the reservation that select() just committed. Returning
             // without recording the attempt left an estimate committed against
             // an account that nothing would ever settle, and the in-flight term
             // in the hard gate would keep counting it for the life of the
             // process -- shrinking the headroom every later request sees.
-            lease.settled();
             record_attempt_failure(
                 state.backend.as_ref(),
-                &plan,
+                reservation,
                 UpstreamErrorClass::Other,
                 None,
                 Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
@@ -657,10 +611,9 @@ async fn chat_completions(
                     ..Default::default()
                 }
                 .classify();
-                lease.settled();
                 record_attempt_failure(
                     state.backend.as_ref(),
-                    &plan,
+                    reservation,
                     class,
                     None,
                     None,
@@ -689,10 +642,9 @@ async fn chat_completions(
             }
             Err(_) => {
                 let class = UpstreamErrorClass::Timeout;
-                lease.settled();
                 record_attempt_failure(
                     state.backend.as_ref(),
-                    &plan,
+                    reservation,
                     class,
                     None,
                     None,
@@ -742,7 +694,7 @@ async fn chat_completions(
             // probe-confirmed "the window is spent" branch was unreachable.
             let window_exhausted_hint = state
                 .backend
-                .account(&plan.qualified_account())
+                .account(&reservation.qualified_account())
                 .map(|acct| {
                     acct.covered_gates()
                         .any(|g| g.cap > Decimal::ZERO && g.remaining() <= Decimal::ZERO)
@@ -760,10 +712,13 @@ async fn chat_completions(
             }
             .classify();
 
-            lease.settled();
+            // Captured before the handover: recording the failure parks the
+            // account, and the Retry-After below is read from the pool it just
+            // updated.
+            let provider = reservation.provider.clone();
             record_attempt_failure(
                 state.backend.as_ref(),
-                &plan,
+                reservation,
                 class,
                 retry_after,
                 Some(status.as_u16()),
@@ -782,8 +737,7 @@ async fn chat_completions(
             } else {
                 status_for_class(class)
             };
-            let client_retry =
-                retry_after.or_else(|| state.backend.retry_after_for(&plan.provider));
+            let client_retry = retry_after.or_else(|| state.backend.retry_after_for(&provider));
             last_failure = Some(Failure {
                 status: client_status,
                 kind: class,
@@ -808,7 +762,7 @@ async fn chat_completions(
 
         // Phase 2: 2xx means bytes are about to be delivered. From here the
         // request is not retryable, so the relay owns the record.
-        let coverage = plan.coverage;
+        let coverage = reservation.coverage;
         let response_headers = response.headers().clone();
         let content_type = response_headers
             .get(header::CONTENT_TYPE)
@@ -826,10 +780,9 @@ async fn chat_completions(
         // marked as a truncated stream for missing a terminator that a JSON
         // body never had.
         let is_sse = content_type.contains("text/event-stream");
-        lease.settled();
         let finalizer = Finalizer {
             backend: state.backend.clone(),
-            plan,
+            reservation,
             request_id: request_id.clone(),
             client_model: client_model.clone(),
             provider_request_id,
@@ -1274,7 +1227,7 @@ fn plan_error_response(err: &PlanError, backend: &dyn ProxyBackend) -> Response 
 #[allow(clippy::too_many_arguments)]
 fn record_attempt_failure(
     backend: &dyn ProxyBackend,
-    plan: &AttemptPlan,
+    reservation: Reservation,
     class: UpstreamErrorClass,
     retry_after: Option<Duration>,
     status_code: Option<u16>,
@@ -1286,8 +1239,8 @@ fn record_attempt_failure(
     let attempt = AttemptRecord {
         request_id: request_id.to_string(),
         attempt_no,
-        account_id: plan.account_id.clone(),
-        provider: plan.provider.clone(),
+        account_id: reservation.account_id.clone(),
+        provider: reservation.provider.clone(),
         started_at,
         // The attempt failed before any content was produced, so it must not
         // contribute to TTFT or TPS statistics.
@@ -1299,7 +1252,7 @@ fn record_attempt_failure(
         billed: false,
         bytes_sent: 0,
     };
-    backend.record_failure(plan, class, retry_after, None, attempt);
+    backend.record_failure(reservation, class, retry_after, None, attempt);
 }
 
 fn estimate_request_cost(
@@ -1321,7 +1274,7 @@ fn estimate_request_cost(
     };
     let tier = backend.tier_at(provider, model);
     backend
-        .estimate_cost(provider, model, tier, &probe, Decimal::ONE)
+        .estimate_cost(provider, model, &tier, &probe, Decimal::ONE)
         // One shared definition of "unknown model" across the whole request
         // path: two different fallback constants would mean the gate and the
         // finalizer disagreed about what a request costs.
@@ -1456,7 +1409,9 @@ fn error_response_retry(
 /// dropping the partial usage on the floor would understate the ledger.
 struct Finalizer {
     backend: Arc<dyn ProxyBackend>,
-    plan: AttemptPlan,
+    /// The attempt's commitment. The relay settles it when the body ends, and
+    /// dropping it unsettled returns it.
+    reservation: Reservation,
     request_id: String,
     client_model: String,
     provider_request_id: Option<String>,
@@ -1525,9 +1480,9 @@ impl RelayStream {
         let cost = f
             .backend
             .estimate_cost(
-                &f.plan.provider,
-                &f.plan.model,
-                f.plan.tier,
+                &f.reservation.provider,
+                &f.reservation.model,
+                &f.reservation.tier,
                 &result.usage,
                 f.credit_multiplier,
             )
@@ -1549,8 +1504,8 @@ impl RelayStream {
         let attempt = AttemptRecord {
             request_id: f.request_id.clone(),
             attempt_no: f.attempt_no,
-            account_id: f.plan.account_id.clone(),
-            provider: f.plan.provider.clone(),
+            account_id: f.reservation.account_id.clone(),
+            provider: f.reservation.provider.clone(),
             started_at: f.started_at,
             ttft_ms,
             status_code: Some(f.status_code),
@@ -1563,11 +1518,11 @@ impl RelayStream {
         let record = RequestRecord {
             request_id: f.request_id.clone(),
             ts: f.started_at,
-            session_key: f.plan.session_key.clone(),
+            session_key: f.reservation.session_key.clone(),
             client_model: f.client_model.clone(),
-            provider: f.plan.provider.clone(),
-            account_id: f.plan.account_id.clone(),
-            model: f.plan.model.clone(),
+            provider: f.reservation.provider.clone(),
+            account_id: f.reservation.account_id.clone(),
+            model: f.reservation.model.clone(),
             usage: result.usage.clone(),
             ttft_ms,
             total_ms,
@@ -1581,7 +1536,7 @@ impl RelayStream {
             provider_request_id: f.provider_request_id.clone(),
         };
         f.backend
-            .record_success(&f.plan, &result.usage, cost, attempt, record);
+            .record_success(f.reservation, &result.usage, cost, attempt, record);
     }
 }
 
@@ -1861,7 +1816,7 @@ mod tests {
             request_id: &str,
             attempt_no: u32,
             exclude: &[String],
-        ) -> std::result::Result<(ResolvedRoute, AttemptPlan), PlanError> {
+        ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError> {
             let route = self
                 .config
                 .resolve(client_model)
@@ -1878,12 +1833,6 @@ mod tests {
             Ok((route, plan))
         }
 
-        fn release(&self, plan: &AttemptPlan) {
-            // The test backend commits reservations through the same pool, so it
-            // has to give them back the same way.
-            self.pool.settle(plan, Decimal::ZERO, false);
-        }
-
         fn pick_account(
             &self,
             provider: &str,
@@ -1891,11 +1840,12 @@ mod tests {
             request_id: &str,
             attempt_no: u32,
         ) -> std::result::Result<AttemptPlan, PlanError> {
-            let plan =
+            let reservation =
                 self.pool
                     .select(provider, "", None, est_cost, request_id, attempt_no, &[])?;
-            // Released immediately: see the production impl above.
-            self.pool.settle(&plan, Decimal::ZERO, false);
+            // Settled immediately: see the production impl above.
+            let plan = reservation.plan().clone();
+            reservation.settle(Decimal::ZERO, false);
             Ok(plan)
         }
 
@@ -1915,15 +1865,15 @@ mod tests {
             self.http.clone()
         }
 
-        fn tier_at(&self, _provider: &str, _model: &str) -> u32 {
-            0
+        fn tier_at(&self, _provider: &str, _model: &str) -> TierKey {
+            TierKey::Default
         }
 
         fn estimate_cost(
             &self,
             _provider: &str,
             _model: &str,
-            _tier: u32,
+            _tier: &TierKey,
             _usage: &TokenUsage,
             _multiplier: Decimal,
         ) -> Option<Decimal> {
@@ -1932,15 +1882,16 @@ mod tests {
 
         fn record_success(
             &self,
-            plan: &AttemptPlan,
+            reservation: Reservation,
             usage: &TokenUsage,
             cost: Decimal,
             attempt: AttemptRecord,
             record: RequestRecord,
         ) {
-            self.pool.settle(plan, cost, true);
+            let plan = reservation.plan().clone();
+            reservation.settle(cost, true);
             self.successes.lock().unwrap().push(RecordedSuccess {
-                plan: plan.clone(),
+                plan,
                 usage: usage.clone(),
                 cost,
                 attempt,
@@ -1950,17 +1901,19 @@ mod tests {
 
         fn record_failure(
             &self,
-            plan: &AttemptPlan,
+            reservation: Reservation,
             class: UpstreamErrorClass,
             retry_after: Option<Duration>,
             window_reset: Option<OffsetDateTime>,
             attempt: AttemptRecord,
         ) {
-            self.pool.settle(plan, Decimal::ZERO, false);
+            let qualified = reservation.qualified_account();
+            let account_id = reservation.account_id.clone();
+            reservation.settle(Decimal::ZERO, false);
             self.pool
-                .note_error(&plan.qualified_account(), class, retry_after, window_reset);
+                .note_error(&qualified, class, retry_after, window_reset);
             self.failures.lock().unwrap().push(RecordedFailure {
-                account_id: plan.account_id.clone(),
+                account_id,
                 class,
                 attempt,
             });
@@ -2681,7 +2634,7 @@ key = "sk-b1"
     #[tokio::test]
     async fn dropping_the_relay_records_a_partial_aborted_request() {
         let fake = fake_backend("http://127.0.0.1:1");
-        let plan = fake
+        let reservation = fake
             .pool
             .select("mock", "mock/model", None, Decimal::ZERO, "req-1", 1, &[])
             .unwrap();
@@ -2689,7 +2642,7 @@ key = "sk-b1"
             b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
         let finalizer = Finalizer {
             backend: fake.clone(),
-            plan,
+            reservation,
             request_id: "req-1".to_string(),
             client_model: "mock/model".to_string(),
             provider_request_id: None,

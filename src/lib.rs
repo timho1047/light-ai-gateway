@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod interval;
 pub mod meter;
 pub mod proxy;
 pub mod quota;

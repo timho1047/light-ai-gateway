@@ -29,10 +29,9 @@ use crate::domain::{
 use crate::quota::probe_for;
 use crate::router::Gateway;
 use crate::secrets::{CredentialStore, LOCAL_KEY_ACCOUNT, LOCAL_KEY_PROVIDER};
-use crate::store;
+use crate::store::{self, Ledger};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use rusqlite::Connection;
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -244,6 +243,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
     // One decision, made once: every renderer below either has a palette or
     // prints the plain text, and no command decides for itself.
     let pal = cli.color.palette();
+    // One credential store per run, so a command never reaches for the
+    // operator's keychain itself: a test hands in an in-memory one.
+    let creds = credential_store();
     match cli.command {
         Command::Init(args) => {
             let target = args.path.clone().unwrap_or_else(|| path.clone());
@@ -258,13 +260,36 @@ async fn dispatch(cli: Cli) -> Result<()> {
             );
             crate::proxy::serve(config).await
         }
-        Command::Status(args) => cmd_status(&path, args.refresh, &pal).await,
-        Command::Usage(args) => cmd_usage(&path, &args, &pal),
-        Command::Accounts(args) => cmd_accounts(&path, args, &pal).await,
-        Command::Tail(args) => cmd_tail(&path, args.limit, &pal),
-        Command::Doctor => cmd_doctor(&path, origin, &pal).await,
-        Command::Keys(args) => cmd_keys(&path, args, &pal).await,
-        Command::Prices(args) => cmd_prices(&path, &args, &pal),
+        // Each command is handed what it reads. A handler that takes a path
+        // rebuilds its own config, which is what kept every one of them out of
+        // reach of a test.
+        Command::Status(args) => {
+            let config = load_config(&path)?;
+            cmd_status(&config, args.refresh, &pal).await
+        }
+        Command::Usage(args) => {
+            let config = load_config(&path)?;
+            cmd_usage(&config, &args, &pal)
+        }
+        Command::Accounts(args) => {
+            let config = load_config(&path)?;
+            cmd_accounts(&config, args, &pal).await
+        }
+        Command::Tail(args) => {
+            let config = load_config(&path)?;
+            cmd_tail(&config, args.limit, &pal)
+        }
+        // Doctor reads the config itself: reporting a config that will not load
+        // is the one thing it exists to do.
+        Command::Doctor => cmd_doctor(&path, origin, &pal, &creds).await,
+        Command::Keys(args) => {
+            let config = load_config(&path)?;
+            cmd_keys(&config, &creds, args, &pal).await
+        }
+        Command::Prices(args) => {
+            let config = load_config(&path)?;
+            cmd_prices(&config, &args, &pal)
+        }
     }
 }
 
@@ -330,35 +355,33 @@ fn load_config(path: &Path) -> Result<Config> {
 /// A missing ledger is reported rather than treated as an empty account list:
 /// an empty board would read as "no accounts" when the truth is "not probed
 /// yet", and on Command Code that confusion is how real money gets spent.
-fn open_ledger(db: &Path) -> Result<Connection> {
-    if !store::db_exists(db) {
-        bail!(
+fn open_ledger(db: &Path) -> Result<Ledger> {
+    Ledger::open(db).map_err(|e| match e {
+        store::LedgerError::Missing(path) => anyhow::anyhow!(
             "no ledger at {} yet. Run `lgw serve` once (or `lgw status --refresh`) \
              so accounts are probed and persisted.",
-            db.display()
-        );
-    }
-    store::open_readonly(db).with_context(|| format!("opening ledger {}", db.display()))
+            path.display()
+        ),
+        other => anyhow::Error::new(other),
+    })
 }
 
 // ---------------------------------------------------------------------------
 // status
 // ---------------------------------------------------------------------------
 
-async fn cmd_status(path: &Path, refresh: bool, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
+async fn cmd_status(config: &Config, refresh: bool, pal: &Palette) -> Result<()> {
     let now = OffsetDateTime::now_utc();
 
     if refresh {
-        let gateway = Gateway::new(config).await?;
+        let gateway = Gateway::new(config.clone()).await?;
         let rows: Vec<AccountOverview> = gateway.snapshot().iter().map(overview_of).collect();
         print!("{}", render_board(&rows, now, pal));
         let _ = gateway.shutdown();
         return Ok(());
     }
 
-    let conn = open_ledger(&config.db_path())?;
-    let rows = store::load_accounts(&conn)?;
+    let rows = open_ledger(&config.db_path())?.accounts()?;
     if rows.is_empty() {
         println!(
             "no accounts in the ledger yet at {}; run lgw status --refresh",
@@ -625,7 +648,7 @@ fn covered_of(r: &AccountOverview, pal: &Palette) -> Option<Covered> {
     let mut gates: Vec<&Gate> = r
         .gates
         .iter()
-        .filter(|g| g.class() == GateClass::Covered && g.kind != GateKind::FreeTokens)
+        .filter(|g| g.class() == GateClass::Covered)
         .collect();
     if gates.is_empty() {
         return None;
@@ -912,29 +935,19 @@ fn load_price_table(config: &Config) -> crate::meter::PriceTable {
     table.seed_from_config(&config.prices);
     let db = config.db_path();
     if store::db_exists(&db)
-        && let Ok(rows) = store::open_readonly(&db).and_then(|conn| store::load_prices(&conn))
+        && let Ok(ledger) = Ledger::open(&db)
+        && let Ok(rows) = ledger.prices()
     {
         table.load_learned(rows);
     }
     table
 }
 
-fn cmd_usage(path: &Path, args: &UsageArgs, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
-    let conn = open_ledger(&config.db_path())?;
+fn cmd_usage(config: &Config, args: &UsageArgs, pal: &Palette) -> Result<()> {
     let now = OffsetDateTime::now_utc();
     let since = parse_since(&args.since, now)?;
     let dims = parse_group_by(&args.group_by)?;
-
-    let rows = if dims.len() == 1 {
-        store::usage_rows(&conn, since, dims[0])?
-    } else {
-        // store::usage_rows aggregates by exactly one dimension, and the CLI
-        // advertises "provider,model,account". Multi-dimension grouping is done
-        // here, with the same discipline as the store: money stays TEXT and is
-        // added as Decimal, never through a SQL float SUM.
-        usage_rows_multi(&conn, since, &dims)?
-    };
+    let rows = open_ledger(&config.db_path())?.usage_by(since, &dims)?;
 
     if rows.is_empty() {
         println!(
@@ -948,12 +961,11 @@ fn cmd_usage(path: &Path, args: &UsageArgs, pal: &Palette) -> Result<()> {
 
     // Rates in effect, then what each model is actually costing against them.
     // The panel comes first because the drift table is unreadable without it.
-    let table = load_price_table(&config);
+    let table = load_price_table(config);
     println!();
-    print_price_panel(&config, &table, pal);
+    print_price_panel(config, &table, pal);
 
-    let names = tier_names(&config);
-    let drift_rows = price_rows(&table, &names);
+    let drift_rows = price_rows(&table);
     if !drift_rows.is_empty() {
         println!();
         print!("{}", render_price_rows(&drift_rows, pal));
@@ -984,7 +996,7 @@ fn render_price_rows(rows: &[PriceRow], pal: &Palette) -> String {
         table.push(vec![
             r.provider.clone(),
             r.model.clone(),
-            r.tier_name.clone(),
+            r.tier.clone(),
             r.source.clone(),
             r.mix.clone(),
             r.expected_per_million.clone(),
@@ -1078,61 +1090,6 @@ fn parse_relative(spec: &str) -> Option<time::Duration> {
         _ => return None,
     };
     Some(time::Duration::seconds(secs))
-}
-
-/// Aggregate over several dimensions at once.
-///
-/// Every dimension expression is NOT NULL in practice (provider, model and
-/// account_id are NOT NULL columns; day is derived), but COALESCE keeps a
-/// surprising NULL from collapsing the whole concatenated key.
-fn usage_rows_multi(
-    conn: &Connection,
-    since: OffsetDateTime,
-    dims: &[GroupBy],
-) -> Result<Vec<UsageRow>> {
-    let key_expr = dims
-        .iter()
-        .map(|d| format!("COALESCE({}, '')", d.as_sql_expr()))
-        .collect::<Vec<_>>()
-        .join(" || '|' || ");
-    let sql = format!(
-        "SELECT {key_expr} AS k, currency, prompt_tokens, completion_tokens, cached_tokens, cost \
-         FROM requests WHERE ts >= ?1"
-    );
-
-    let mut acc: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
-    let mut stmt = conn.prepare(&sql).context("preparing usage query")?;
-    let mut rows = stmt.query(rusqlite::params![since.unix_timestamp()])?;
-    while let Some(row) = rows.next()? {
-        let key: String = row.get::<_, Option<String>>(0)?.unwrap_or_default();
-        let currency: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
-        let prompt = row.get::<_, i64>(2)?.max(0) as u64;
-        let completion = row.get::<_, i64>(3)?.max(0) as u64;
-        let cached = row.get::<_, i64>(4)?.max(0) as u64;
-        let cost = row
-            .get::<_, Option<String>>(5)?
-            .as_deref()
-            .and_then(crate::domain::parse_money)
-            .unwrap_or(Decimal::ZERO);
-
-        let entry = acc
-            .entry((key.clone(), currency.clone()))
-            .or_insert_with(|| UsageRow {
-                key,
-                requests: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                cost: Decimal::ZERO,
-                currency,
-            });
-        entry.requests += 1;
-        entry.input_tokens += prompt;
-        entry.output_tokens += completion;
-        entry.cached_tokens += cached;
-        entry.cost += cost;
-    }
-    Ok(acc.into_values().collect())
 }
 
 /// Cached tokens with the hit rate beside them.
@@ -1249,10 +1206,8 @@ fn render_usage(
 // tail
 // ---------------------------------------------------------------------------
 
-fn cmd_tail(path: &Path, limit: u32, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
-    let conn = open_ledger(&config.db_path())?;
-    let rows = store::recent_requests(&conn, limit)?;
+fn cmd_tail(config: &Config, limit: u32, pal: &Palette) -> Result<()> {
+    let rows = open_ledger(&config.db_path())?.tail(limit)?;
     if rows.is_empty() {
         println!("no requests recorded yet in {}", config.db_path().display());
         return Ok(());
@@ -1350,6 +1305,7 @@ fn coverage_label(c: GateClass) -> &'static str {
     match c {
         GateClass::Covered => "covered",
         GateClass::Metered => "metered",
+        GateClass::TokenAllowance => "token_allowance",
         GateClass::RateLimit => "rate_limit",
     }
 }
@@ -1366,25 +1322,24 @@ fn truncate(s: &str, width: usize) -> String {
 // accounts
 // ---------------------------------------------------------------------------
 
-async fn cmd_accounts(path: &Path, args: AccountsArgs, pal: &Palette) -> Result<()> {
+async fn cmd_accounts(config: &Config, args: AccountsArgs, pal: &Palette) -> Result<()> {
     match args.command {
-        AccountsCommand::List => cmd_status(path, false, pal).await,
-        AccountsCommand::Probe { account } => cmd_accounts_probe(path, account, pal).await,
-        AccountsCommand::Disable { account } => cmd_accounts_disable(path, &account, pal),
-        AccountsCommand::Enable { account } => cmd_accounts_enable(path, &account, pal),
+        AccountsCommand::List => cmd_status(config, false, pal).await,
+        AccountsCommand::Probe { account } => cmd_accounts_probe(config, account, pal).await,
+        AccountsCommand::Disable { account } => cmd_accounts_disable(config, &account, pal),
+        AccountsCommand::Enable { account } => cmd_accounts_enable(config, &account, pal),
     }
 }
 
-async fn cmd_accounts_probe(path: &Path, account: Option<String>, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
+async fn cmd_accounts_probe(config: &Config, account: Option<String>, pal: &Palette) -> Result<()> {
     let target_provider = match &account {
-        Some(id) => Some(provider_of(&config, id)?),
+        Some(id) => Some(provider_of(config, id)?),
         None => None,
     };
 
     // Gateway::new probes every account once, then we probe the named one again
     // so a single-account probe is authoritative rather than a cached reading.
-    let gateway = Gateway::new(config).await?;
+    let gateway = Gateway::new(config.clone()).await?;
     if let (Some(provider), Some(id)) = (&target_provider, &account) {
         println!("{}", pal.dim(&format!("probing {provider}/{id} ...")));
         gateway.probe_account(provider, id).await;
@@ -1446,9 +1401,8 @@ fn probe_client(config: &Config) -> Result<reqwest::Client> {
         .context("building the probe HTTP client")
 }
 
-fn cmd_accounts_disable(path: &Path, account_id: &str, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
-    let provider = provider_of(&config, account_id)?;
+fn cmd_accounts_disable(config: &Config, account_id: &str, pal: &Palette) -> Result<()> {
+    let provider = provider_of(config, account_id)?;
     // Deliberately unresolved: disabling an account must work even when its
     // credential is missing, which is exactly when you want to disable it.
     // Target the canonical identity: the same account id can exist under
@@ -1471,8 +1425,8 @@ fn cmd_accounts_disable(path: &Path, account_id: &str, pal: &Palette) -> Result<
     // would quietly erase the quota readings of all the others -- hours of
     // probing, and on Command Code the difference between routing on real
     // numbers and routing blind.
-    if let Ok(conn) = store::open_readonly(&db)
-        && let Ok(rows) = store::load_accounts(&conn)
+    if let Ok(ledger) = Ledger::open(&db)
+        && let Ok(rows) = ledger.accounts()
         && let Some(row) = rows
             .into_iter()
             .find(|r| crate::domain::qualified_id(&r.provider, &r.account_id) == qualified)
@@ -1562,7 +1516,12 @@ fn routes_by_provider(config: &Config) -> BTreeMap<&str, Vec<&str>> {
     out
 }
 
-async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<()> {
+async fn cmd_doctor(
+    path: &Path,
+    origin: ConfigOrigin,
+    pal: &Palette,
+    creds: &CredentialStore,
+) -> Result<()> {
     let mut problems = 0u32;
     println!("config path : {} (from {})", path.display(), origin.label());
 
@@ -1577,8 +1536,6 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
             bail!("configuration is unusable; nothing else could be checked");
         }
     };
-
-    let creds = credential_store();
 
     let accounts: usize = config.providers.values().map(|p| p.accounts.len()).sum();
     println!(
@@ -1664,7 +1621,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
     // the probe section -- so every key was read twice. On macOS each read of an
     // item the app is not already trusted for is another authorisation prompt,
     // which made "lgw doctor" ask twice per account for a read-only check.
-    let (usable, unusable) = config.build_accounts_lenient(&creds)?;
+    let (usable, unusable) = config.build_accounts_lenient(creds)?;
     for (provider, p) in &config.providers {
         if p.accounts.is_empty() {
             println!("  {provider}: no accounts configured");
@@ -1808,7 +1765,7 @@ async fn cmd_doctor(path: &Path, origin: ConfigOrigin, pal: &Palette) -> Result<
             // "The config names a key" and "the key is there" are different
             // facts, and serve fails closed on the second one. Doctor is where
             // that shows up instead of at the next restart.
-            match secret_ref.resolve(&creds, LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT) {
+            match secret_ref.resolve(creds, LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT) {
                 Ok(key) => println!(
                     "local auth  : {} ({} from {})",
                     pal.green("configured"),
@@ -1891,9 +1848,8 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
 /// the same rule a restart follows. "accounts enable" means "try again", not
 /// "trust me" -- and it is the only thing that can undo an operator's disable,
 /// because a successful probe restores the credential, not the decision.
-fn cmd_accounts_enable(path: &Path, account_id: &str, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
-    let provider = provider_of(&config, account_id)?;
+fn cmd_accounts_enable(config: &Config, account_id: &str, pal: &Palette) -> Result<()> {
+    let provider = provider_of(config, account_id)?;
     let qualified = crate::domain::qualified_id(&provider, account_id);
     let db = config.db_path();
 
@@ -1903,8 +1859,8 @@ fn cmd_accounts_enable(path: &Path, account_id: &str, pal: &Palette) -> Result<(
         .find(|a| a.qualified() == qualified)
         .with_context(|| format!("account {qualified} is not in the configuration"))?;
 
-    if let Ok(conn) = store::open_readonly(&db)
-        && let Ok(rows) = store::load_accounts(&conn)
+    if let Ok(ledger) = Ledger::open(&db)
+        && let Ok(rows) = ledger.accounts()
         && let Some(row) = rows
             .into_iter()
             .find(|r| crate::domain::qualified_id(&r.provider, &r.account_id) == qualified)
@@ -1945,19 +1901,22 @@ fn cmd_accounts_enable(path: &Path, account_id: &str, pal: &Palette) -> Result<(
 // keys
 // ---------------------------------------------------------------------------
 
-async fn cmd_keys(path: &Path, args: KeysArgs, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
-    let creds = credential_store();
+async fn cmd_keys(
+    config: &Config,
+    creds: &CredentialStore,
+    args: KeysArgs,
+    pal: &Palette,
+) -> Result<()> {
     match args.command {
         KeysCommand::Add {
             provider,
             account,
             stdin,
-        } => cmd_keys_add(&config, &creds, &provider, &account, stdin, pal),
-        KeysCommand::List => cmd_keys_list(&config, &creds, pal),
-        KeysCommand::Remove { provider, account } => cmd_keys_remove(&creds, &provider, &account),
+        } => cmd_keys_add(config, creds, &provider, &account, stdin, pal),
+        KeysCommand::List => cmd_keys_list(config, creds, pal),
+        KeysCommand::Remove { provider, account } => cmd_keys_remove(creds, &provider, &account),
         KeysCommand::Test { provider, account } => {
-            cmd_keys_test(&config, &creds, &provider, &account, pal).await
+            cmd_keys_test(config, creds, &provider, &account, pal).await
         }
     }
 }
@@ -2343,6 +2302,7 @@ fn class_label(class: GateClass) -> &'static str {
     match class {
         GateClass::Covered => "covered",
         GateClass::Metered => "metered",
+        GateClass::TokenAllowance => "token allowance",
         GateClass::RateLimit => "rate limit",
     }
 }
@@ -2466,10 +2426,7 @@ pub fn price_panel(
                 let Some(learned) = entry.learned else {
                     continue;
                 };
-                let name = tiers
-                    .get(tier as usize)
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| format!("tier {tier}"));
+                let name = tier.label();
                 rows.push(PricePanelRow {
                     label: format!("learned ({name})"),
                     when: "recovered from observed spend".to_string(),
@@ -2573,10 +2530,9 @@ fn print_price_panel(config: &Config, table: &crate::meter::PriceTable, pal: &Pa
 pub struct PriceRow {
     pub provider: String,
     pub model: String,
-    /// 0 is the default price tier; higher values are configured time windows.
-    pub tier: u32,
-    /// "default", or the window's name from the configuration.
-    pub tier_name: String,
+    /// The window's own name, or "default" for the model's plain price. The name
+    /// travels with the price, so a report never has to look the position up.
+    pub tier: String,
     pub source: String,
     /// Input / output / cache-read share of the tokens actually used.
     pub mix: String,
@@ -2595,40 +2551,12 @@ fn f64_of(d: Decimal) -> f64 {
     d.to_f64().unwrap_or(0.0)
 }
 
-/// Names for price tiers, keyed by (provider, model, tier). Built from the
-/// configuration, since the learned table knows only the tier index.
-pub type TierNames = std::collections::HashMap<(String, String, u32), String>;
-
-/// Tier names for every configured model, so a report can label a window the
-/// way the operator wrote it.
-pub fn tier_names(config: &Config) -> TierNames {
-    let mut out = TierNames::new();
-    for (provider, models) in &config.prices {
-        for (model, price) in models {
-            for (tier, t) in price.tiers().into_iter().enumerate() {
-                out.insert((provider.clone(), model.clone(), tier as u32), t.name);
-            }
-        }
-    }
-    out
-}
-
 /// Build the price report. Pure, so it can be tested without a terminal.
-pub fn price_rows(table: &crate::meter::PriceTable, names: &TierNames) -> Vec<PriceRow> {
+pub fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
     let mut rows: Vec<PriceRow> = table
         .entries()
         .filter_map(|(provider, model, tier, entry)| {
             let source = entry.source()?.label().to_string();
-            let tier_name = names
-                .get(&(provider.to_string(), model.to_string(), tier))
-                .cloned()
-                .unwrap_or_else(|| {
-                    if tier == 0 {
-                        "default".to_string()
-                    } else {
-                        format!("tier {tier}")
-                    }
-                });
 
             // The mix is what makes a per-million figure mean anything: the same
             // prices produce very different per-million costs on different mixes.
@@ -2655,8 +2583,7 @@ pub fn price_rows(table: &crate::meter::PriceTable, names: &TierNames) -> Vec<Pr
             Some(PriceRow {
                 provider: provider.to_string(),
                 model: model.to_string(),
-                tier,
-                tier_name,
+                tier: tier.label().to_string(),
                 source,
                 mix,
                 expected_per_million,
@@ -2728,7 +2655,7 @@ fn forget_learned_prices(config: &Config, scope: &[String], pal: &Palette) -> Re
         rows.push(vec![
             row.provider.clone(),
             row.model.clone(),
-            row.tier.to_string(),
+            row.tier.label().to_string(),
             per_million(row.price.input_per_token),
             per_million(row.price.cache_read_per_token),
             row.price.samples.to_string(),
@@ -2784,21 +2711,18 @@ fn forget_learned_prices(config: &Config, scope: &[String], pal: &Palette) -> Re
     Ok(())
 }
 
-fn cmd_prices(path: &Path, args: &PricesArgs, pal: &Palette) -> Result<()> {
-    let config = load_config(path)?;
-
+fn cmd_prices(config: &Config, args: &PricesArgs, pal: &Palette) -> Result<()> {
     if let Some(scope) = &args.forget {
-        return forget_learned_prices(&config, scope, pal);
+        return forget_learned_prices(config, scope, pal);
     }
 
     // Configured prices come from the config file; learned prices come from the
     // ledger, so this works whether or not a gateway is running.
-    let table = load_price_table(&config);
-    print_price_panel(&config, &table, pal);
+    let table = load_price_table(config);
+    print_price_panel(config, &table, pal);
     println!();
 
-    let names = tier_names(&config);
-    let mut rows = price_rows(&table, &names);
+    let mut rows = price_rows(&table);
     if args.drift_only {
         rows.retain(|r| r.significant);
     }
@@ -2892,7 +2816,7 @@ mod tests {
         table.observe(
             "xkiro",
             "z-ai/glm-5.3-flash",
-            0,
+            &crate::tier::TierKey::Default,
             dec("0.9"),
             &crate::domain::TokenUsage {
                 prompt_tokens: 1_000_000,
@@ -2903,7 +2827,7 @@ mod tests {
         table.observe(
             "commandcode",
             "deepseek/deepseek-v4.1-flash",
-            0,
+            &crate::tier::TierKey::Default,
             dec("0.05"),
             &crate::domain::TokenUsage {
                 prompt_tokens: 1_000,
@@ -2916,7 +2840,7 @@ mod tests {
 
     #[test]
     fn price_rows_show_configured_against_learned() {
-        let rows = price_rows(&priced_table(), &TierNames::new());
+        let rows = price_rows(&priced_table());
         assert_eq!(rows.len(), 2);
 
         let glm = rows
@@ -2957,7 +2881,7 @@ mod tests {
 
     #[test]
     fn drifted_rows_sort_first_so_they_are_seen() {
-        let rows = price_rows(&priced_table(), &TierNames::new());
+        let rows = price_rows(&priced_table());
         assert!(rows[0].significant, "the drifted model must come first");
     }
 
@@ -2978,7 +2902,7 @@ mod tests {
         );
         table.seed_from_config(&cfg);
 
-        let rows = price_rows(&table, &TierNames::new());
+        let rows = price_rows(&table);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, "configured");
         // Nothing observed yet, so there is no mix and no per-million figure:
@@ -2995,6 +2919,18 @@ mod tests {
     /// A config exercising every credential source except the real keychain.
     /// Uses a key_file rather than an environment variable: mutating process-wide
     /// env in a test is racy across threads and needs unsafe in edition 2024.
+    /// A whole command, driven end to end rather than through the renderer it
+    /// calls.
+    ///
+    /// cmd_keys_list takes its Config and its CredentialStore now, so it runs
+    /// against an in-memory store instead of the operator's keychain.
+    #[test]
+    fn a_command_runs_against_an_injected_credential_store() {
+        let config = keys_config("secret");
+        cmd_keys_list(&config, &CredentialStore::memory(), &Palette::off())
+            .expect("listing keys needs no keychain");
+    }
+
     fn keys_config(key_file: &str) -> Config {
         Config::from_toml_str(&format!(
             r#"
@@ -3502,8 +3438,7 @@ key = {{ key_file = "{}" }}
         let row = |drift: &str, significant: bool| PriceRow {
             provider: "commandcode".into(),
             model: "deepseek/deepseek-v4.1-flash".into(),
-            tier: 0,
-            tier_name: "default".into(),
+            tier: "default".into(),
             source: "learned".into(),
             mix: "1/1/98%".into(),
             expected_per_million: "$0.008".into(),
@@ -3611,7 +3546,7 @@ key = {{ key_file = "{}" }}
         assert!(!out.contains("RateLimit"), "no Rust enum names: {out}");
 
         let pot = |line: &str| {
-            ["covered", "metered", "rate limit"]
+            ["covered", "metered", "token allowance", "rate limit"]
                 .iter()
                 .filter_map(|word| line.find(*word))
                 .next()

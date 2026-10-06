@@ -43,8 +43,16 @@ impl QuotaAdapter {
     /// real-money spending is disabled for it, so none of its accounts can ever
     /// be selected. validate() warns about that combination rather than leaving
     /// the operator to work out why a configured provider serves nothing.
+    ///
+    /// Deliberately no wildcard arm. This is a restatement of what each adapter
+    /// emits, so it is the one place that can disagree with them; a new variant
+    /// that inherited "false" would silently drop the warning that explains why
+    /// its accounts never serve.
     pub fn wallet_only(self) -> bool {
-        matches!(self, QuotaAdapter::Haoai | QuotaAdapter::Deepseek)
+        match self {
+            QuotaAdapter::None | QuotaAdapter::Xkiro | QuotaAdapter::CommandCode => false,
+            QuotaAdapter::Deepseek | QuotaAdapter::Haoai => true,
+        }
     }
 }
 
@@ -636,6 +644,35 @@ impl Config {
             bail!("no providers configured");
         }
 
+        for (provider, models) in &self.prices {
+            for (model, p) in models {
+                // A window's NAME is the key its learned rate is stored under, and
+                // the empty key is the default price: an unnamed window would
+                // silently take the default price's row, and two windows sharing a
+                // name would share one learned rate between them.
+                let mut seen: Vec<String> = Vec::new();
+                for (i, s) in p.schedules.iter().enumerate() {
+                    if s.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+                        bail!(
+                            "[prices.{provider}.{model}] a tier name must not be empty: it is \
+                             the key its learned price is stored under"
+                        );
+                    }
+                    let name = s
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("schedule {}", i + 1));
+                    if seen.contains(&name) {
+                        bail!(
+                            "[prices.{provider}.{model}] two price tiers are both named {name:?}: \
+                             the name is the key a learned price is stored under"
+                        );
+                    }
+                    seen.push(name);
+                }
+            }
+        }
+
         for (name, p) in &self.providers {
             if p.base_url.trim().is_empty() {
                 bail!("provider {name}: base_url must not be empty");
@@ -1068,6 +1105,19 @@ pub fn sample_toml() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tier::TierKey;
+
+    /// Which adapters report nothing but a wallet. Pinned here because
+    /// wallet_only() restates what the adapters emit, and validate()'s warning
+    /// is the only thing that explains an idle wallet-only provider.
+    #[test]
+    fn only_the_wallet_only_adapters_say_so() {
+        assert!(!QuotaAdapter::Xkiro.wallet_only());
+        assert!(!QuotaAdapter::CommandCode.wallet_only());
+        assert!(!QuotaAdapter::None.wallet_only());
+        assert!(QuotaAdapter::Deepseek.wallet_only());
+        assert!(QuotaAdapter::Haoai.wallet_only());
+    }
 
     fn cfg_with_two_providers() -> Config {
         Config::from_toml_str(
@@ -1368,7 +1418,7 @@ output = 15.0
         .unwrap();
         let mut table = PriceTable::new();
         assert_eq!(table.seed_from_config(&cfg.prices), 1);
-        let p = table.get("xkiro", "m", 0).unwrap();
+        let p = table.get("xkiro", "m", &TierKey::Default).unwrap();
         // $3/M input -> $0.30/M cache read, never zero: a free-looking cache
         // read would under-estimate cost, which is the spending direction.
         assert_eq!(p.cache_read_per_token, rust_decimal::Decimal::new(3, 7));
@@ -1485,7 +1535,7 @@ output = 1.20
             completion_tokens: 1_000_000,
             ..Default::default()
         };
-        let at = |tier| {
+        let at = |tier: &TierKey| {
             table.estimate(
                 "commandcode",
                 "deepseek/deepseek-v4.1-flash",
@@ -1494,24 +1544,32 @@ output = 1.20
                 rust_decimal::Decimal::ONE,
             )
         };
-        assert_eq!(at(0), Some(Decimal::new(75, 2)), "0.15 + 0.60 = 0.75 USD");
-        assert_eq!(at(1), Some(Decimal::new(150, 2)), "0.30 + 1.20 = 1.50 USD");
+        assert_eq!(
+            at(&TierKey::Default),
+            Some(Decimal::new(75, 2)),
+            "0.15 + 0.60 = 0.75 USD"
+        );
+        assert_eq!(
+            at(&TierKey::Named("peak".into())),
+            Some(Decimal::new(150, 2)),
+            "0.30 + 1.20 = 1.50 USD"
+        );
 
         // And the window that picks between them: 7 hours a day, weekdays only.
         use time::macros::datetime;
         assert_eq!(
-            schedule.tier_index_at(datetime!(2026-09-15 02:00:00 UTC)),
-            Some(0),
+            schedule.tier_at(datetime!(2026-09-15 02:00:00 UTC)),
+            TierKey::Named("peak".into()),
             "Tuesday 02:00 is inside the window"
         );
         assert_eq!(
-            schedule.tier_index_at(datetime!(2026-09-15 05:00:00 UTC)),
-            None,
+            schedule.tier_at(datetime!(2026-09-15 05:00:00 UTC)),
+            TierKey::Default,
             "Tuesday 05:00 falls between the two windows"
         );
         assert_eq!(
-            schedule.tier_index_at(datetime!(2026-09-19 02:00:00 UTC)),
-            None,
+            schedule.tier_at(datetime!(2026-09-19 02:00:00 UTC)),
+            TierKey::Default,
             "Saturday is never peak"
         );
     }

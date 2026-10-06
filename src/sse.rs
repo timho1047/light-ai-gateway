@@ -359,17 +359,6 @@ pub fn inject_include_usage(body: &mut serde_json::Value) -> bool {
     }
 }
 
-/// Replace the model field, returning the previous value.
-pub fn set_model(body: &mut serde_json::Value, model: &str) -> Option<String> {
-    let obj = body.as_object_mut()?;
-    let old = obj
-        .get("model")
-        .and_then(|m| m.as_str())
-        .map(str::to_string);
-    obj.insert("model".into(), serde_json::Value::String(model.to_string()));
-    old
-}
-
 /// Extract usage from an OpenAI-shaped or Anthropic-shaped JSON value.
 ///
 /// Accepts the usage object at "usage" (OpenAI chunks and responses) or at
@@ -1001,14 +990,5 @@ mod tests {
         let r = meter.finish();
         assert!(!r.usage.measured);
         assert_eq!(r.usage.total_tokens(), 0);
-    }
-
-    #[test]
-    fn set_model_returns_the_previous_value() {
-        let mut body = json!({"model": "old"});
-        assert_eq!(set_model(&mut body, "new").as_deref(), Some("old"));
-        assert_eq!(body["model"], json!("new"));
-        let mut empty = json!({});
-        assert_eq!(set_model(&mut empty, "new"), None);
     }
 }

@@ -4,85 +4,21 @@
 //! pool, the price table, the quota probes, and the database writer, and it is
 //! the only place that decides which pot of money pays for a request.
 
-use crate::accounts::{AttemptPlan, PlanError, Pool};
+use crate::accounts::{PlanError, Pool, Reservation};
 use crate::config::{Config, ResolvedRoute};
 use crate::domain::{Account, AttemptRecord, GateKind, RequestRecord, TokenUsage, now};
 use crate::error::UpstreamErrorClass;
+use crate::interval::IntervalLedger;
 use crate::meter::PriceTable;
 use crate::quota::{QuotaProbe, probe_for};
 use crate::store::StoreHandle;
+use crate::tier::TierKey;
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
-
-/// Spend that appeared during one probe interval.
-///
-/// Sums across accounts, because two accounts are two separate pools of money.
-/// Within a single account it takes the LARGEST single-window increase rather
-/// than the sum, because the windows nest: a weekly window and the 5-hour window
-/// inside it both report the same cumulative spend, and adding them bills the
-/// same money once per window.
-///
-/// An account with no previous sample contributes nothing. Its whole historic
-/// spend would otherwise be charged to whatever tokens happened to pass through
-/// since it first appeared.
-fn interval_spend(
-    last: &HashMap<String, SpendSample>,
-    current: &HashMap<String, HashMap<GateKind, Decimal>>,
-) -> Decimal {
-    let mut delta = Decimal::ZERO;
-    for (account, gates) in current {
-        let Some(previous) = last.get(account).map(|s| &s.by_gate) else {
-            continue;
-        };
-        let largest = gates
-            .iter()
-            .filter_map(|(kind, used)| previous.get(kind).map(|before| *used - *before))
-            .filter(|increase| *increase > Decimal::ZERO)
-            .max();
-        if let Some(increase) = largest {
-            delta += increase;
-        }
-    }
-    delta
-}
-
-/// Add this interval's unattributed spend to the provider's running total.
-///
-/// Returns the new total. Split out from the warning so the accounting can be
-/// tested without building a gateway.
-fn add_unattributed(
-    totals: &Mutex<HashMap<String, Decimal>>,
-    provider: &str,
-    delta: Decimal,
-) -> Decimal {
-    let Ok(mut totals) = totals.lock() else {
-        return delta;
-    };
-    let entry = totals.entry(provider.to_string()).or_insert(Decimal::ZERO);
-    *entry += delta;
-    *entry
-}
-
-/// Provider spend observed at the last probe, for price learning.
-///
-/// Keyed by account, then by gate kind, and both levels are load-bearing.
-///
-/// Across ACCOUNTS the spend sums: two accounts are two separate pools of
-/// money. Within ONE account it must not. A weekly window and the 5-hour window
-/// nested inside it both report the same cumulative spend, so adding them bills
-/// the same money once per window. Measured on a live Command Code account, a 5h
-/// window and a weekly window both rose by exactly 0.036638504 credits over one
-/// interval while the summed delta reported 0.073277008 -- exactly double, and
-/// half of it invented. The interval's spend is therefore the largest increase
-/// any single window of that account saw.
-#[derive(Debug, Clone, Default)]
-struct SpendSample {
-    by_gate: HashMap<GateKind, Decimal>,
-}
 
 pub struct Gateway {
     pub config: Config,
@@ -93,23 +29,12 @@ pub struct Gateway {
     pub credentials: crate::secrets::CredentialStore,
     pub http: reqwest::Client,
     pub prices: Mutex<PriceTable>,
+    /// Tokens served since the last probe, and the spend each interval moved.
+    interval: Mutex<IntervalLedger>,
     pub probes: HashMap<String, Arc<dyn QuotaProbe>>,
     /// Parsed price windows, keyed by (provider, model). Only models with a
     /// configured schedule appear here; everything else is priced at tier 0.
     pub schedules: HashMap<(String, String), crate::tier::Schedule>,
-    /// Token usage accumulated since the last successful probe, keyed by
-    /// (provider, model, tier). The tier is part of the key so an interval's
-    /// spend can be attributed to the window that actually earned it instead of
-    /// being smeared across the peak and off-peak rates.
-    pending: Mutex<HashMap<(String, String, u32), TokenUsage>>,
-    last_spend: Mutex<HashMap<String, SpendSample>>,
-    /// Spend that moved with no local tokens to attribute it to, per provider,
-    /// since this process started.
-    ///
-    /// A single interval's worth is small enough to dismiss; a day's worth is the
-    /// answer to "where did the money go", which is the question the per-interval
-    /// warning cannot answer on its own.
-    unattributed: Mutex<HashMap<String, Decimal>>,
 }
 
 impl Gateway {
@@ -188,8 +113,8 @@ impl Gateway {
         // reverts to the conservative default until the next probe, and that
         // default was measured against live providers to be off by an order of
         // magnitude in both directions.
-        match crate::store::open_readonly(&db_path) {
-            Ok(conn) => match crate::store::load_prices(&conn) {
+        match crate::store::Ledger::open(&db_path) {
+            Ok(ledger) => match ledger.prices() {
                 Ok(rows) if !rows.is_empty() => {
                     let n = prices.load_learned(rows);
                     tracing::info!(count = n, "restored learned prices from disk");
@@ -223,9 +148,7 @@ impl Gateway {
             http,
             prices: Mutex::new(prices),
             probes,
-            pending: Mutex::new(HashMap::new()),
-            last_spend: Mutex::new(HashMap::new()),
-            unattributed: Mutex::new(HashMap::new()),
+            interval: Mutex::new(IntervalLedger::new()),
         });
 
         // Restore the persisted ledger. Accounts come back in Unknown state, so
@@ -243,10 +166,10 @@ impl Gateway {
     /// Load persisted accounts into the pool, then persist the fresh snapshot.
     fn restore_from_disk(&self) {
         let path = self.config.db_path();
-        let Ok(conn) = crate::store::open_readonly(&path) else {
+        let Ok(ledger) = crate::store::Ledger::open(&path) else {
             return;
         };
-        let Ok(accounts) = crate::store::load_accounts(&conn) else {
+        let Ok(accounts) = ledger.accounts() else {
             return;
         };
         if !accounts.is_empty() {
@@ -271,12 +194,12 @@ impl Gateway {
         request_id: &str,
         attempt_no: u32,
         exclude: &[String],
-    ) -> Result<(ResolvedRoute, AttemptPlan), PlanError> {
+    ) -> Result<(ResolvedRoute, Reservation), PlanError> {
         let route = self
             .config
             .resolve(client_model)
             .map_err(|_| PlanError::UnknownProvider(client_model.to_string()))?;
-        let mut plan = self.pool.select(
+        let mut reservation = self.pool.select(
             &route.provider,
             &route.model,
             session_key,
@@ -288,74 +211,48 @@ impl Gateway {
         // Fix the price tier now, from the time the request starts. Deciding it
         // later would let a request that began in one window be billed against
         // another.
-        plan.tier = self.tier_at(&route.provider, &route.model, now());
-        Ok((route, plan))
+        reservation.set_tier(self.tier_at(&route.provider, &route.model, now()));
+        Ok((route, reservation))
     }
 
-    /// Which price tier a request starting now falls into.
+    /// Which price window a request starting now falls into.
     ///
-    /// Tier 0 is the default price. A configured window makes a request cost
-    /// the tier price instead, and getting this wrong is off by the peak
-    /// multiplier -- toward spending when the peak rate is higher.
-    pub fn tier_at(&self, provider: &str, model: &str, at: time::OffsetDateTime) -> u32 {
+    /// The default price applies when no configured window matches. Getting this
+    /// wrong is off by the peak multiplier -- toward spending when the peak rate
+    /// is higher.
+    pub fn tier_at(&self, provider: &str, model: &str, at: time::OffsetDateTime) -> TierKey {
         let Some(schedule) = self
             .schedules
             .get(&(provider.to_string(), model.to_string()))
         else {
-            return 0;
+            return TierKey::Default;
         };
-        match schedule.tier_index_at(at) {
-            Some(i) => (i + 1) as u32,
-            None => 0,
-        }
-    }
-
-    /// Estimated cost of a request, used to size the hard gate.
-    ///
-    /// Unknown models are priced at the conservative fallback rather than at
-    /// zero, so an unpriced model can never silently drain a wallet.
-    pub fn estimate_cost(
-        &self,
-        provider: &str,
-        model: &str,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        multiplier: Decimal,
-    ) -> Decimal {
-        let usage = TokenUsage {
-            prompt_tokens,
-            completion_tokens,
-            cached_tokens: 0,
-            reasoning_tokens: 0,
-            measured: false,
-        };
-        let tier = self.tier_at(provider, model, now());
-        if let Ok(prices) = self.prices.lock()
-            && let Some(c) = prices.estimate(provider, model, tier, &usage, multiplier)
-        {
-            return c;
-        }
-        // Nothing known about this model: over-state rather than under-state.
-        crate::meter::conservative_estimate(&usage, multiplier)
+        schedule.tier_at(at)
     }
 
     /// Record a completed attempt that succeeded.
     pub fn record_success(
         &self,
-        plan: &AttemptPlan,
+        reservation: Reservation,
         usage: &TokenUsage,
         cost: Decimal,
         attempt: AttemptRecord,
         record: RequestRecord,
     ) {
-        self.pool.settle(plan, cost, true);
+        // Read what the records need first: settling consumes the reservation,
+        // and everything below is written from these.
+        let qualified = reservation.qualified_account();
+        let provider = reservation.provider.clone();
+        let model = reservation.model.clone();
+        let tier = reservation.tier.clone();
+        reservation.settle(cost, true);
         self.pool.note_activity();
-        self.accumulate_usage(&plan.provider, &plan.model, plan.tier, usage);
+        self.observe_usage(&provider, &model, tier, usage);
         // Standing contract with the store: persist the ledger after EVERY
         // state transition. A lost ledger is not just a stale display -- on
         // restart it means re-spending quota already consumed, which on
         // Command Code silently becomes real money.
-        self.save_account(&plan.qualified_account());
+        self.save_account(&qualified);
         self.store.record_attempt(attempt);
         self.store.record_request(record);
     }
@@ -366,38 +263,26 @@ impl Gateway {
     /// reservation is released with billed = false.
     pub fn record_failure(
         &self,
-        plan: &AttemptPlan,
+        reservation: Reservation,
         class: UpstreamErrorClass,
         retry_after: Option<Duration>,
         window_reset: Option<OffsetDateTime>,
         attempt: AttemptRecord,
     ) {
         let billed = attempt.billed;
-        self.pool.settle(plan, Decimal::ZERO, billed);
+        let qualified = reservation.qualified_account();
+        reservation.settle(Decimal::ZERO, billed);
         self.pool
-            .note_error(&plan.qualified_account(), class, retry_after, window_reset);
-        self.save_account(&plan.qualified_account());
+            .note_error(&qualified, class, retry_after, window_reset);
+        self.save_account(&qualified);
         self.store.record_attempt(attempt);
     }
 
-    fn accumulate_usage(&self, provider: &str, model: &str, tier: u32, usage: &TokenUsage) {
-        // Only real measurements feed the price table. An estimate built from
-        // "characters divided by four" is not a token count, and dividing a real
-        // spend delta by it produces a rate that is neither observed nor
-        // configured -- it then sizes the hard gate for every later request.
-        if !usage.measured {
-            return;
+    /// Count tokens the gateway served, for the next interval to learn from.
+    fn observe_usage(&self, provider: &str, model: &str, tier: TierKey, usage: &TokenUsage) {
+        if let Ok(mut ledger) = self.interval.lock() {
+            ledger.observe(provider, model, tier, usage);
         }
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        let e = pending
-            .entry((provider.to_string(), model.to_string(), tier))
-            .or_default();
-        e.prompt_tokens += usage.prompt_tokens;
-        e.completion_tokens += usage.completion_tokens;
-        e.cached_tokens += usage.cached_tokens;
-        e.reasoning_tokens += usage.reasoning_tokens;
     }
 
     /// Probe every account of every provider that has an adapter.
@@ -537,8 +422,8 @@ impl Gateway {
     /// and promotions) are learned from real numbers rather than maintained by
     /// hand.
     fn learn_from_probe(&self, provider: &str) {
-        // One map per account: gate kind -> that window's cumulative spend.
-        let snapshot: HashMap<String, HashMap<GateKind, Decimal>> = self
+        // One reading per account: gate kind -> that window's cumulative spend.
+        let readings: Vec<(String, HashMap<GateKind, Decimal>)> = self
             .pool
             .accounts_of(provider)
             .iter()
@@ -552,35 +437,21 @@ impl Gateway {
             })
             .collect();
 
-        let delta = {
-            let Ok(mut last) = self.last_spend.lock() else {
+        // The ledger's lock is released before the price table's is taken: the
+        // two are never held at once, so no caller can deadlock against the
+        // poller.
+        let interval = {
+            let Ok(mut ledger) = self.interval.lock() else {
                 return;
             };
-            let delta = interval_spend(&last, &snapshot);
-            for (account, current) in snapshot {
-                last.insert(account, SpendSample { by_gate: current });
-            }
-            delta
+            ledger.settle(provider, &readings)
         };
 
-        if delta <= Decimal::ZERO {
+        if interval.spend <= Decimal::ZERO {
             return;
         }
 
-        let drained: Vec<((String, String, u32), TokenUsage)> = {
-            let Ok(mut pending) = self.pending.lock() else {
-                return;
-            };
-            let keys: Vec<(String, String, u32)> = pending
-                .keys()
-                .filter(|(p, _, _)| p == provider)
-                .cloned()
-                .collect();
-            keys.into_iter()
-                .filter_map(|k| pending.remove(&k).map(|u| (k, u)))
-                .collect()
-        };
-        if drained.is_empty() {
+        if let Some(total) = interval.unattributed {
             // Spend moved and none of our tokens did. That is either an account
             // used by something other than this gateway or traffic that predates
             // this process, and either way the money cannot be attributed to a
@@ -588,10 +459,9 @@ impl Gateway {
             // tokens. Silently dropping it is how the same thing hid for a week,
             // so both the interval and the running total are reported -- the
             // interval alone looks like rounding, the total is the real number.
-            let total = add_unattributed(&self.unattributed, provider, delta);
             tracing::warn!(
                 provider,
-                interval_spend = %delta,
+                interval_spend = %interval.spend,
                 unattributed_total = %total,
                 "spend moved with no local tokens to attribute it to; price learning \
                  skipped this interval. Is this account used outside the gateway?"
@@ -599,26 +469,22 @@ impl Gateway {
             return;
         }
 
+        let spend = interval.spend;
         let Ok(mut prices) = self.prices.lock() else {
             return;
         };
 
-        // Group the interval by model, then split its spend across the tiers that
-        // were actually used, in proportion to what each tier was expected to
-        // cost. A tick that only touched one tier is exact; one that straddles a
-        // window boundary is a proportional approximation, which is the best a
-        // single spend figure per interval allows.
-        let mut by_model: HashMap<String, Vec<(u32, TokenUsage)>> = HashMap::new();
-        for ((_, model, tier), usage) in drained {
-            by_model.entry(model).or_default().push((tier, usage));
-        }
-
-        for (model, tiers) in by_model {
+        // Split the interval's spend across the tiers that were actually used, in
+        // proportion to what each tier was expected to cost. A tick that only
+        // touched one tier is exact; one that straddles a window boundary is a
+        // proportional approximation, which is the best a single spend figure per
+        // interval allows.
+        for (model, tiers) in interval.tokens {
             let expected: Vec<Decimal> = tiers
                 .iter()
                 .map(|(tier, usage)| {
                     prices
-                        .estimate(provider, &model, *tier, usage, Decimal::ONE)
+                        .estimate(provider, &model, tier, usage, Decimal::ONE)
                         .unwrap_or_else(|| crate::meter::conservative_estimate(usage, Decimal::ONE))
                 })
                 .collect();
@@ -629,7 +495,7 @@ impl Gateway {
                 } else {
                     Decimal::ONE / Decimal::from(tiers.len().max(1) as u64)
                 };
-                prices.observe(provider, &model, *tier, delta * share, usage);
+                prices.observe(provider, &model, tier, spend * share, usage);
             }
         }
         drop(prices);
@@ -651,7 +517,7 @@ impl Gateway {
             tracing::warn!(
                 provider,
                 model,
-                tier,
+                tier = tier.label(),
                 configured_cost = %d.expected,
                 observed_cost = %d.observed,
                 drift_pct = format_args!("{:+.1}%", d.ratio * 100.0),
@@ -736,134 +602,5 @@ impl Gateway {
 
     pub fn snapshot(&self) -> Vec<Account> {
         self.pool.snapshot()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn d(mantissa: i64, scale: u32) -> Decimal {
-        Decimal::new(mantissa, scale)
-    }
-
-    fn gates(pairs: &[(GateKind, Decimal)]) -> HashMap<GateKind, Decimal> {
-        pairs.iter().copied().collect()
-    }
-
-    /// Measured live on a Command Code account.
-    ///
-    /// One probe interval moved the 5-hour window and the weekly window that
-    /// contains it by exactly 0.036638504 credits each, while the monthly window
-    /// did not move at all. Summing the three reported 0.073277008 -- double the
-    /// money that actually left the account. Because the learned price is a
-    /// RATE, every figure derived from that interval was inflated by the same
-    /// factor, and it is what turned 47 tokens into 1559 USD per million.
-    #[test]
-    fn nested_windows_are_counted_once_not_once_each() {
-        let previous = HashMap::from([(
-            "commandcode/acc-1".to_string(),
-            SpendSample {
-                by_gate: gates(&[
-                    (GateKind::FiveHour, d(1_328_079_011, 9)),
-                    (GateKind::Weekly, d(4_390_359_400, 9)),
-                    (GateKind::Monthly, d(4_399_661_385, 9)),
-                ]),
-            },
-        )]);
-        let current = HashMap::from([(
-            "commandcode/acc-1".to_string(),
-            gates(&[
-                (GateKind::FiveHour, d(1_364_717_515, 9)),
-                (GateKind::Weekly, d(4_426_997_904, 9)),
-                (GateKind::Monthly, d(4_399_661_385, 9)),
-            ]),
-        )]);
-
-        assert_eq!(
-            interval_spend(&previous, &current),
-            d(36_638_504, 9),
-            "the same spend seen by two nested windows is still one spend"
-        );
-    }
-
-    /// Accounts add; windows inside one account do not; a reset does not go
-    /// negative; an account seen for the first time contributes nothing.
-    #[test]
-    fn spend_adds_across_accounts_but_not_within_one() {
-        let previous = HashMap::from([
-            (
-                "p/a".to_string(),
-                SpendSample {
-                    by_gate: gates(&[
-                        (GateKind::FiveHour, d(1_000, 3)),
-                        (GateKind::Weekly, d(2_000, 3)),
-                    ]),
-                },
-            ),
-            (
-                "p/c".to_string(),
-                SpendSample {
-                    by_gate: gates(&[(GateKind::FiveHour, d(2_000, 3))]),
-                },
-            ),
-        ]);
-        let current = HashMap::from([
-            (
-                "p/a".to_string(),
-                gates(&[
-                    // The short window rolled over inside the interval, so its
-                    // reading dropped. Only the weekly window saw the spend.
-                    (GateKind::FiveHour, d(10, 3)),
-                    (GateKind::Weekly, d(2_800, 3)),
-                ]),
-            ),
-            (
-                // Never probed before: its entire history must not be charged
-                // to whatever tokens happen to have passed through.
-                "p/b".to_string(),
-                gates(&[(GateKind::FiveHour, d(9_000, 3))]),
-            ),
-            (
-                "p/c".to_string(),
-                gates(&[(GateKind::FiveHour, d(2_250, 3))]),
-            ),
-        ]);
-
-        // p/a: max(+800 from weekly, -990 ignored) = 0.800; p/c: +0.250.
-        assert_eq!(interval_spend(&previous, &current), d(1_050, 3));
-    }
-
-    /// Spend with no tokens accumulates, so the warning can report a total and
-    /// not just the interval that happens to be small.
-    #[test]
-    fn unattributed_spend_accumulates_per_provider() {
-        let totals = std::sync::Mutex::new(HashMap::new());
-        assert_eq!(add_unattributed(&totals, "commandcode", d(31, 3)), d(31, 3));
-        assert_eq!(add_unattributed(&totals, "commandcode", d(19, 3)), d(50, 3));
-        assert_eq!(
-            add_unattributed(&totals, "xkiro", d(2, 3)),
-            d(2, 3),
-            "one provider's leak is not another's"
-        );
-        assert_eq!(add_unattributed(&totals, "commandcode", d(1, 3)), d(51, 3));
-    }
-
-    /// Nothing moved: there is no interval spend to learn from.
-    #[test]
-    fn an_unchanged_interval_learns_nothing() {
-        let same = || {
-            HashMap::from([(
-                "p/a".to_string(),
-                SpendSample {
-                    by_gate: gates(&[(GateKind::FiveHour, d(1_000, 3))]),
-                },
-            )])
-        };
-        let current = HashMap::from([(
-            "p/a".to_string(),
-            gates(&[(GateKind::FiveHour, d(1_000, 3))]),
-        )]);
-        assert_eq!(interval_spend(&same(), &current), Decimal::ZERO);
     }
 }

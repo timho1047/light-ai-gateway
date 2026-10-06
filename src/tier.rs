@@ -61,6 +61,50 @@ impl HourRange {
     }
 }
 
+/// Which price a request is charged at: the model's default, or one named window
+/// from its schedule.
+///
+/// The NAME is the identity, and it is what the ledger keys a learned rate by.
+/// A positional index was the identity before, which made reordering two
+/// [[prices.x.y.tiers]] blocks silently re-associate every learned rate with
+/// another window's price.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TierKey {
+    /// No window matched: the model's own price.
+    Default,
+    /// A window named in the configuration.
+    Named(String),
+}
+
+impl TierKey {
+    /// The name as the ledger stores it.
+    ///
+    /// Empty means the default price. A configured name can never be empty --
+    /// validate() rejects that -- so the two cannot collide.
+    pub fn as_key(&self) -> &str {
+        match self {
+            TierKey::Default => "",
+            TierKey::Named(name) => name,
+        }
+    }
+
+    pub fn from_key(key: &str) -> TierKey {
+        if key.is_empty() {
+            TierKey::Default
+        } else {
+            TierKey::Named(key.to_string())
+        }
+    }
+
+    /// How a report names it.
+    pub fn label(&self) -> &str {
+        match self {
+            TierKey::Default => "default",
+            TierKey::Named(name) => name,
+        }
+    }
+}
+
 /// One priced tier with the window it applies to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tier {
@@ -83,33 +127,36 @@ impl Schedule {
         self.tiers.is_empty()
     }
 
-    /// Which tier prices a request starting at this instant.
+    /// Which price applies to a request starting at this instant.
     ///
-    /// Returns the index into tiers, or None for the default price. Tiers are
-    /// checked in order so the first match wins, which makes overlapping
-    /// windows behave predictably instead of arbitrarily.
-    pub fn tier_index_at(&self, at: OffsetDateTime) -> Option<usize> {
-        for (i, tier) in self.tiers.iter().enumerate() {
-            let offset = UtcOffset::from_whole_seconds(tier.offset_minutes * 60).ok()?;
+    /// Tiers are checked in order so the first match wins, which makes
+    /// overlapping windows behave predictably instead of arbitrarily.
+    pub fn tier_at(&self, at: OffsetDateTime) -> TierKey {
+        for tier in self.tiers.iter() {
+            // An offset out of range cannot match any window; validate() rejects
+            // one before it reaches here.
+            let Ok(offset) = UtcOffset::from_whole_seconds(tier.offset_minutes * 60) else {
+                continue;
+            };
             let local = at.to_offset(offset);
             let minute_of_day = u16::from(local.hour()) * 60 + u16::from(local.minute());
 
             for range in &tier.hours {
                 if !range.wraps() {
                     if tier.days.contains(local.weekday()) && range.contains(minute_of_day, 0) {
-                        return Some(i);
+                        return TierKey::Named(tier.name.clone());
                     }
                     continue;
                 }
                 if minute_of_day >= range.start_min && tier.days.contains(local.weekday()) {
-                    return Some(i);
+                    return TierKey::Named(tier.name.clone());
                 }
                 if minute_of_day < range.end_min && tier.days.contains(local.weekday().previous()) {
-                    return Some(i);
+                    return TierKey::Named(tier.name.clone());
                 }
             }
         }
-        None
+        TierKey::Default
     }
 }
 
@@ -242,7 +289,7 @@ mod tests {
     }
 
     fn peak_at(s: &Schedule, at: OffsetDateTime) -> bool {
-        s.tier_index_at(at).is_some()
+        s.tier_at(at) != TierKey::Default
     }
 
     #[test]
@@ -366,7 +413,10 @@ mod tests {
     #[test]
     fn the_default_tier_is_used_when_nothing_matches() {
         let empty = Schedule::default();
-        assert_eq!(empty.tier_index_at(datetime!(2026-09-09 2:00 UTC)), None);
+        assert_eq!(
+            empty.tier_at(datetime!(2026-09-09 2:00 UTC)),
+            TierKey::Default
+        );
         assert!(empty.is_empty());
     }
 
@@ -388,8 +438,14 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(s.tier_index_at(datetime!(2026-09-09 1:30 UTC)), Some(0));
-        assert_eq!(s.tier_index_at(datetime!(2026-09-09 3:00 UTC)), Some(1));
+        assert_eq!(
+            s.tier_at(datetime!(2026-09-09 1:30 UTC)),
+            TierKey::Named("specific".into())
+        );
+        assert_eq!(
+            s.tier_at(datetime!(2026-09-09 3:00 UTC)),
+            TierKey::Named("broad".into())
+        );
     }
 
     #[test]
