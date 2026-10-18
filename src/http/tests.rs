@@ -262,6 +262,9 @@ struct FakeBackend {
     history: Mutex<Option<Vec<crate::store::RequestHistory>>>,
     /// The credentials the Keys page reads and writes in tests.
     credentials: crate::secrets::CredentialStore,
+    /// When set, publish goes through the production adapter instead of a
+    /// test-local copy of its algorithm.
+    publisher: Mutex<Option<Arc<super::GatewayBackend>>>,
 }
 
 impl FakeBackend {
@@ -276,7 +279,27 @@ impl FakeBackend {
             usage: Mutex::new(None),
             history: Mutex::new(None),
             credentials: crate::secrets::CredentialStore::memory(),
+            publisher: Mutex::new(None),
         }
+    }
+
+    fn with_pool(config: Config, pool: Pool) -> Self {
+        FakeBackend {
+            runtime: RwLock::new(runtime_for(&config)),
+            pool,
+            successes: Mutex::new(Vec::new()),
+            failures: Mutex::new(Vec::new()),
+            applied: Mutex::new(None),
+            applied_count: std::sync::atomic::AtomicUsize::new(0),
+            usage: Mutex::new(None),
+            history: Mutex::new(None),
+            credentials: crate::secrets::CredentialStore::memory(),
+            publisher: Mutex::new(None),
+        }
+    }
+
+    fn attach_publisher(&self, publisher: Arc<super::GatewayBackend>) {
+        *self.publisher.lock().unwrap() = Some(publisher);
     }
 
     /// The publication the production gateway exposes to the apply engine:
@@ -561,18 +584,11 @@ impl OperatorBackend for FakeBackend {
         model: Option<&str>,
     ) -> std::result::Result<usize, crate::http::ApplyError> {
         let current = self.runtime();
-        let learned = current.prices().learned_rows();
-        let in_scope = |row: &crate::meter::PersistedPrice| {
-            provider.is_none_or(|provider| row.provider == provider)
-                && model.is_none_or(|model| row.model == model)
-        };
-        let forgotten = learned.iter().filter(|row| in_scope(row)).count();
-        let keep: Vec<crate::meter::PersistedPrice> =
-            learned.into_iter().filter(|row| !in_scope(row)).collect();
-        let mut next = crate::meter::PriceTable::new();
-        next.load_learned(keep);
-        next.seed_from_config(&current.config().prices);
-        self.install_runtime(current.with_prices(std::sync::Arc::new(next)));
+        let (forgotten, next) =
+            super::forget_learned_prices(&current, provider, model, &mut || Ok(()))?;
+        if forgotten > 0 {
+            self.install_runtime(current.with_prices(next));
+        }
         Ok(forgotten)
     }
 
@@ -599,18 +615,14 @@ impl OperatorBackend for FakeBackend {
         config: Config,
         write: &mut dyn FnMut() -> std::io::Result<()>,
     ) -> std::result::Result<(), crate::http::ApplyError> {
-        let reset_providers =
-            crate::http::providers_needing_reset(self.runtime().config(), &config);
-        let prices = Arc::new(self.runtime().prices().reseeded(&config.prices));
-        let runtime = Arc::new(Runtime::new(Arc::new(config.clone()), prices).unwrap());
-        let (mut accounts, unusable) = config
-            .build_accounts_lenient(&crate::secrets::CredentialStore::memory())
-            .map_err(|error| crate::http::ApplyError(error.to_string()))?;
-        accounts.extend(unusable);
-        write().map_err(|error| crate::http::ApplyError(error.to_string()))?;
-        self.pool.retune(&config.policy);
-        self.install_runtime(runtime);
-        self.pool.reconfigure(accounts, &reset_providers);
+        let publisher = self.publisher.lock().unwrap().clone();
+        let Some(publisher) = publisher else {
+            return Err(crate::http::ApplyError(
+                "this test backend has no production publisher attached".to_string(),
+            ));
+        };
+        publisher.apply_config(config.clone(), write)?;
+        self.install_runtime(runtime_for(&config));
         *self.applied.lock().unwrap() = Some(config);
         self.applied_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2003,6 +2015,28 @@ input = 0.15
 output = 0.60
 "#;
 
+/// A fake report/transport adapter backed by the production publisher. The
+/// pool handle is shared with the real gateway, so account and reading changes
+/// made by the real apply are visible to the tests that inspect them.
+async fn fake_with_real_publisher(config: Config, dir: &std::path::Path) -> Arc<FakeBackend> {
+    // The real gateway needs its own ledger, but the test runtime and the file
+    // on disk must keep the config the test wrote (no db_path), or a plain
+    // apply would look like a restart-only db_path change.
+    let mut real_config = config.clone();
+    real_config.server.db_path = dir.join("gateway.db").to_string_lossy().into_owned();
+    let gateway = crate::router::Gateway::with_credentials(
+        real_config,
+        crate::secrets::CredentialStore::memory(),
+    )
+    .await
+    .expect("real gateway for the test publisher");
+    let fake = Arc::new(FakeBackend::with_pool(config, gateway.pool.clone()));
+    activate(&fake.pool, "mock/a1", 1);
+    activate(&fake.pool, "mock/a2", 0);
+    fake.attach_publisher(Arc::new(super::GatewayBackend::new(gateway)));
+    fake
+}
+
 /// A console router over a real configuration file, with a backend built from
 /// the same file. Returns the base URL, the backend (so the test can see what
 /// was published) and the file paths.
@@ -2013,8 +2047,6 @@ async fn apply_router() -> (
     std::path::PathBuf,
 ) {
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let config = Config::from_toml_str(APPLY_TOML).expect("valid config");
-    let fake = fake_backend_with_config(config);
     let unique = format!(
         "lgw-apply-{}-{}-{}",
         std::process::id(),
@@ -2028,6 +2060,8 @@ async fn apply_router() -> (
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     std::fs::write(&path, APPLY_TOML).unwrap();
+    let config = Config::from_toml_str(APPLY_TOML).expect("valid config");
+    let fake = fake_with_real_publisher(config, &dir).await;
     let addr = spawn_console_router_with(fake.clone(), path.to_str().unwrap()).await;
     (addr, fake, path, dir)
 }
@@ -2275,7 +2309,6 @@ async fn an_apply_during_a_stream_keeps_the_in_flight_request_on_its_snapshot() 
     let (upstream_url, _mock, started, release) = spawn_held_mock().await;
     let toml = priced_toml(&upstream_url, 1.0, 2.0);
     let config = Config::from_toml_str(&toml).unwrap();
-    let fake = fake_backend_with_config(config.clone());
 
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -2290,6 +2323,7 @@ async fn an_apply_during_a_stream_keeps_the_in_flight_request_on_its_snapshot() 
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     std::fs::write(&path, &toml).unwrap();
+    let fake = fake_with_real_publisher(config.clone(), &dir).await;
     let addr = spawn_console_router_with(fake.clone(), path.to_str().unwrap()).await;
 
     let client = reqwest::Client::new();
@@ -2652,8 +2686,6 @@ async fn routes_router() -> (
     std::path::PathBuf,
 ) {
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let config = Config::from_toml_str(ROUTES_TOML).expect("valid config");
-    let fake = fake_backend_with_config(config);
     let dir = std::env::temp_dir().join(format!(
         "lgw-routes-{}-{}-{}",
         std::process::id(),
@@ -2666,6 +2698,8 @@ async fn routes_router() -> (
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     std::fs::write(&path, ROUTES_TOML).unwrap();
+    let config = Config::from_toml_str(ROUTES_TOML).expect("valid config");
+    let fake = fake_with_real_publisher(config, &dir).await;
     let addr = spawn_console_router_with(fake.clone(), path.to_str().unwrap()).await;
     (addr, fake, path, dir)
 }
@@ -2897,8 +2931,6 @@ async fn watcher_setup(
     std::path::PathBuf,
 ) {
     static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let config = Config::from_toml_str(toml).expect("valid config");
-    let fake = fake_backend_with_config(config);
     let dir = std::env::temp_dir().join(format!(
         "lgw-watch-{}-{}-{}",
         std::process::id(),
@@ -2911,6 +2943,8 @@ async fn watcher_setup(
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     std::fs::write(&path, toml).unwrap();
+    let config = Config::from_toml_str(toml).expect("valid config");
+    let fake = fake_with_real_publisher(config, &dir).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

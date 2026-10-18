@@ -312,6 +312,33 @@ pub trait OperatorBackend: RuntimeSource {
     }
 }
 
+/// The one learned-price forgetting algorithm. The caller persists the same
+/// scope first; only then is the replacement table built and published.
+pub(crate) fn forget_learned_prices(
+    current: &Runtime,
+    provider: Option<&str>,
+    model: Option<&str>,
+    persist: &mut dyn FnMut() -> std::result::Result<(), ApplyError>,
+) -> std::result::Result<(usize, Arc<crate::meter::PriceTable>), ApplyError> {
+    let table = current.prices();
+    let in_scope = |row: &crate::meter::PersistedPrice| {
+        provider.is_none_or(|provider| row.provider == provider)
+            && model.is_none_or(|model| row.model == model)
+    };
+    let learned = table.learned_rows();
+    let forgotten = learned.iter().filter(|row| in_scope(row)).count();
+    if forgotten == 0 {
+        return Ok((0, Arc::new(table.clone())));
+    }
+    persist()?;
+    let keep: Vec<crate::meter::PersistedPrice> =
+        learned.into_iter().filter(|row| !in_scope(row)).collect();
+    let mut next = crate::meter::PriceTable::new();
+    next.load_learned(keep);
+    next.seed_from_config(&current.config().prices);
+    Ok((forgotten, Arc::new(next)))
+}
+
 /// Production wiring: a thin adapter over the frozen Gateway API.
 pub struct GatewayBackend {
     gateway: Arc<Gateway>,
@@ -587,34 +614,16 @@ impl OperatorBackend for GatewayBackend {
         model: Option<&str>,
     ) -> std::result::Result<usize, ApplyError> {
         let current = self.gateway.runtime();
-        let table = current.prices();
-        let in_scope = |row: &crate::meter::PersistedPrice| {
-            provider.is_none_or(|provider| row.provider == provider)
-                && model.is_none_or(|model| row.model == model)
-        };
-        let learned = table.learned_rows();
-        let forgotten = learned.iter().filter(|row| in_scope(row)).count();
-        if forgotten == 0 {
-            return Ok(0);
+        let (forgotten, next) = forget_learned_prices(&current, provider, model, &mut || {
+            self.gateway.store.forget_prices(provider, model);
+            self.gateway
+                .store
+                .flush_blocking()
+                .map_err(|error| ApplyError(error.to_string()))
+        })?;
+        if forgotten > 0 {
+            self.gateway.install_runtime(current.with_prices(next));
         }
-
-        // Same ledger write as the CLI, then wait for it so the page reads the
-        // new state immediately.
-        self.gateway.store.forget_prices(provider, model);
-        self.gateway
-            .store
-            .flush_blocking()
-            .map_err(|error| ApplyError(error.to_string()))?;
-
-        // Rebuild without the forgotten rates: residual learned entries plus the
-        // configured card, and no second trip through the ledger.
-        let keep: Vec<crate::meter::PersistedPrice> =
-            learned.into_iter().filter(|row| !in_scope(row)).collect();
-        let mut next = crate::meter::PriceTable::new();
-        next.load_learned(keep);
-        next.seed_from_config(&current.config().prices);
-        self.gateway
-            .install_runtime(current.with_prices(Arc::new(next)));
         Ok(forgotten)
     }
 
