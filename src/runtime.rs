@@ -8,7 +8,7 @@
 //! request is running under. Old snapshots stay alive as long as any request
 //! still holds an Arc to them.
 //!
-//! Later work (the apply engine) builds the replacement snapshot and publishes it
+//! The Apply module builds the replacement snapshot and publishes it
 //! through `Gateway::install_runtime`; this module deliberately contains no
 //! reload or watcher logic of its own.
 

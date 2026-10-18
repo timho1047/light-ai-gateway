@@ -7,11 +7,167 @@
 //! guard, the apply lock, the write/publish order and ReloadState -- lives here.
 
 use crate::config::{Config, ConfigViolation};
-use crate::config_doc::{self, ConfigDocument, DiffLine, DraftAction, DraftError};
-use crate::editable::FieldClass;
+use crate::config_doc::{
+    self, ConfigDocument, DiffLine, DraftAction, DraftChange, DraftError, KeySpec,
+};
 use crate::http::OperatorBackend;
 use crate::http::console::ConsoleContext;
+use serde::Deserialize;
 use std::path::Path;
+
+/// One edit from the form. A plain value edit omits `action`; the same body
+/// also carries whole-account additions and removals so one Apply can express
+/// everything the page shows.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DraftEntry {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    path: Vec<String>,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    /// "keychain", "env" or "file".
+    #[serde(default)]
+    key_source: Option<String>,
+    /// The environment variable name or the key file path.
+    #[serde(default)]
+    key_value: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    days: Option<String>,
+    #[serde(default)]
+    hours: Option<String>,
+    #[serde(default)]
+    tz: Option<String>,
+    #[serde(default)]
+    index: Option<usize>,
+}
+
+fn required(value: Option<String>, message: &str) -> std::result::Result<String, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(message.to_string()),
+    }
+}
+
+/// Turn the wire form into document actions, refusing a half-specified one
+/// before it can touch the document.
+fn draft_actions(entries: Vec<DraftEntry>) -> std::result::Result<Vec<DraftAction>, String> {
+    let mut actions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry.action.as_deref().unwrap_or("set") {
+            "set" => actions.push(DraftAction::Set(DraftChange {
+                path: entry.path,
+                value: entry.value.unwrap_or_default(),
+            })),
+            "remove" => actions.push(DraftAction::Remove { path: entry.path }),
+            "add_account" => {
+                let provider = entry
+                    .provider
+                    .filter(|provider| !provider.trim().is_empty())
+                    .ok_or_else(|| "add_account needs a provider".to_string())?;
+                let id = entry
+                    .id
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| "add_account needs an account id".to_string())?;
+                let key = match entry.key_source.as_deref().unwrap_or("keychain") {
+                    "keychain" => KeySpec::Keychain,
+                    "env" => KeySpec::Env(
+                        entry
+                            .key_value
+                            .filter(|name| !name.trim().is_empty())
+                            .ok_or_else(|| "an env key source needs a variable name".to_string())?,
+                    ),
+                    "file" => KeySpec::File(
+                        entry
+                            .key_value
+                            .filter(|path| !path.trim().is_empty())
+                            .ok_or_else(|| "a file key source needs a path".to_string())?,
+                    ),
+                    other => return Err(format!("unknown key source {other}")),
+                };
+                actions.push(DraftAction::AddAccount {
+                    provider,
+                    id,
+                    label: entry.label,
+                    key,
+                });
+            }
+            "add_route" => actions.push(DraftAction::AddRoute {
+                model: required(entry.model, "a route needs a model")?,
+                provider: required(entry.provider, "a route needs a provider")?,
+            }),
+            "remove_route" => actions.push(DraftAction::RemoveRoute {
+                model: required(entry.model, "a route needs a model")?,
+            }),
+            "add_alias" => actions.push(DraftAction::AddAlias {
+                alias: required(entry.alias, "an alias needs a name")?,
+                provider: required(entry.provider, "an alias needs a provider")?,
+            }),
+            "remove_alias" => actions.push(DraftAction::RemoveAlias {
+                alias: required(entry.alias, "an alias needs a name")?,
+            }),
+            "add_price" => actions.push(DraftAction::AddPrice {
+                provider: required(entry.provider, "a price needs a provider")?,
+                model: required(entry.model, "a price needs a model")?,
+                input: entry
+                    .input
+                    .ok_or_else(|| "a price needs an input rate".to_string())?,
+                output: entry
+                    .output
+                    .ok_or_else(|| "a price needs an output rate".to_string())?,
+                cache_read: entry.cache_read,
+            }),
+            "remove_price" => actions.push(DraftAction::RemovePrice {
+                provider: required(entry.provider, "a price needs a provider")?,
+                model: required(entry.model, "a price needs a model")?,
+            }),
+            "add_schedule" => actions.push(DraftAction::AddSchedule {
+                provider: required(entry.provider, "a schedule needs a provider")?,
+                model: required(entry.model, "a schedule needs a model")?,
+                entry: crate::config_doc::ScheduleEntry {
+                    name: entry.name,
+                    days: required(entry.days, "a schedule needs days")?,
+                    hours: required(entry.hours, "a schedule needs hours")?,
+                    tz: entry.tz,
+                    input: entry
+                        .input
+                        .ok_or_else(|| "a schedule needs an input rate".to_string())?,
+                    output: entry
+                        .output
+                        .ok_or_else(|| "a schedule needs an output rate".to_string())?,
+                    cache_read: entry.cache_read,
+                },
+            }),
+            "remove_schedule" => actions.push(DraftAction::RemoveSchedule {
+                provider: required(entry.provider, "a schedule needs a provider")?,
+                model: required(entry.model, "a schedule needs a model")?,
+                index: entry
+                    .index
+                    .ok_or_else(|| "a schedule needs its index".to_string())?,
+            }),
+            other => return Err(format!("unknown draft action {other}")),
+        }
+    }
+    Ok(actions)
+}
 
 /// Why a draft could not be prepared. The HTTP layer maps these to status
 /// codes; the watcher maps them to one rejected reload.
@@ -21,14 +177,14 @@ pub enum Failure {
     Stale,
     /// The file could not be read.
     Read { message: String },
-    /// A path the editable-field policy does not allow from the Console.
-    Scope { fields: Vec<String> },
     /// Applying an action to the TOML document failed.
     Document(DraftError),
     /// The edited document is not a valid configuration.
     Invalid(ConfigViolation),
     /// The file parses as TOML but not as a configuration at all.
     Toml { message: String },
+    /// The form's JSON draft could not be turned into document actions.
+    Wire(String),
 }
 
 impl Failure {
@@ -38,15 +194,12 @@ impl Failure {
         match self {
             Failure::Stale => "the file changed after the form loaded".to_string(),
             Failure::Read { message } => message.clone(),
-            Failure::Scope { fields } => format!(
-                "these paths cannot be applied from the console: {}",
-                fields.join(", ")
-            ),
             Failure::Document(error) => format!("{}: {}", error.field, error.message),
             Failure::Invalid(violation) => {
                 format!("{}: {}", violation.field, violation.message)
             }
             Failure::Toml { message } => message.clone(),
+            Failure::Wire(message) => message.clone(),
         }
     }
 }
@@ -78,8 +231,22 @@ pub enum CommitMode {
 pub enum CommitError {
     /// The file changed again after preparation. Nothing was written.
     Stale,
+    /// A prepared change includes a field that only takes effect on restart.
+    RestartOnly(Vec<String>),
     Write(String),
     Publish(String),
+}
+
+/// Prepare a Console draft from the form's JSON entries. The wire parser lives
+/// here with the document actions so one sealed interface covers the whole draft.
+pub fn prepare_request(
+    path: &Path,
+    fingerprint: &str,
+    entries: Vec<DraftEntry>,
+    current: &Config,
+) -> std::result::Result<Prepared, Failure> {
+    let actions = draft_actions(entries).map_err(Failure::Wire)?;
+    prepare_draft(path, fingerprint, actions, current)
 }
 
 /// Prepare a Console draft. The caller has already parsed the wire entries into
@@ -95,10 +262,6 @@ pub fn prepare_draft(
     })?;
     if original.fingerprint() != fingerprint {
         return Err(Failure::Stale);
-    }
-    let refuse = scope_refusals(&actions);
-    if !refuse.is_empty() {
-        return Err(Failure::Scope { fields: refuse });
     }
     prepare_actions(original, &actions, current)
 }
@@ -124,7 +287,7 @@ fn prepare_actions(
     if let Some(violation) = next.violation() {
         return Err(Failure::Invalid(violation));
     }
-    let restart = crate::reload::restart_only_changes(current, &next);
+    let restart = restart_only_changes(current, &next);
     let diff = config_doc::diff(&original, &edited);
     let fingerprint = edited.fingerprint();
     let structural = actions
@@ -141,59 +304,18 @@ fn prepare_actions(
     })
 }
 
-/// The sections the form may write. Secrets are not refused here: the document
-/// editor gives them a field-specific message, which is more useful than a
-/// generic scope error.
-fn scope_refusals(actions: &[DraftAction]) -> Vec<String> {
-    let mut fields: Vec<String> = Vec::new();
-    let mut refuse = |field: String| {
-        if !fields.contains(&field) {
-            fields.push(field);
-        }
-    };
-    for action in actions {
-        match action {
-            DraftAction::Set(change) => match crate::editable::field(&change.path) {
-                None => refuse(change.path.join(".")),
-                Some(policy) if policy.class == FieldClass::ReadOnly && !policy.secret => {
-                    refuse(change.path.join("."));
-                }
-                Some(_) => {}
-            },
-            DraftAction::Remove { path } => {
-                let is_account = path.first().map(String::as_str) == Some("providers")
-                    && path.get(2).map(String::as_str) == Some("accounts");
-                if !is_account {
-                    refuse(path.join("."));
-                }
-            }
-            DraftAction::AddAccount { provider, id, .. } => {
-                if provider.trim().is_empty() || id.trim().is_empty() {
-                    refuse("providers".to_string());
-                }
-            }
-            DraftAction::AddRoute { .. }
-            | DraftAction::RemoveRoute { .. }
-            | DraftAction::AddAlias { .. }
-            | DraftAction::RemoveAlias { .. }
-            | DraftAction::AddPrice { .. }
-            | DraftAction::RemovePrice { .. }
-            | DraftAction::AddSchedule { .. }
-            | DraftAction::RemoveSchedule { .. } => {}
-        }
-    }
-    fields
-}
-
 /// Commit a prepared edit under the apply lock. This is the only place that
 /// writes the file, publishes a snapshot and records ReloadState.
 pub async fn commit(
     backend: &dyn OperatorBackend,
     console: &ConsoleContext,
-    path: &Path,
     prepared: &Prepared,
     mode: CommitMode,
 ) -> std::result::Result<(), CommitError> {
+    if !prepared.restart.is_empty() {
+        return Err(CommitError::RestartOnly(prepared.restart.clone()));
+    }
+    let path = Path::new(&console.config_path);
     let _serialized = console.apply_lock.lock().await;
 
     // An editor may have saved between preparation and this lock. Re-read the
@@ -216,54 +338,32 @@ pub async fn commit(
         .map_err(|error| CommitError::Publish(error.to_string()))?;
 
     if let Ok(mut state) = console.reload.lock() {
-        state.last_checked = Some(prepared.fingerprint.clone());
-        state.last_error = None;
-        state.last_success = Some(crate::domain::now());
+        state.applied(&prepared.fingerprint, crate::domain::now());
     }
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scope_refuses_unknown_paths_and_read_only_conveniences() {
-        let actions = vec![
-            DraftAction::Set(crate::config_doc::DraftChange {
-                path: vec!["no_such_section".to_string(), "field".to_string()],
-                value: "x".to_string(),
-            }),
-            DraftAction::Set(crate::config_doc::DraftChange {
-                path: vec![
-                    "providers".to_string(),
-                    "mock".to_string(),
-                    "allow_metered".to_string(),
-                ],
-                value: "true".to_string(),
-            }),
-        ];
-        assert_eq!(
-            scope_refusals(&actions),
-            vec![
-                "no_such_section.field".to_string(),
-                "providers.mock.allow_metered".to_string()
-            ]
-        );
+/// Fields that only take effect on restart. Compared against the running
+/// configuration, so a file that already differed from it is not mistaken for a
+/// new edit.
+pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<String> {
+    let mut fields = Vec::new();
+    if old.server.listen != new.server.listen {
+        fields.push("server.listen".to_string());
     }
-
-    #[test]
-    fn a_secret_is_not_a_scope_refusal() {
-        let actions = vec![DraftAction::Set(crate::config_doc::DraftChange {
-            path: vec![
-                "providers".to_string(),
-                "mock".to_string(),
-                "accounts".to_string(),
-                "a1".to_string(),
-                "key".to_string(),
-            ],
-            value: "sk".to_string(),
-        })];
-        assert!(scope_refusals(&actions).is_empty());
+    if old.server.db_path != new.server.db_path {
+        fields.push("server.db_path".to_string());
     }
+    let key_changed = match (&old.server.local_key, &new.server.local_key) {
+        (None, None) => false,
+        (Some(a), Some(b)) => !a.same_source(b),
+        _ => true,
+    };
+    if key_changed {
+        fields.push("server.local_key".to_string());
+    }
+    if old.policy.max_body_bytes != new.policy.max_body_bytes {
+        fields.push("policy.max_body_bytes".to_string());
+    }
+    fields
 }

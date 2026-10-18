@@ -771,21 +771,15 @@ fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), 
             message: "this field is read-only in the console".to_string(),
         });
     }
-    let kind = Some(policy.kind);
+    let kind = policy.kind;
     let (parents, leaf) = change.path.split_at(change.path.len() - 1);
-    let table = parent_table(document, parents, kind, &field)?;
+    let table = parent_table(document, parents, &field)?;
     if let Some(item) = table.get_mut(leaf[0].as_str()) {
         return set_leaf(item, &change.value).map_err(|message| DraftError {
             field: field.clone(),
             message,
         });
     }
-    let Some(kind) = kind else {
-        return Err(DraftError {
-            field: field.clone(),
-            message: "unknown field".to_string(),
-        });
-    };
     let value = value_for(kind, &change.value).map_err(|message| DraftError {
         field: field.clone(),
         message,
@@ -802,16 +796,14 @@ fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), 
 fn parent_table<'a>(
     document: &'a mut DocumentMut,
     segments: &[String],
-    kind: Option<ValueKind>,
     field: &str,
 ) -> Result<&'a mut dyn toml_edit::TableLike, DraftError> {
-    descend(document.as_table_mut(), segments, kind, field)
+    descend(document.as_table_mut(), segments, field)
 }
 
 fn descend<'a>(
     table: &'a mut dyn toml_edit::TableLike,
     segments: &[String],
-    kind: Option<ValueKind>,
     field: &str,
 ) -> Result<&'a mut dyn toml_edit::TableLike, DraftError> {
     let Some((segment, rest)) = segments.split_first() else {
@@ -824,12 +816,6 @@ fn descend<'a>(
         });
     }
     if table.get(segment).is_none() {
-        let Some(_) = kind else {
-            return Err(DraftError {
-                field: field.to_string(),
-                message: "unknown field".to_string(),
-            });
-        };
         table.insert(segment, Item::Table(toml_edit::Table::new()));
     }
     let item = table.get_mut(segment).ok_or_else(|| DraftError {
@@ -851,7 +837,7 @@ fn descend<'a>(
             field: field.to_string(),
             message: "no such schedule".to_string(),
         })?;
-        return descend(entry, rest, kind, field);
+        return descend(entry, rest, field);
     }
     let Some(next) = item.as_table_like_mut() else {
         return Err(DraftError {
@@ -859,7 +845,7 @@ fn descend<'a>(
             message: format!("{segment} is not a table"),
         });
     };
-    descend(next, rest, kind, field)
+    descend(next, rest, field)
 }
 
 fn value_for(kind: ValueKind, text: &str) -> Result<Value, String> {

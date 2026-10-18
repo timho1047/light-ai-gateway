@@ -2113,7 +2113,7 @@ async fn an_apply_of_a_section_without_a_live_path_is_refused_and_writes_nothing
     assert_eq!(response.status(), 422);
     let html = response.text().await.unwrap();
     assert!(html.contains("no_such_section.field"));
-    assert!(html.contains("cannot be applied"));
+    assert!(html.contains("unknown field"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2140,6 +2140,84 @@ async fn a_draft_cannot_write_a_secret_into_the_configuration() {
         0,
         "nothing was published"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_production_publisher_applies_and_republishes_the_real_gateway() {
+    let dir = std::env::temp_dir().join(format!(
+        "lgw-prod-apply-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, APPLY_TOML).unwrap();
+    let config = Config::from_toml_str(APPLY_TOML).expect("config");
+    let gateway = crate::router::Gateway::with_credentials(
+        config.clone(),
+        crate::secrets::CredentialStore::memory(),
+    )
+    .await
+    .expect("gateway");
+    let backend = super::GatewayBackend::new(gateway.clone());
+    let console = super::console::ConsoleContext::new("127.0.0.1:0", 0, path.to_str().unwrap());
+    let document = crate::config_doc::ConfigDocument::read(&path).expect("configuration document");
+
+    let prepared = crate::http::apply::prepare_draft(
+        &path,
+        &document.fingerprint(),
+        vec![crate::config_doc::DraftAction::Set(
+            crate::config_doc::DraftChange {
+                path: vec!["policy".to_string(), "soft_threshold".to_string()],
+                value: "0.75".to_string(),
+            },
+        )],
+        gateway.runtime().config(),
+    )
+    .expect("prepare");
+    crate::http::apply::commit(
+        &backend,
+        &console,
+        &prepared,
+        crate::http::apply::CommitMode::ReplaceFile,
+    )
+    .await
+    .expect("commit through the production adapter");
+    assert_eq!(gateway.runtime().config().policy.soft_threshold, 0.75);
+    assert!(std::fs::read_to_string(&path).unwrap().contains("0.75"));
+
+    // The production adapter is also the one that owns the restart refusal.
+    let document = crate::config_doc::ConfigDocument::read(&path).expect("configuration document");
+    let restarted = crate::http::apply::prepare_draft(
+        &path,
+        &document.fingerprint(),
+        vec![crate::config_doc::DraftAction::Set(
+            crate::config_doc::DraftChange {
+                path: vec!["policy".to_string(), "max_body_bytes".to_string()],
+                value: "1048576".to_string(),
+            },
+        )],
+        gateway.runtime().config(),
+    )
+    .expect("prepare restart-only");
+    let error = crate::http::apply::commit(
+        &backend,
+        &console,
+        &restarted,
+        crate::http::apply::CommitMode::ReplaceFile,
+    )
+    .await
+    .expect_err("restart-only is refused by the publisher");
+    assert!(matches!(
+        error,
+        crate::http::apply::CommitError::RestartOnly(_)
+    ));
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("1048576"));
+    let _ = gateway.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

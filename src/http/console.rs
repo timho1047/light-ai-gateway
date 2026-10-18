@@ -8,7 +8,7 @@
 
 use super::AppState;
 use crate::config::Config;
-use crate::config_doc::{DraftAction, DraftChange, KeySpec};
+
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
 use crate::console::{
@@ -34,9 +34,9 @@ pub struct ConsoleContext {
     pub listen: String,
     pub port: u16,
     pub config_path: String,
-    /// When this process loaded the file its pages describe. The read-only
-    /// configuration page reports it as the last applied time until a real
-    /// apply engine exists.
+    /// When this process loaded the file its pages describe. The configuration
+    /// page uses it as the last-applied fallback before the Apply lifecycle has
+    /// recorded a success.
     pub started_at: time::OffsetDateTime,
     /// One apply at a time: read, fingerprint check, write and publish are one
     /// critical section, so two concurrent applies cannot interleave.
@@ -174,161 +174,7 @@ pub(super) async fn config_page_handler(
 #[derive(Debug, Deserialize)]
 pub(super) struct ValidateRequest {
     fingerprint: String,
-    draft: Vec<DraftEntry>,
-}
-
-/// One edit from the form. A plain value edit omits `action`; the same body
-/// also carries whole-account additions and removals so one Apply can express
-/// everything the page shows.
-#[derive(Debug, Deserialize)]
-struct DraftEntry {
-    #[serde(default)]
-    action: Option<String>,
-    #[serde(default)]
-    path: Vec<String>,
-    #[serde(default)]
-    value: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    /// "keychain", "env" or "file".
-    #[serde(default)]
-    key_source: Option<String>,
-    /// The environment variable name or the key file path.
-    #[serde(default)]
-    key_value: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    alias: Option<String>,
-    #[serde(default)]
-    input: Option<f64>,
-    #[serde(default)]
-    output: Option<f64>,
-    #[serde(default)]
-    cache_read: Option<f64>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    days: Option<String>,
-    #[serde(default)]
-    hours: Option<String>,
-    #[serde(default)]
-    tz: Option<String>,
-    #[serde(default)]
-    index: Option<usize>,
-}
-
-fn required(value: Option<String>, message: &str) -> std::result::Result<String, String> {
-    match value {
-        Some(value) if !value.trim().is_empty() => Ok(value),
-        _ => Err(message.to_string()),
-    }
-}
-
-/// Turn the wire form into document actions, refusing a half-specified one
-/// before it can touch the document.
-fn draft_actions(entries: Vec<DraftEntry>) -> std::result::Result<Vec<DraftAction>, String> {
-    let mut actions = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match entry.action.as_deref().unwrap_or("set") {
-            "set" => actions.push(DraftAction::Set(DraftChange {
-                path: entry.path,
-                value: entry.value.unwrap_or_default(),
-            })),
-            "remove" => actions.push(DraftAction::Remove { path: entry.path }),
-            "add_account" => {
-                let provider = entry
-                    .provider
-                    .filter(|provider| !provider.trim().is_empty())
-                    .ok_or_else(|| "add_account needs a provider".to_string())?;
-                let id = entry
-                    .id
-                    .filter(|id| !id.trim().is_empty())
-                    .ok_or_else(|| "add_account needs an account id".to_string())?;
-                let key = match entry.key_source.as_deref().unwrap_or("keychain") {
-                    "keychain" => KeySpec::Keychain,
-                    "env" => KeySpec::Env(
-                        entry
-                            .key_value
-                            .filter(|name| !name.trim().is_empty())
-                            .ok_or_else(|| "an env key source needs a variable name".to_string())?,
-                    ),
-                    "file" => KeySpec::File(
-                        entry
-                            .key_value
-                            .filter(|path| !path.trim().is_empty())
-                            .ok_or_else(|| "a file key source needs a path".to_string())?,
-                    ),
-                    other => return Err(format!("unknown key source {other}")),
-                };
-                actions.push(DraftAction::AddAccount {
-                    provider,
-                    id,
-                    label: entry.label,
-                    key,
-                });
-            }
-            "add_route" => actions.push(DraftAction::AddRoute {
-                model: required(entry.model, "a route needs a model")?,
-                provider: required(entry.provider, "a route needs a provider")?,
-            }),
-            "remove_route" => actions.push(DraftAction::RemoveRoute {
-                model: required(entry.model, "a route needs a model")?,
-            }),
-            "add_alias" => actions.push(DraftAction::AddAlias {
-                alias: required(entry.alias, "an alias needs a name")?,
-                provider: required(entry.provider, "an alias needs a provider")?,
-            }),
-            "remove_alias" => actions.push(DraftAction::RemoveAlias {
-                alias: required(entry.alias, "an alias needs a name")?,
-            }),
-            "add_price" => actions.push(DraftAction::AddPrice {
-                provider: required(entry.provider, "a price needs a provider")?,
-                model: required(entry.model, "a price needs a model")?,
-                input: entry
-                    .input
-                    .ok_or_else(|| "a price needs an input rate".to_string())?,
-                output: entry
-                    .output
-                    .ok_or_else(|| "a price needs an output rate".to_string())?,
-                cache_read: entry.cache_read,
-            }),
-            "remove_price" => actions.push(DraftAction::RemovePrice {
-                provider: required(entry.provider, "a price needs a provider")?,
-                model: required(entry.model, "a price needs a model")?,
-            }),
-            "add_schedule" => actions.push(DraftAction::AddSchedule {
-                provider: required(entry.provider, "a schedule needs a provider")?,
-                model: required(entry.model, "a schedule needs a model")?,
-                entry: crate::config_doc::ScheduleEntry {
-                    name: entry.name,
-                    days: required(entry.days, "a schedule needs days")?,
-                    hours: required(entry.hours, "a schedule needs hours")?,
-                    tz: entry.tz,
-                    input: entry
-                        .input
-                        .ok_or_else(|| "a schedule needs an input rate".to_string())?,
-                    output: entry
-                        .output
-                        .ok_or_else(|| "a schedule needs an output rate".to_string())?,
-                    cache_read: entry.cache_read,
-                },
-            }),
-            "remove_schedule" => actions.push(DraftAction::RemoveSchedule {
-                provider: required(entry.provider, "a schedule needs a provider")?,
-                model: required(entry.model, "a schedule needs a model")?,
-                index: entry
-                    .index
-                    .ok_or_else(|| "a schedule needs its index".to_string())?,
-            }),
-            other => return Err(format!("unknown draft action {other}")),
-        }
-    }
-    Ok(actions)
+    draft: Vec<apply::DraftEntry>,
 }
 
 /// Check a draft without writing it: apply the changes to a copy of the file,
@@ -342,19 +188,10 @@ pub(super) async fn config_validate(
 ) -> Response {
     let lang = query.lang();
     let path = state.console.config_path.clone();
-    let actions = match draft_actions(request.draft) {
-        Ok(actions) => actions,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::failed("draft", &error, lang),
-            );
-        }
-    };
-    match apply::prepare_draft(
+    match apply::prepare_request(
         std::path::Path::new(&path),
         &request.fingerprint,
-        actions,
+        request.draft,
         state.operator.runtime().config(),
     ) {
         Ok(prepared) => fragment(StatusCode::OK, config_page::validated(&prepared.diff, lang)),
@@ -376,34 +213,18 @@ pub(super) async fn config_apply(
 ) -> Response {
     let lang = query.lang();
     let path = state.console.config_path.clone();
-    let actions = match draft_actions(request.draft) {
-        Ok(actions) => actions,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::failed("draft", &error, lang),
-            );
-        }
-    };
-    let prepared = match apply::prepare_draft(
+    let prepared = match apply::prepare_request(
         std::path::Path::new(&path),
         &request.fingerprint,
-        actions,
+        request.draft,
         state.operator.runtime().config(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => return apply_failure(error, &path, lang),
     };
-    if !prepared.restart.is_empty() {
-        return fragment(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            config_page::restart_only(&prepared.restart, lang),
-        );
-    }
     match apply::commit(
         state.operator.as_ref(),
         &state.console,
-        std::path::Path::new(&path),
         &prepared,
         apply::CommitMode::ReplaceFile,
     )
@@ -419,6 +240,10 @@ pub(super) async fn config_apply(
             ),
         ),
         Err(apply::CommitError::Stale) => fragment(StatusCode::CONFLICT, config_page::stale(lang)),
+        Err(apply::CommitError::RestartOnly(fields)) => fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::restart_only(&fields, lang),
+        ),
         Err(apply::CommitError::Write(message)) | Err(apply::CommitError::Publish(message)) => {
             fragment(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -434,10 +259,6 @@ fn apply_failure(error: apply::Failure, path: &str, lang: Lang) -> Response {
         apply::Failure::Read { message } => fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
             config_page::failed(path, &message, lang),
-        ),
-        apply::Failure::Scope { fields } => fragment(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            config_page::not_live(&fields, lang),
         ),
         apply::Failure::Document(error) => fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -455,6 +276,10 @@ fn apply_failure(error: apply::Failure, path: &str, lang: Lang) -> Response {
         apply::Failure::Toml { message } => fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
             config_page::rejected("config", None, &message, lang),
+        ),
+        apply::Failure::Wire(message) => fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::failed("draft", &message, lang),
         ),
     }
 }

@@ -9,7 +9,6 @@
 //! bytes (or a console apply that has just written them) is not a new event, and
 //! a rename-based save is just a different inode with new bytes.
 
-use crate::config::Config;
 use crate::http::OperatorBackend;
 use crate::http::console::ConsoleContext;
 use std::path::{Path, PathBuf};
@@ -29,6 +28,34 @@ pub struct ReloadState {
     pub last_error: Option<ReloadError>,
     /// When a file was last made live through this process.
     pub last_success: Option<OffsetDateTime>,
+}
+
+impl ReloadState {
+    /// A fresh process loaded this file; there is no rejection yet.
+    pub fn loaded(&mut self, fingerprint: &str, at: OffsetDateTime) {
+        self.last_checked = Some(fingerprint.to_string());
+        self.last_success = Some(at);
+        self.last_error = None;
+    }
+
+    /// An Apply made these bytes live.
+    pub fn applied(&mut self, fingerprint: &str, at: OffsetDateTime) {
+        self.last_checked = Some(fingerprint.to_string());
+        self.last_success = Some(at);
+        self.last_error = None;
+    }
+
+    /// A file was read and refused. The previous success stays as history.
+    pub fn rejected(&mut self, fingerprint: &str, message: &str) {
+        if !fingerprint.is_empty() {
+            self.last_checked = Some(fingerprint.to_string());
+        }
+        self.last_error = Some(ReloadError {
+            fingerprint: fingerprint.to_string(),
+            message: message.to_string(),
+            at: OffsetDateTime::now_utc(),
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +89,7 @@ pub enum Outcome {
 /// would apply the same file a second time.
 pub fn mark_loaded(shared: &SharedReload, fingerprint: &str, at: OffsetDateTime) {
     if let Ok(mut state) = shared.lock() {
-        state.last_checked = Some(fingerprint.to_string());
-        state.last_success = Some(at);
+        state.loaded(fingerprint, at);
     }
 }
 
@@ -93,21 +119,9 @@ pub async fn reload_once(
         Ok(prepared) => prepared,
         Err(error) => return reject(console, &fingerprint, &error.message()),
     };
-    if !prepared.restart.is_empty() {
-        return reject(
-            console,
-            &fingerprint,
-            &format!(
-                "these fields need a restart, so the running configuration is unchanged: {}",
-                prepared.restart.join(", ")
-            ),
-        );
-    }
-
     match crate::http::apply::commit(
         backend,
         console,
-        path,
         &prepared,
         crate::http::apply::CommitMode::ExternalFile,
     )
@@ -122,6 +136,14 @@ pub async fn reload_once(
             Outcome::Applied { fingerprint }
         }
         Err(crate::http::apply::CommitError::Stale) => Outcome::Unchanged,
+        Err(crate::http::apply::CommitError::RestartOnly(fields)) => reject(
+            console,
+            &fingerprint,
+            &format!(
+                "these fields need a restart, so the running configuration is unchanged: {}",
+                fields.join(", ")
+            ),
+        ),
         Err(crate::http::apply::CommitError::Write(message))
         | Err(crate::http::apply::CommitError::Publish(message)) => {
             reject(console, &fingerprint, &message)
@@ -163,14 +185,7 @@ fn lock(console: &ConsoleContext) -> std::sync::MutexGuard<'_, ReloadState> {
 fn reject(console: &ConsoleContext, fingerprint: &str, message: &str) -> Outcome {
     {
         let mut state = lock(console);
-        if !fingerprint.is_empty() {
-            state.last_checked = Some(fingerprint.to_string());
-        }
-        state.last_error = Some(ReloadError {
-            fingerprint: fingerprint.to_string(),
-            message: message.to_string(),
-            at: OffsetDateTime::now_utc(),
-        });
+        state.rejected(fingerprint, message);
     }
     Outcome::Rejected {
         fingerprint: fingerprint.to_string(),
@@ -178,34 +193,9 @@ fn reject(console: &ConsoleContext, fingerprint: &str, message: &str) -> Outcome
     }
 }
 
-/// Fields that only take effect on restart. Compared against the running
-/// configuration, so a file that already differed from it is not mistaken for a
-/// new edit.
-pub fn restart_only_changes(old: &Config, new: &Config) -> Vec<String> {
-    let mut fields = Vec::new();
-    if old.server.listen != new.server.listen {
-        fields.push("server.listen".to_string());
-    }
-    if old.server.db_path != new.server.db_path {
-        fields.push("server.db_path".to_string());
-    }
-    let key_changed = match (&old.server.local_key, &new.server.local_key) {
-        (None, None) => false,
-        (Some(a), Some(b)) => !a.same_source(b),
-        _ => true,
-    };
-    if key_changed {
-        fields.push("server.local_key".to_string());
-    }
-    if old.policy.max_body_bytes != new.policy.max_body_bytes {
-        fields.push("policy.max_body_bytes".to_string());
-    }
-    fields
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::http::apply::restart_only_changes;
 
     #[test]
     fn restart_only_fields_are_named() {

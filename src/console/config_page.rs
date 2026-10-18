@@ -76,7 +76,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "soft_threshold"],
             "policy.soft_threshold",
             &fnum(p.soft_threshold),
-            true,
             s,
         );
         editable_bool(
@@ -84,7 +83,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "allow_metered"],
             "policy.allow_metered",
             p.allow_metered,
-            true,
             s,
         );
         editable_text(
@@ -92,7 +90,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "poll_interval_secs"],
             "policy.poll_interval_secs",
             &p.poll_interval_secs.to_string(),
-            true,
             s,
         );
         editable_text(
@@ -100,7 +97,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "poll_interval_active_secs"],
             "policy.poll_interval_active_secs",
             &p.poll_interval_active_secs.to_string(),
-            true,
             s,
         );
         editable_text(
@@ -108,7 +104,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "poll_interval_idle_secs"],
             "policy.poll_interval_idle_secs",
             &p.poll_interval_idle_secs.to_string(),
-            true,
             s,
         );
         editable_text(
@@ -116,7 +111,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "drift_threshold"],
             "policy.drift_threshold",
             &fnum(p.drift_threshold),
-            true,
             s,
         );
         editable_text(
@@ -124,7 +118,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "hard_margin"],
             "policy.hard_margin",
             &fnum(p.hard_margin),
-            true,
             s,
         );
         editable_text(
@@ -132,7 +125,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "max_retries"],
             "policy.max_retries",
             &p.max_retries.to_string(),
-            true,
             s,
         );
         editable_text(
@@ -140,7 +132,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "connect_timeout_secs"],
             "policy.connect_timeout_secs",
             &p.connect_timeout_secs.to_string(),
-            true,
             s,
         );
         editable_text(
@@ -148,7 +139,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "ttft_timeout_secs"],
             "policy.ttft_timeout_secs",
             &p.ttft_timeout_secs.to_string(),
-            true,
             s,
         );
         editable_text(
@@ -156,7 +146,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "idle_timeout_secs"],
             "policy.idle_timeout_secs",
             &p.idle_timeout_secs.to_string(),
-            true,
             s,
         );
         editable_bool(
@@ -164,7 +153,6 @@ pub fn render(view: &ConfigView) -> String {
             &["policy", "probe_before_switch"],
             "policy.probe_before_switch",
             p.probe_before_switch,
-            true,
             s,
         );
         readonly_field(
@@ -188,7 +176,6 @@ pub fn render(view: &ConfigView) -> String {
                 &[provider_path[0], provider_path[1], "adapter"],
                 "adapter",
                 adapter_name(cfg.adapter),
-                true,
                 s,
             );
             editable_text(
@@ -196,7 +183,6 @@ pub fn render(view: &ConfigView) -> String {
                 &[provider_path[0], provider_path[1], "base_url"],
                 "base_url",
                 &cfg.base_url,
-                true,
                 s,
             );
             editable_text(
@@ -204,7 +190,6 @@ pub fn render(view: &ConfigView) -> String {
                 &[provider_path[0], provider_path[1], "probe_base_url"],
                 "probe_base_url",
                 cfg.probe_base_url.as_deref().unwrap_or(""),
-                true,
                 s,
             );
             editable_text(
@@ -212,7 +197,6 @@ pub fn render(view: &ConfigView) -> String {
                 &[provider_path[0], provider_path[1], "currency"],
                 "currency",
                 &cfg.currency,
-                true,
                 s,
             );
             editable_text(
@@ -222,7 +206,6 @@ pub fn render(view: &ConfigView) -> String {
                 &cfg.credit_multiplier
                     .map(fnum)
                     .unwrap_or_else(|| "1".to_string()),
-                true,
                 s,
             );
             readonly_field(
@@ -310,7 +293,6 @@ pub fn render(view: &ConfigView) -> String {
                     &["prices", provider, model, "input"],
                     s.config_input_m,
                     &fnum(price.input),
-                    true,
                     s,
                 );
                 editable_text(
@@ -318,7 +300,6 @@ pub fn render(view: &ConfigView) -> String {
                     &["prices", provider, model, "output"],
                     s.config_output_m,
                     &fnum(price.output),
-                    true,
                     s,
                 );
                 editable_text(
@@ -326,7 +307,6 @@ pub fn render(view: &ConfigView) -> String {
                     &["prices", provider, model, "cache_read"],
                     s.config_cache_m,
                     &price.cache_read.map(fnum).unwrap_or_default(),
-                    true,
                     s,
                 );
                 let price_payload =
@@ -358,7 +338,6 @@ pub fn render(view: &ConfigView) -> String {
                         &name_path,
                         s.config_schedule_name,
                         tier.name.as_deref().unwrap_or(""),
-                        true,
                         s,
                     );
                     let days_path = [
@@ -369,7 +348,7 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "days",
                     ];
-                    editable_text(body, &days_path, s.config_days, &tier.days, true, s);
+                    editable_text(body, &days_path, s.config_days, &tier.days, s);
                     let hours_path = [
                         "prices",
                         provider.as_str(),
@@ -378,7 +357,7 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "hours",
                     ];
-                    editable_text(body, &hours_path, s.config_hours, &tier.hours, true, s);
+                    editable_text(body, &hours_path, s.config_hours, &tier.hours, s);
                     let tz_path = [
                         "prices",
                         provider.as_str(),
@@ -392,7 +371,6 @@ pub fn render(view: &ConfigView) -> String {
                         &tz_path,
                         s.config_tz,
                         tier.tz.as_deref().unwrap_or(""),
-                        true,
                         s,
                     );
                     let input_path = [
@@ -403,14 +381,7 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "input",
                     ];
-                    editable_text(
-                        body,
-                        &input_path,
-                        s.config_input_m,
-                        &fnum(tier.input),
-                        true,
-                        s,
-                    );
+                    editable_text(body, &input_path, s.config_input_m, &fnum(tier.input), s);
                     let output_path = [
                         "prices",
                         provider.as_str(),
@@ -419,14 +390,7 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "output",
                     ];
-                    editable_text(
-                        body,
-                        &output_path,
-                        s.config_output_m,
-                        &fnum(tier.output),
-                        true,
-                        s,
-                    );
+                    editable_text(body, &output_path, s.config_output_m, &fnum(tier.output), s);
                     let cache_path = [
                         "prices",
                         provider.as_str(),
@@ -440,7 +404,6 @@ pub fn render(view: &ConfigView) -> String {
                         &cache_path,
                         s.config_cache_m,
                         &tier.cache_read.map(fnum).unwrap_or_default(),
-                        true,
                         s,
                     );
                     let schedule_payload = serde_json::json!({
@@ -601,14 +564,7 @@ fn marker_for_path(path: &[&str], s: &Strings) -> String {
     format!("<span class=\"tag {}\">{}</span>", class, esc(text))
 }
 
-fn editable_text(
-    out: &mut String,
-    path: &[&str],
-    label: &str,
-    value: &str,
-    _live: bool,
-    s: &Strings,
-) {
+fn editable_text(out: &mut String, path: &[&str], label: &str, value: &str, s: &Strings) {
     let _ = write!(
         out,
         r#"<div class="field"><span class="field-label mono">{}</span><input type="text" value="{}" data-path="{}" data-initial="{}" spellcheck="false" autocomplete="off"><span class="hint">{}</span></div>"#,
@@ -620,14 +576,7 @@ fn editable_text(
     );
 }
 
-fn editable_bool(
-    out: &mut String,
-    path: &[&str],
-    label: &str,
-    value: bool,
-    _live: bool,
-    s: &Strings,
-) {
+fn editable_bool(out: &mut String, path: &[&str], label: &str, value: bool, s: &Strings) {
     let true_selected = if value { " selected" } else { "" };
     let false_selected = if value { "" } else { " selected" };
     let _ = write!(
@@ -695,13 +644,6 @@ pub fn applied(diff: &[DiffLine], fingerprint: &str, reload: bool, lang: Lang) -
 pub fn restart_only(fields: &[String], lang: Lang) -> String {
     let s = lang.strings();
     refused(s.config_apply_failed, s.config_restart_only, fields)
-}
-
-/// A section whose apply path has not landed yet. Refused loudly instead of
-/// being silently written and ignored.
-pub fn not_live(fields: &[String], lang: Lang) -> String {
-    let s = lang.strings();
-    refused(s.config_apply_failed, s.config_not_live, fields)
 }
 
 fn refused(banner: &str, heading: &str, fields: &[String]) -> String {
@@ -908,7 +850,6 @@ fn account_fields(
         ],
         "label",
         &label,
-        true,
         s,
     );
     readonly_field(
@@ -936,7 +877,6 @@ fn account_fields(
         ],
         "currency",
         &currency,
-        true,
         s,
     );
     editable_text(
@@ -953,7 +893,6 @@ fn account_fields(
             .credit_multiplier
             .map(fnum)
             .unwrap_or_else(|| "1".to_string()),
-        true,
         s,
     );
     editable_text(
@@ -970,7 +909,6 @@ fn account_fields(
             .concurrency_limit
             .map(|v| v.to_string())
             .unwrap_or_default(),
-        true,
         s,
     );
     editable_text(
@@ -984,7 +922,6 @@ fn account_fields(
         ],
         "rpm_limit",
         &account.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
-        true,
         s,
     );
     readonly_field(
@@ -1127,18 +1064,58 @@ mod tests {
     }
 
     #[test]
-    fn a_section_without_a_live_path_is_refused_by_name() {
-        let html = not_live(&["providers.mock.base_url".to_string()], Lang::En);
-        assert!(html.contains("providers.mock.base_url"));
-        assert!(html.contains("cannot be applied"));
-    }
-
-    #[test]
     fn a_stale_draft_asks_for_a_reload() {
         let html = stale(Lang::En);
         assert!(html.contains("changed after this page loaded"));
     }
 
+    /// The page and the policy must agree on every path the form can edit.
+    /// This walks the real HTML attributes rather than a second hand-written
+    /// list, so a field that is rendered but not writable fails here.
+    #[test]
+    fn every_rendered_editable_path_is_accepted_by_the_policy() {
+        let config = sample();
+        let html = render(&view(&config, "listen = \"127.0.0.1:8787\""));
+        let mut paths = Vec::new();
+        for marker in ["<input", "<select"] {
+            let mut position = 0;
+            while let Some(relative) = html[position..].find(marker) {
+                let start = position + relative;
+                let Some(end_relative) = html[start..].find('>') else {
+                    break;
+                };
+                let end = start + end_relative;
+                let tag = &html[start..end];
+                if let Some(attribute) = tag.find("data-path=\"") {
+                    let value = &tag[attribute + 11..];
+                    if let Some(close) = value.find('"') {
+                        let encoded = value[..close].replace("&quot;", "\"");
+                        let path: Vec<String> =
+                            serde_json::from_str(&encoded).expect("data-path JSON");
+                        paths.push(path);
+                    }
+                }
+                position = end + 1;
+            }
+        }
+        assert!(
+            paths.len() > 20,
+            "the form should expose many editable fields"
+        );
+        for path in paths {
+            let policy = crate::editable::field(&path)
+                .unwrap_or_else(|| panic!("rendered path has no policy: {path:?}"));
+            assert!(
+                !policy.secret,
+                "a secret path must not be rendered: {path:?}"
+            );
+            assert_ne!(
+                policy.class,
+                crate::editable::FieldClass::ReadOnly,
+                "a read-only path must not be rendered as editable: {path:?}"
+            );
+        }
+    }
     #[test]
     fn every_section_and_the_restart_markers_are_rendered() {
         let config = sample();
