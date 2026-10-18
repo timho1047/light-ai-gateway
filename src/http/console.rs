@@ -60,9 +60,7 @@ pub(super) async fn board_page(
     Query(query): Query<LangQuery>,
 ) -> Response {
     let lang = query.lang();
-    let snapshot = state.backend.snapshot();
-    let at = crate::domain::now();
-    let inner = board::render(&snapshot, at, lang);
+    let inner = board_html(&state, lang);
     let body = format!(
         "<div data-poll data-url=\"/console/partials/board\" data-interval=\"10000\">{inner}</div>"
     );
@@ -75,13 +73,28 @@ pub(super) async fn board_partial(
     Query(query): Query<LangQuery>,
 ) -> Response {
     let lang = query.lang();
-    let snapshot = state.backend.snapshot();
-    let html = board::render(&snapshot, crate::domain::now(), lang);
+    let html = board_html(&state, lang);
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         Body::from(html),
     )
         .into_response()
+}
+
+/// One renderer for the page and the polled fragment. The vitals and drift come
+/// from the same seams the pool exposes, so a refresh cannot show numbers from
+/// two different moments in different places.
+fn board_html(state: &AppState, lang: Lang) -> String {
+    let snapshot = state.backend.snapshot();
+    let vitals = state.backend.board_vitals();
+    let drift = state.backend.price_drift();
+    let input = board::BoardInput {
+        accounts: &snapshot,
+        vitals: vitals.as_ref(),
+        in_flight: state.backend.in_flight(),
+        drift: &drift,
+    };
+    board::render(&input, crate::domain::now(), lang)
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the

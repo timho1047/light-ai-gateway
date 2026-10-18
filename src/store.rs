@@ -1175,6 +1175,11 @@ impl Ledger {
         recent_requests(&self.conn, limit)
     }
 
+    /// The Board's live-ish vitals, read from the request history.
+    pub fn board_vitals(&self, now: OffsetDateTime) -> Result<BoardVitals> {
+        board_vitals(&self.conn, now)
+    }
+
     /// Usage aggregated by the dimensions asked for, in order.
     ///
     /// The grouping key is built by concatenating the dimensions, which SQLite
@@ -1184,6 +1189,71 @@ impl Ledger {
     pub fn usage_by(&self, since: OffsetDateTime, dims: &[GroupBy]) -> Result<Vec<UsageRow>> {
         usage_rows_multi(&self.conn, since, dims)
     }
+}
+
+/// The numbers the Board's rail shows: how busy the gateway is right now and
+/// how healthy the last day was. One short read over the requests table, never
+/// a provider call.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoardVitals {
+    /// Requests recorded in the last minute.
+    pub requests_last_minute: u64,
+    /// Requests whose last status was not ok in the last hour.
+    pub errors_last_hour: u64,
+    /// 95th percentile time to first token over the last day, in milliseconds.
+    pub p95_ttft_ms: Option<f64>,
+    /// Cached tokens over prompt tokens in the last day.
+    pub cache_hit: Option<f64>,
+}
+
+/// Board vitals as of now, from the request history only.
+pub fn board_vitals(conn: &Connection, now: OffsetDateTime) -> Result<BoardVitals> {
+    let minutes = e2i(now - time::Duration::minutes(1));
+    let hour = e2i(now - time::Duration::hours(1));
+    let day = e2i(now - time::Duration::days(1));
+
+    let requests_last_minute: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM requests WHERE ts >= ?1",
+        params![minutes],
+        |row| row.get(0),
+    )?;
+    let errors_last_hour: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM requests WHERE ts >= ?1 AND status != 'ok'",
+        params![hour],
+        |row| row.get(0),
+    )?;
+
+    let mut ttfts: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT ttft_ms FROM requests WHERE ts >= ?1 AND ttft_ms IS NOT NULL")?;
+        let rows = stmt.query_map(params![day], |row| row.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    ttfts.sort_unstable();
+    let p95_ttft_ms = if ttfts.is_empty() {
+        None
+    } else {
+        let rank = ((ttfts.len() as f64) * 0.95).ceil() as usize;
+        let index = rank.saturating_sub(1).min(ttfts.len() - 1);
+        Some(ttfts[index] as f64)
+    };
+
+    let (prompt, cached): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT SUM(prompt_tokens), SUM(cached_tokens) FROM requests WHERE ts >= ?1",
+        params![day],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let cache_hit = match (prompt, cached) {
+        (Some(prompt), Some(cached)) if prompt > 0 => Some(cached as f64 / prompt as f64),
+        _ => None,
+    };
+
+    Ok(BoardVitals {
+        requests_last_minute: requests_last_minute.max(0) as u64,
+        errors_last_hour: errors_last_hour.max(0) as u64,
+        p95_ttft_ms,
+        cache_hit,
+    })
 }
 
 /// The column a usage dimension groups by.
@@ -2237,6 +2307,40 @@ mod tests {
         );
         let conn = crate::store::open(&db.path).expect("reopen");
         assert_eq!(schema_version(&conn).expect("version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn board_vitals_read_the_recent_windows() {
+        let mut conn = mem();
+        let now = ts(1_000_000);
+        let epoch = now.unix_timestamp();
+
+        let mut fresh = request("fresh", epoch - 10, "p", "a", "m", "1");
+        fresh.ttft_ms = Some(200);
+        insert_req(&mut conn, &fresh);
+        let mut broken = request("broken", epoch - 120, "p", "a", "m", "1");
+        broken.status = RequestStatus::Error;
+        broken.ttft_ms = Some(400);
+        insert_req(&mut conn, &broken);
+        let mut old = request("old", epoch - 90_000, "p", "a", "m", "1");
+        old.ttft_ms = Some(900);
+        insert_req(&mut conn, &old);
+
+        let vitals = board_vitals(&conn, now).expect("vitals");
+        assert_eq!(vitals.requests_last_minute, 1);
+        assert_eq!(vitals.errors_last_hour, 1);
+        assert_eq!(vitals.p95_ttft_ms, Some(400.0));
+        assert_eq!(vitals.cache_hit, Some(0.4));
+    }
+
+    #[test]
+    fn empty_board_vitals_are_empty_not_zero_percent() {
+        let conn = mem();
+        let vitals = board_vitals(&conn, ts(1_000_000)).expect("vitals");
+        assert_eq!(vitals.requests_last_minute, 0);
+        assert_eq!(vitals.errors_last_hour, 0);
+        assert_eq!(vitals.p95_ttft_ms, None);
+        assert_eq!(vitals.cache_hit, None);
     }
 
     #[test]

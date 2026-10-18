@@ -270,6 +270,10 @@
           node.innerHTML = await response.text();
           failures = 0;
           node.removeAttribute("data-stale");
+          var stamp = node.querySelector("[data-updated]");
+          if (stamp) {
+            stamp.textContent = new Date().toLocaleTimeString();
+          }
         } catch (error) {
           failures += 1;
           node.setAttribute("data-stale", "true");
@@ -285,11 +289,29 @@
         timer = window.setInterval(refresh, interval);
       }
 
+      // The refresh button finds its poller through this property, so it keeps
+      // working after the fragment (and the button) has been replaced.
+      node.lgwRefresh = refresh;
+      var firstStamp = node.querySelector("[data-updated]");
+      if (firstStamp) {
+        firstStamp.textContent = new Date().toLocaleTimeString();
+      }
+
       document.addEventListener("visibilitychange", function () {
         if (!document.hidden) { refresh(); }
       });
       schedule();
     })(polls[p]);
+  }
+
+  var refreshButtons = document.querySelectorAll("[data-refresh]");
+  for (var rb = 0; rb < refreshButtons.length; rb++) {
+    refreshButtons[rb].addEventListener("click", function () {
+      var nodes = document.querySelectorAll("[data-poll]");
+      for (var n = 0; n < nodes.length; n++) {
+        if (nodes[n].lgwRefresh) { nodes[n].lgwRefresh(); }
+      }
+    });
   }
 
   /* flash messages vanish on their own; a close chip can remove them early */

@@ -388,6 +388,20 @@ impl Pool {
         }
     }
 
+    /// Requests currently committed against any account, for the console's
+    /// vitals. A number for a dashboard, not a routing input.
+    pub fn in_flight_total(&self) -> u32 {
+        match self.inner.lock() {
+            Ok(inner) => inner.inflight.values().map(|entry| entry.count).sum(),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .inflight
+                .values()
+                .map(|entry| entry.count)
+                .sum(),
+        }
+    }
+
     /// Requests currently committed against an account.
     ///
     /// Test-only: the in-flight counter is what the hard gate and the pacing

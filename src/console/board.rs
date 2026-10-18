@@ -7,15 +7,31 @@
 
 use super::copy::Lang;
 use super::layout::esc;
-use crate::domain::{Account, AccountState, Gate, GateKind};
+use crate::domain::{Account, AccountOverview, AccountState, Gate, GateKind};
 use rust_decimal::Decimal;
 use std::fmt::Write;
 use time::OffsetDateTime;
 
 const WINDOWS: [GateKind; 3] = [GateKind::FiveHour, GateKind::Weekly, GateKind::Monthly];
 
-pub fn render(accounts: &[Account], at: OffsetDateTime, lang: Lang) -> String {
+/// Everything the Board renders besides the timestamp: the live accounts, the
+/// ledger's vitals, the pool's in-flight count and the drifted learned prices.
+pub struct BoardInput<'a> {
+    pub accounts: &'a [Account],
+    pub vitals: Option<&'a crate::store::BoardVitals>,
+    pub in_flight: u32,
+    pub drift: &'a [(
+        String,
+        String,
+        crate::tier::TierKey,
+        crate::meter::PriceDrift,
+    )],
+}
+
+pub fn render(input: &BoardInput, at: OffsetDateTime, lang: Lang) -> String {
     let s = lang.strings();
+    let accounts = input.accounts;
+    let overviews: Vec<AccountOverview> = accounts.iter().map(Account::overview).collect();
     let mut out = String::new();
     let _ = write!(
         out,
@@ -24,17 +40,29 @@ pub fn render(accounts: &[Account], at: OffsetDateTime, lang: Lang) -> String {
     <div class="eyebrow">{}</div>
     <h2 class="section-title">{}</h2>
     <p class="lede">{}</p>
-  </div>"#,
+    <div class="updated">{} <b data-updated></b></div>
+  </div>
+  <div class="board-grid">
+    <div class="board-main">"#,
         esc(s.board_eyebrow),
         esc(s.board_title),
-        lede(accounts, lang),
+        lede(&overviews, lang),
+        esc(s.updated),
     );
+    table(&mut out, &overviews, at, lang);
+    out.push_str("</div>");
+    out.push_str(&rail(input, &overviews, lang));
+    out.push_str("</div></section>");
+    out
+}
 
+fn table(out: &mut String, accounts: &[AccountOverview], at: OffsetDateTime, lang: Lang) {
+    let s = lang.strings();
     if accounts.is_empty() {
         let _ = write!(out, "<div class=\"empty\">{}</div>", esc(s.no_accounts));
     } else if accounts
         .iter()
-        .all(|a| a.last_probe_at.is_none() && a.gates.is_empty())
+        .all(|a| a.state == AccountState::Unknown && a.gates.is_empty())
     {
         let _ = write!(out, "<div class=\"empty\">{}</div>", esc(s.not_probed));
     } else {
@@ -50,15 +78,136 @@ pub fn render(accounts: &[Account], at: OffsetDateTime, lang: Lang) -> String {
             esc(s.col_state),
         );
         for account in accounts {
-            row(&mut out, account, at, lang);
+            row(out, account, at, lang);
         }
         out.push_str("</tbody></table>");
     }
-    out.push_str("</section>");
+}
+
+fn rail(input: &BoardInput, overviews: &[AccountOverview], lang: Lang) -> String {
+    let s = lang.strings();
+    let mut out = String::from("<aside class=\"rail\">");
+
+    let inventory = inventory(overviews);
+    if !inventory.is_empty() {
+        let _ = write!(
+            out,
+            "<div class=\"rail-block\"><h3>{}</h3><div class=\"rail-rows\">",
+            esc(s.inventory)
+        );
+        for (kind, used, cap) in inventory {
+            let _ = write!(
+                out,
+                "<div class=\"rail-row\"><span>{}</span><b>{}</b></div>",
+                esc(kind.label()),
+                esc(&percent(used, cap))
+            );
+        }
+        let _ = write!(
+            out,
+            "<div class=\"rail-row\"><span>{}</span><b>{}</b></div>",
+            esc(s.inventory_pool),
+            esc(&pool_percent(overviews))
+        );
+        out.push_str("</div></div>");
+    }
+
+    let _ = write!(
+        out,
+        "<div class=\"rail-block\"><h3>{}</h3><div class=\"rail-rows\">",
+        esc(s.vitals)
+    );
+    let dash = "—".to_string();
+    let requests = input
+        .vitals
+        .map(|v| v.requests_last_minute.to_string())
+        .unwrap_or_else(|| dash.clone());
+    let errors = input
+        .vitals
+        .map(|v| v.errors_last_hour.to_string())
+        .unwrap_or_else(|| dash.clone());
+    let p95 = input
+        .vitals
+        .and_then(|v| v.p95_ttft_ms)
+        .map(|ms| {
+            if ms >= 1000.0 {
+                format!("{:.1}s", ms / 1000.0)
+            } else {
+                format!("{ms:.0}ms")
+            }
+        })
+        .unwrap_or_else(|| dash.clone());
+    let cache = input
+        .vitals
+        .and_then(|v| v.cache_hit)
+        .map(percent_f64)
+        .unwrap_or_else(|| dash.clone());
+    rail_row(&mut out, s.requests_per_minute, &requests, false);
+    rail_row(&mut out, s.in_flight, &input.in_flight.to_string(), false);
+    rail_row(&mut out, s.p95_ttft, &p95, false);
+    rail_row(
+        &mut out,
+        s.errors_1h,
+        &errors,
+        errors != "0" && errors != dash,
+    );
+    rail_row(&mut out, s.cache_hit, &cache, false);
+    out.push_str("</div></div>");
+
+    let _ = write!(
+        out,
+        "<div class=\"rail-block\"><h3>{}</h3><div class=\"rail-rows\">",
+        esc(s.price_drift)
+    );
+    if input.drift.is_empty() {
+        let _ = write!(
+            out,
+            "<div class=\"rail-row\"><span>{}</span></div>",
+            esc(s.no_drift)
+        );
+    }
+    for (provider, model, tier, drift) in input.drift.iter().take(4) {
+        let _ = write!(
+            out,
+            "<div class=\"rail-row\"><span>{}/{} {}</span><b class=\"warn\">{:+.1}%</b></div>",
+            esc(provider),
+            esc(model),
+            esc(tier.label()),
+            drift.ratio * 100.0,
+        );
+    }
+    out.push_str("</div></div>");
+
+    let _ = write!(
+        out,
+        "<div class=\"rail-block\"><h3>{}</h3><button class=\"btn\" type=\"button\" data-refresh>{}</button></div>",
+        esc(s.actions),
+        esc(s.refresh)
+    );
+    out.push_str("</aside>");
     out
 }
 
-fn lede(accounts: &[Account], lang: Lang) -> String {
+fn rail_row(out: &mut String, label: &str, value: &str, warn: bool) {
+    let _ = write!(
+        out,
+        "<div class=\"rail-row\"><span>{}</span><b{}>{}</b></div>",
+        esc(label),
+        if warn { " class=\"warn\"" } else { "" },
+        esc(value)
+    );
+}
+
+fn percent_f64(ratio: f64) -> String {
+    let rounded = (ratio * 1000.0).round() / 10.0;
+    if (rounded - rounded.round()).abs() < f64::EPSILON {
+        format!("{rounded:.0}%")
+    } else {
+        format!("{rounded:.1}%")
+    }
+}
+
+fn lede(accounts: &[AccountOverview], lang: Lang) -> String {
     let stale = accounts
         .iter()
         .flat_map(|a| a.gates.iter())
@@ -141,7 +290,7 @@ fn lede(accounts: &[Account], lang: Lang) -> String {
     }
 }
 
-fn row(out: &mut String, account: &Account, at: OffsetDateTime, lang: Lang) {
+fn row(out: &mut String, account: &AccountOverview, at: OffsetDateTime, lang: Lang) {
     let s = lang.strings();
     let _ = write!(
         out,
@@ -269,7 +418,7 @@ fn state_class(state: AccountState) -> &'static str {
 /// Covered inventory across the whole pool: sum(used) over sum(cap) for every
 /// covered money window. One spent account beside a fresh one reads 50%, not
 /// the "next account" figure.
-fn pool_percent(accounts: &[Account]) -> String {
+fn pool_percent(accounts: &[AccountOverview]) -> String {
     let mut used = Decimal::ZERO;
     let mut cap = Decimal::ZERO;
     for (_, window_used, window_cap) in inventory(accounts) {
@@ -279,7 +428,7 @@ fn pool_percent(accounts: &[Account]) -> String {
     percent(used, cap)
 }
 
-fn inventory(accounts: &[Account]) -> Vec<(GateKind, Decimal, Decimal)> {
+fn inventory(accounts: &[AccountOverview]) -> Vec<(GateKind, Decimal, Decimal)> {
     WINDOWS
         .iter()
         .map(|kind| {
@@ -374,6 +523,19 @@ mod tests {
         OffsetDateTime::from_unix_timestamp(epoch).expect("timestamp")
     }
 
+    fn board(accounts: &[Account], at: OffsetDateTime, lang: Lang) -> String {
+        render(
+            &BoardInput {
+                accounts,
+                vitals: None,
+                in_flight: 0,
+                drift: &[],
+            },
+            at,
+            lang,
+        )
+    }
+
     fn account(
         provider: &str,
         id: &str,
@@ -433,7 +595,7 @@ mod tests {
     #[test]
     fn the_board_renders_an_account_state_and_its_windows() {
         let at = ts(1_000_000);
-        let html = render(&[covered_account()], at, Lang::En);
+        let html = board(&[covered_account()], at, Lang::En);
         assert!(html.contains("primary"));
         assert!(html.contains("xkiro"));
         assert!(html.contains("ACTIVE"));
@@ -444,6 +606,50 @@ mod tests {
             html.contains("30%"),
             "inventory across every covered window"
         );
+    }
+
+    #[test]
+    fn the_rail_reports_inventory_vitals_and_drift() {
+        let vitals = crate::store::BoardVitals {
+            requests_last_minute: 7,
+            errors_last_hour: 1,
+            p95_ttft_ms: Some(1200.0),
+            cache_hit: Some(0.78),
+        };
+        let drift = vec![(
+            "xkiro".to_string(),
+            "z-ai/glm-5.3-flash".to_string(),
+            crate::tier::TierKey::Default,
+            crate::meter::PriceDrift {
+                expected: Decimal::from(25),
+                observed: Decimal::from(90),
+                expected_per_million: Decimal::from(25),
+                actual_per_million: Decimal::from(90),
+                total_tokens: 12_000,
+                ratio: 2.523,
+                samples: 12,
+                significant: true,
+            },
+        )];
+        let accounts = [covered_account()];
+        let html = render(
+            &BoardInput {
+                accounts: &accounts,
+                vitals: Some(&vitals),
+                in_flight: 3,
+                drift: &drift,
+            },
+            ts(1_000_000),
+            Lang::En,
+        );
+        assert!(html.contains("Vitals"));
+        assert!(html.contains("requests / min"));
+        assert!(html.contains("1.2s"));
+        assert!(html.contains("78%"));
+        assert!(html.contains("+252.3%"));
+        assert!(html.contains("xkiro/z-ai/glm-5.3-flash"));
+        assert!(html.contains("data-refresh"));
+        assert!(html.contains("Inventory"));
     }
 
     #[test]
@@ -466,7 +672,7 @@ mod tests {
             Decimal::ZERO,
             None,
         )];
-        let html = render(&[spent, fresh], ts(1_000_000), Lang::En);
+        let html = board(&[spent, fresh], ts(1_000_000), Lang::En);
         assert!(
             html.contains("50%"),
             "one spent account beside a fresh one is 50%"
@@ -479,7 +685,7 @@ mod tests {
         for gate in &mut account.gates {
             gate.stale = true;
         }
-        let html = render(&[account], ts(1_000_000), Lang::En);
+        let html = board(&[account], ts(1_000_000), Lang::En);
         assert!(html.contains("stale"));
         assert!(html.contains("10 / 20"));
         assert!(!html.contains(">0 / 20<"));
@@ -487,14 +693,14 @@ mod tests {
 
     #[test]
     fn the_api_key_never_reaches_the_page() {
-        let html = render(&[covered_account()], ts(1_000_000), Lang::En);
+        let html = board(&[covered_account()], ts(1_000_000), Lang::En);
         assert!(!html.contains("sk-test"));
         assert!(!html.contains("api_key"));
     }
 
     #[test]
     fn covered_and_metered_are_not_folded_together() {
-        let html = render(&[covered_account()], ts(1_000_000), Lang::En);
+        let html = board(&[covered_account()], ts(1_000_000), Lang::En);
         assert!(html.contains("10 / 20"));
         assert!(html.contains("$7.40"));
         assert!(!html.contains("$17.40"), "covered is not added to metered");
@@ -505,14 +711,15 @@ mod tests {
         let mut account = covered_account();
         account.gates.clear();
         account.last_probe_at = None;
-        let html = render(&[account], ts(1_000_000), Lang::En);
+        account.state = AccountState::Unknown;
+        let html = board(&[account], ts(1_000_000), Lang::En);
         assert!(html.contains("probed"));
         assert!(!html.contains("<table"));
     }
 
     #[test]
     fn the_chinese_board_speaks_chinese() {
-        let html = render(&[covered_account()], ts(1_000_000), Lang::Zh);
+        let html = board(&[covered_account()], ts(1_000_000), Lang::Zh);
         assert!(html.contains("账号与额度"));
         assert!(html.contains("个账号"));
     }
@@ -521,7 +728,7 @@ mod tests {
     fn a_malicious_label_is_escaped() {
         let mut account = covered_account();
         account.label = "<img src=x onerror=alert(1)>".to_string();
-        let html = render(&[account], ts(1_000_000), Lang::En);
+        let html = board(&[account], ts(1_000_000), Lang::En);
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img"));
     }

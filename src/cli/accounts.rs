@@ -1,6 +1,6 @@
 //! `lgw accounts`: list, probe, disable, and enable accounts.
 
-use super::status::{cmd_status, overview_of, render_board};
+use super::status::{cmd_status, render_board};
 use super::{AccountsArgs, AccountsCommand};
 use crate::ansi::Palette;
 use crate::config::Config;
@@ -32,7 +32,11 @@ async fn cmd_accounts_probe(config: &Config, account: Option<String>, pal: &Pale
         println!("{}", pal.dim(&format!("probing {provider}/{id} ...")));
         gateway.probe_account(provider, id).await;
     }
-    let rows: Vec<AccountOverview> = gateway.snapshot().iter().map(overview_of).collect();
+    let rows: Vec<AccountOverview> = gateway
+        .snapshot()
+        .iter()
+        .map(|account| account.overview())
+        .collect();
     print!("{}", render_board(&rows, OffsetDateTime::now_utc(), pal));
     let _ = gateway.shutdown();
     Ok(())

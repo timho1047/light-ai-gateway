@@ -272,6 +272,23 @@ impl Account {
         qualified_id(&self.provider, &self.id)
     }
 
+    /// The operator-facing projection of this account: the board's shape, with
+    /// no credential and no transport detail. Both `lgw status` and the console
+    /// read this, so the two can never disagree about which fields exist.
+    pub fn overview(&self) -> AccountOverview {
+        AccountOverview {
+            account_id: self.id.clone(),
+            provider: self.provider.clone(),
+            label: self.label.clone(),
+            currency: self.currency.clone(),
+            state: self.state,
+            gates: self.gates.clone(),
+            available_at: self.available_at,
+            window_started_at: self.window_started_at,
+            last_error: self.last_error.clone(),
+        }
+    }
+
     /// Covered gates only.
     pub fn covered_gates(&self) -> impl Iterator<Item = &Gate> {
         self.gates

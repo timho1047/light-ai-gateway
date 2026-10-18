@@ -3,9 +3,7 @@
 use super::open_ledger;
 use crate::ansi::Palette;
 use crate::config::Config;
-use crate::domain::{
-    Account, AccountOverview, AccountState, Confidence, Gate, GateClass, GateKind,
-};
+use crate::domain::{AccountOverview, AccountState, Confidence, Gate, GateClass, GateKind};
 use crate::router::Gateway;
 use anyhow::Result;
 use rust_decimal::Decimal;
@@ -16,7 +14,11 @@ pub(super) async fn cmd_status(config: &Config, refresh: bool, pal: &Palette) ->
 
     if refresh {
         let gateway = Gateway::new(config.clone()).await?;
-        let rows: Vec<AccountOverview> = gateway.snapshot().iter().map(overview_of).collect();
+        let rows: Vec<AccountOverview> = gateway
+            .snapshot()
+            .iter()
+            .map(|account| account.overview())
+            .collect();
         print!("{}", render_board(&rows, now, pal));
         let _ = gateway.shutdown();
         return Ok(());
@@ -32,20 +34,6 @@ pub(super) async fn cmd_status(config: &Config, refresh: bool, pal: &Palette) ->
     }
     print!("{}", render_board(&rows, now, pal));
     Ok(())
-}
-
-pub(super) fn overview_of(a: &Account) -> AccountOverview {
-    AccountOverview {
-        account_id: a.id.clone(),
-        provider: a.provider.clone(),
-        label: a.label.clone(),
-        currency: a.currency.clone(),
-        state: a.state,
-        gates: a.gates.clone(),
-        available_at: a.available_at,
-        window_started_at: a.window_started_at,
-        last_error: a.last_error.clone(),
-    }
 }
 
 const BOARD_HEADERS: [(&str, crate::table::Align); 6] = [

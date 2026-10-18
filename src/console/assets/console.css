@@ -1414,3 +1414,68 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
   font-size: 11px;
   line-height: 1.7;
 }
+
+.board-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 290px;
+  gap: 56px;
+  align-items: start;
+}
+
+.board-main {
+  min-width: 0;
+}
+
+.rail-rows {
+  display: grid;
+  gap: 8px;
+}
+
+.rail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.rail-row b {
+  color: var(--ink);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.rail-row b.warn {
+  color: var(--warn);
+}
+
+.updated {
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+@media (max-width: 1080px) {
+  .board-grid {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+
+  .board-grid .rail {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0 32px;
+  }
+}
+
+@media (max-width: 640px) {
+  .board-grid .rail {
+    grid-template-columns: 1fr;
+  }
+}

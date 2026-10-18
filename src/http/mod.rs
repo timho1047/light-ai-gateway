@@ -87,6 +87,23 @@ pub trait ProxyBackend: Send + Sync + 'static {
     /// nobody can afford to leave open.
     fn snapshot(&self) -> Vec<Account>;
 
+    /// Requests currently committed across the pool. A dashboard number, not a
+    /// routing input; backends without a pool report zero.
+    fn in_flight(&self) -> u32 {
+        0
+    }
+
+    /// The Board's vitals from the request history, or None when there is no
+    /// ledger to read yet.
+    fn board_vitals(&self) -> Option<crate::store::BoardVitals> {
+        None
+    }
+
+    /// Learned prices that have drifted materially from the configured rate.
+    fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
+        Vec::new()
+    }
+
     /// Refresh an account's quota reading immediately before switching to it.
     ///
     /// A boxed future rather than an async-trait method so the default can be a
@@ -215,6 +232,21 @@ impl ProxyBackend for GatewayBackend {
 
     fn snapshot(&self) -> Vec<Account> {
         self.gateway.snapshot()
+    }
+
+    fn in_flight(&self) -> u32 {
+        self.gateway.pool.in_flight_total()
+    }
+
+    fn board_vitals(&self) -> Option<crate::store::BoardVitals> {
+        let path = self.gateway.runtime().config().db_path();
+        crate::store::Ledger::open(&path)
+            .ok()
+            .and_then(|ledger| ledger.board_vitals(crate::domain::now()).ok())
+    }
+
+    fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
+        self.gateway.runtime().prices().drifted()
     }
 
     fn ensure_fresh<'a>(
