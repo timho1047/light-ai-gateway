@@ -421,7 +421,22 @@ pub async fn serve(config: Config, config_path: &std::path::Path) -> Result<()> 
         .with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr().context("reading the bound address")?;
     let console = console::ConsoleContext::new(&local.to_string(), local.port(), &config_path);
-    let app = build_router_with_console(Arc::new(GatewayBackend::new(gateway)), console);
+    let backend = Arc::new(GatewayBackend::new(gateway));
+    let app = build_router_with_console(backend.clone(), console.clone());
+    // The file is already live: mark it handled so the first watcher tick does
+    // not publish a second, identical snapshot.
+    if let Ok(raw) = std::fs::read_to_string(&config_path) {
+        crate::reload::mark_loaded(
+            &console.reload,
+            &crate::config_doc::fingerprint(&raw),
+            crate::domain::now(),
+        );
+    }
+    let _watcher = crate::reload::spawn(
+        backend,
+        std::path::PathBuf::from(&config_path),
+        console.clone(),
+    );
     tracing::info!(
         listen = %local,
         console = %format!("http://{local}/"),

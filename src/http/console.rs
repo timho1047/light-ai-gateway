@@ -37,6 +37,8 @@ pub struct ConsoleContext {
     /// One apply at a time: read, fingerprint check, write and publish are one
     /// critical section, so two concurrent applies cannot interleave.
     pub apply_lock: Arc<tokio::sync::Mutex<()>>,
+    /// What the file watcher last saw and why an external edit was refused.
+    pub reload: crate::reload::SharedReload,
 }
 
 impl ConsoleContext {
@@ -47,6 +49,7 @@ impl ConsoleContext {
             config_path: config_path.to_string(),
             started_at: crate::domain::now(),
             apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            reload: crate::reload::new_shared(),
         }
     }
 
@@ -136,15 +139,23 @@ pub(super) async fn config_page_handler(
             }
         };
 
-    let started = state
-        .console
-        .started_at
+    let (reload_error, last_success) = match state.console.reload.lock() {
+        Ok(state) => (state.last_error.clone(), state.last_success),
+        Err(poisoned) => {
+            let state = poisoned.into_inner();
+            (state.last_error.clone(), state.last_success)
+        }
+    };
+    // The console's own apply and an external reload both count as "applied".
+    let applied_at = last_success.unwrap_or(state.console.started_at);
+    let applied_at = applied_at
         .replace_nanosecond(0)
         .unwrap_or(state.console.started_at);
-    let last_applied = started
+    let last_applied = applied_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
     let view = config_page::ConfigView {
+        reload_error: reload_error.as_ref(),
         config: runtime.config(),
         path: &path,
         fingerprint: &fingerprint,
@@ -461,7 +472,7 @@ pub(super) async fn config_apply(
         );
     }
 
-    let restart = restart_only_changes(state.backend.runtime().config(), &next);
+    let restart = crate::reload::restart_only_changes(state.backend.runtime().config(), &next);
     if !restart.is_empty() {
         return fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -483,40 +494,22 @@ pub(super) async fn config_apply(
         .iter()
         .any(|action| !matches!(action, DraftAction::Set(_)));
     match state.backend.apply_config(next, &mut write) {
-        Ok(()) => fragment(
-            StatusCode::OK,
-            config_page::applied(&diff, &fingerprint, structural, lang),
-        ),
+        Ok(()) => {
+            if let Ok(mut reload) = state.console.reload.lock() {
+                reload.last_checked = Some(fingerprint.clone());
+                reload.last_error = None;
+                reload.last_success = Some(crate::domain::now());
+            }
+            fragment(
+                StatusCode::OK,
+                config_page::applied(&diff, &fingerprint, structural, lang),
+            )
+        }
         Err(error) => fragment(
             StatusCode::INTERNAL_SERVER_ERROR,
             config_page::failed(&path, &error.to_string(), lang),
         ),
     }
-}
-
-/// Fields that only take effect on restart. Compared against the running
-/// configuration, so a file that already differed from it is not mistaken for a
-/// new edit.
-fn restart_only_changes(old: &Config, new: &Config) -> Vec<String> {
-    let mut fields = Vec::new();
-    if old.server.listen != new.server.listen {
-        fields.push("server.listen".to_string());
-    }
-    if old.server.db_path != new.server.db_path {
-        fields.push("server.db_path".to_string());
-    }
-    let key_changed = match (&old.server.local_key, &new.server.local_key) {
-        (None, None) => false,
-        (Some(a), Some(b)) => !a.same_source(b),
-        _ => true,
-    };
-    if key_changed {
-        fields.push("server.local_key".to_string());
-    }
-    if old.policy.max_body_bytes != new.policy.max_body_bytes {
-        fields.push("policy.max_body_bytes".to_string());
-    }
-    fields
 }
 
 /// The sections whose live apply has not landed yet. Routes and prices arrive in

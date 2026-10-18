@@ -14,6 +14,7 @@ pub mod interval;
 pub mod meter;
 pub mod quota;
 pub mod quota_report;
+pub mod reload;
 pub mod router;
 pub mod runtime;
 pub mod secrets;

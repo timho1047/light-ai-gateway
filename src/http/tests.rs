@@ -253,6 +253,9 @@ struct FakeBackend {
     failures: Mutex<Vec<RecordedFailure>>,
     /// The last configuration published through the apply seam, if any.
     applied: Mutex<Option<Config>>,
+    /// How many times a configuration was published, so a test can prove the
+    /// watcher did not apply the same bytes twice.
+    applied_count: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeBackend {
@@ -263,6 +266,7 @@ impl FakeBackend {
             successes: Mutex::new(Vec::new()),
             failures: Mutex::new(Vec::new()),
             applied: Mutex::new(None),
+            applied_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -422,6 +426,8 @@ impl ProxyBackend for FakeBackend {
         self.install_runtime(runtime);
         self.pool.reconfigure(accounts, &reset_providers);
         *self.applied.lock().unwrap() = Some(config);
+        self.applied_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }
@@ -2582,5 +2588,196 @@ async fn the_configuration_page_exposes_routes_aliases_and_prices() {
     assert!(html.contains("Add a price"));
     assert!(html.contains("Add a schedule"));
     assert!(html.contains("Provider aliases"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A console router plus the shared watcher state, over a real file.
+async fn watcher_setup(
+    toml: &str,
+) -> (
+    String,
+    super::console::ConsoleContext,
+    Arc<FakeBackend>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let config = Config::from_toml_str(toml).expect("valid config");
+    let fake = fake_backend_with_config(config);
+    let dir = std::env::temp_dir().join(format!(
+        "lgw-watch-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let console =
+        super::console::ConsoleContext::new(&addr.to_string(), addr.port(), path.to_str().unwrap());
+    crate::reload::mark_loaded(
+        &console.reload,
+        &crate::config_doc::fingerprint(toml),
+        crate::domain::now(),
+    );
+    let app = super::build_router_with_console(fake.clone(), console.clone());
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let base = format!("http://{addr}");
+    (base, console, fake, path, dir)
+}
+
+fn replace_config_file(path: &std::path::Path, contents: &str) {
+    let temporary = path.with_extension("editor-save");
+    std::fs::write(&temporary, contents).unwrap();
+    std::fs::rename(&temporary, path).unwrap();
+}
+
+#[tokio::test]
+async fn an_external_edit_is_applied_once_through_the_watcher() {
+    let (base, console, fake, path, dir) = watcher_setup(APPLY_TOML).await;
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    let edited = APPLY_TOML.replace("soft_threshold = 0.8", "soft_threshold = 0.75");
+    replace_config_file(&path, &edited);
+    let outcome = crate::reload::reload_once(fake.as_ref(), &path, &console).await;
+    assert!(
+        matches!(outcome, crate::reload::Outcome::Applied { .. }),
+        "got {outcome:?}"
+    );
+    assert_eq!(fake.runtime().config().policy.soft_threshold, 0.75);
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    let again = crate::reload::reload_once(fake.as_ref(), &path, &console).await;
+    assert_eq!(again, crate::reload::Outcome::Unchanged);
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "unchanged bytes are never applied twice"
+    );
+
+    let page = reqwest::get(format!("{base}/config?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("value=\"0.75\""));
+    assert!(!page.contains("An external edit could not be applied"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_invalid_external_edit_keeps_serving_and_surfaces_the_failure() {
+    let (base, console, fake, path, dir) = watcher_setup(APPLY_TOML).await;
+    let broken = APPLY_TOML.replace("soft_threshold = 0.8", "soft_threshold = 1.5");
+    replace_config_file(&path, &broken);
+    let outcome = crate::reload::reload_once(fake.as_ref(), &path, &console).await;
+    assert!(matches!(outcome, crate::reload::Outcome::Rejected { .. }));
+    assert_eq!(
+        fake.runtime().config().policy.soft_threshold,
+        0.8,
+        "the previous snapshot keeps serving"
+    );
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+
+    let page = reqwest::get(format!("{base}/config?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("An external edit could not be applied"));
+    assert!(page.contains("policy.soft_threshold"));
+
+    // Fixing the file is enough: no restart, no console action.
+    let fixed = APPLY_TOML.replace("soft_threshold = 0.8", "soft_threshold = 0.7");
+    replace_config_file(&path, &fixed);
+    let outcome = crate::reload::reload_once(fake.as_ref(), &path, &console).await;
+    assert!(matches!(outcome, crate::reload::Outcome::Applied { .. }));
+    assert_eq!(fake.runtime().config().policy.soft_threshold, 0.7);
+    let page = reqwest::get(format!("{base}/config?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("An external edit could not be applied"));
+    assert!(page.contains("value=\"0.7\""));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_restart_only_external_edit_is_refused_by_name() {
+    let (_base, console, fake, path, dir) = watcher_setup(APPLY_TOML).await;
+    let changed = APPLY_TOML.replace("listen = \"127.0.0.1:8787\"", "listen = \"127.0.0.1:9999\"");
+    replace_config_file(&path, &changed);
+    let outcome = crate::reload::reload_once(fake.as_ref(), &path, &console).await;
+    let crate::reload::Outcome::Rejected { message, .. } = outcome else {
+        panic!("expected a refusal, got {outcome:?}");
+    };
+    assert!(message.contains("server.listen"), "got {message}");
+    assert_eq!(
+        fake.runtime().config().server.listen,
+        "127.0.0.1:8787",
+        "the listener cannot change without a restart"
+    );
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_console_save_is_not_applied_again_by_the_watcher() {
+    let (base, console, fake, path, dir) = watcher_setup(APPLY_TOML).await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/console/api/config/apply?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&apply_body(&["policy", "soft_threshold"], "0.75"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    let outcome = crate::reload::reload_once(fake.as_ref(), &path, &console).await;
+    assert_eq!(outcome, crate::reload::Outcome::Unchanged);
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the console's own write is not a second apply"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

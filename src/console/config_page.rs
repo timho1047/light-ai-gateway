@@ -19,6 +19,8 @@ pub struct ConfigView<'a> {
     pub fingerprint: &'a str,
     pub last_applied: &'a str,
     pub raw: Option<&'a str>,
+    /// Why the last external edit was refused, if it was.
+    pub reload_error: Option<&'a crate::reload::ReloadError>,
     pub lang: Lang,
 }
 
@@ -26,6 +28,9 @@ pub fn render(view: &ConfigView) -> String {
     let s = view.lang.strings();
     let mut out = String::new();
     out.push_str(&header(view, s));
+    if let Some(error) = view.reload_error {
+        out.push_str(&reload_banner(error, s));
+    }
     let _ = write!(
         out,
         "<form id=\"config-form\" data-config-draft data-fingerprint=\"{}\">",
@@ -766,6 +771,15 @@ pub fn failed(field: &str, message: &str, lang: Lang) -> String {
     )
 }
 
+fn reload_banner(error: &crate::reload::ReloadError, s: &Strings) -> String {
+    format!(
+        r#"<div class="banner error"><b>{}</b><div class="mono detail">{}</div><div class="hint">{}</div></div>"#,
+        esc(s.config_external_error),
+        esc(&error.message),
+        esc(s.config_external_kept),
+    )
+}
+
 fn header(view: &ConfigView, s: &Strings) -> String {
     format!(
         r#"<section class="section">
@@ -987,6 +1001,7 @@ mod tests {
             fingerprint: "fnv64:deadbeef",
             last_applied: "2m ago",
             raw: Some(raw),
+            reload_error: None,
             lang: Lang::En,
         }
     }
