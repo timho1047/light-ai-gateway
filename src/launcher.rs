@@ -390,13 +390,42 @@ pub fn console_url(log: &Path, timeout: Duration) -> Option<String> {
 
 fn parse_console_url(lines: &[String]) -> Option<String> {
     for line in lines.iter().rev() {
-        let Some((_, rest)) = line.split_once("console=") else {
+        // tracing colorises its field names even when the log is a file, so the
+        // invisible console and equals sign may be separated by escape codes.
+        let plain = strip_ansi(line);
+        let Some((_, rest)) = plain.split_once("console=") else {
             continue;
         };
         let token = rest.split_whitespace().next()?;
         return Some(token.trim_end_matches('/').to_string());
     }
     None
+}
+
+fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('?');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 /// Tail the log without loading it more than once per command.
@@ -724,6 +753,21 @@ mod tests {
         ];
         assert_eq!(
             parse_console_url(&lines),
+            Some("http://127.0.0.1:8787".to_string())
+        );
+        let colored = vec![format!(
+            "{}[2m2026-10-18T10:05:00Z{}[0m {}[32m INFO{}[0m {}[3mconsole{}[0m{}[2m={}http://127.0.0.1:8787/",
+            char::from(27),
+            char::from(27),
+            char::from(27),
+            char::from(27),
+            char::from(27),
+            char::from(27),
+            char::from(27),
+            char::from(27),
+        )];
+        assert_eq!(
+            parse_console_url(&colored),
             Some("http://127.0.0.1:8787".to_string())
         );
         assert_eq!(parse_console_url(&[]), None);

@@ -38,6 +38,7 @@ use crate::secrets::CredentialStore;
 use crate::store::{self, Ledger};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 /// Where the configuration file was found.
@@ -291,9 +292,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let ansi = std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+        && std::env::var("TERM").as_deref() != Ok("dumb");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(ansi)
         .try_init();
 }
 
