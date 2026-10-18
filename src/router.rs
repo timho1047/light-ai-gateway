@@ -10,31 +10,38 @@ use crate::domain::{Account, AttemptRecord, GateKind, RequestRecord, TokenUsage,
 use crate::error::UpstreamErrorClass;
 use crate::interval::IntervalLedger;
 use crate::meter::PriceTable;
-use crate::quota::{QuotaProbe, probe_for};
+use crate::runtime::Runtime;
 use crate::store::StoreHandle;
 use crate::tier::TierKey;
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use time::OffsetDateTime;
 
 pub struct Gateway {
-    pub config: Config,
+    /// The configuration snapshot new requests and probes are admitted under.
+    /// In-flight work keeps the Arc it captured, so publishing a replacement
+    /// never rewrites a running request.
+    runtime: RwLock<Arc<Runtime>>,
     pub pool: Pool,
     pub store: StoreHandle,
     /// Where provider credentials live. The operator's real OS credential store
     /// in production; an in-memory store in tests.
     pub credentials: crate::secrets::CredentialStore,
-    pub http: reqwest::Client,
-    pub prices: Mutex<PriceTable>,
+    /// The live learned-price table. It is replaced as a whole rather than
+    /// mutated in place, so a request settles against the table it admitted
+    /// under. The installed Runtime carries a snapshot of the same table, so a
+    /// learned rate reaches new requests without rebuilding the configuration.
+    ///
+    /// Lock order: `prices` before `runtime`. Price learning and publication
+    /// both hold the two locks, and one order across both paths is what keeps a
+    /// concurrent apply and probe from deadlocking.
+    prices: RwLock<Arc<PriceTable>>,
     /// Tokens served since the last probe, and the spend each interval moved.
     interval: Mutex<IntervalLedger>,
-    pub probes: HashMap<String, Arc<dyn QuotaProbe>>,
-    /// Parsed price windows, keyed by (provider, model). Only models with a
-    /// configured schedule appear here; everything else is priced at tier 0.
-    pub schedules: HashMap<(String, String), crate::tier::Schedule>,
 }
 
 impl Gateway {
@@ -72,15 +79,6 @@ impl Gateway {
         accounts.extend(unusable);
         let pool = Pool::new(accounts, &config.policy);
 
-        // Probes are pinned to configured hosts so credentials can never be
-        // redirected to an address that came in with a request.
-        let mut probes: HashMap<String, Arc<dyn QuotaProbe>> = HashMap::new();
-        for (provider, adapter, base_url) in config.probe_targets() {
-            if let Some(p) = probe_for(adapter, &base_url) {
-                probes.insert(provider, p);
-            }
-        }
-
         // The ledger's directory and file modes are the store's business: it
         // creates both private, and a second create_dir_all here would make the
         // directory exist first and take that decision away from it.
@@ -88,66 +86,15 @@ impl Gateway {
         let store = StoreHandle::spawn(&db_path)
             .with_context(|| format!("opening database {}", db_path.display()))?;
 
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(config.policy.connect_timeout_secs))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("building upstream HTTP client")?;
-
-        // Seed the price table from configuration. seed_from_config skips
-        // non-finite and negative entries instead of coercing them: a NaN price
-        // silently becoming zero would make the model look free, and an
-        // under-estimated cost is what lets a request slip into metered spend.
-        let mut prices = PriceTable::new();
-        let configured_models: usize = config.prices.values().map(BTreeMap::len).sum();
-        let seeded = prices.seed_from_config(&config.prices);
-        if seeded < configured_models {
-            tracing::warn!(
-                skipped = configured_models - seeded,
-                "ignored configured prices that are not usable"
-            );
-        }
-
-        // Restore prices learned in an earlier run. Without this every restart
-        // reverts to the conservative default until the next probe, and that
-        // default was measured against live providers to be off by an order of
-        // magnitude in both directions.
-        match crate::store::Ledger::open(&db_path) {
-            Ok(ledger) => match ledger.prices() {
-                Ok(rows) if !rows.is_empty() => {
-                    let n = prices.load_learned(rows);
-                    tracing::info!(count = n, "restored learned prices from disk");
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(error = %e, "could not read learned prices"),
-            },
-            Err(e) => tracing::debug!(error = %e, "no price store to read yet"),
-        }
-
-        // Parse the configured price windows once. Only models that have one
-        // appear here; every other model is priced at tier 0.
-        let mut schedules: HashMap<(String, String), crate::tier::Schedule> = HashMap::new();
-        for (provider, models) in &config.prices {
-            for (model, p) in models {
-                let Ok(s) = p.schedule(provider, model) else {
-                    continue;
-                };
-                if !s.is_empty() {
-                    schedules.insert((provider.clone(), model.clone()), s);
-                }
-            }
-        }
+        let prices = Arc::new(seed_prices(&config, &db_path));
+        let runtime = Arc::new(Runtime::new(Arc::new(config), prices.clone())?);
 
         let gateway = Arc::new(Gateway {
-            config,
+            runtime: RwLock::new(runtime),
             pool,
             store,
             credentials,
-            schedules,
-            http,
-            prices: Mutex::new(prices),
-            probes,
+            prices: RwLock::new(prices),
             interval: Mutex::new(IntervalLedger::new()),
         });
 
@@ -165,7 +112,7 @@ impl Gateway {
 
     /// Load persisted accounts into the pool, then persist the fresh snapshot.
     fn restore_from_disk(&self) {
-        let path = self.config.db_path();
+        let path = self.runtime().config().db_path();
         let Ok(ledger) = crate::store::Ledger::open(&path) else {
             return;
         };
@@ -178,16 +125,36 @@ impl Gateway {
         }
     }
 
-    pub fn resolve(&self, client_model: &str) -> Result<ResolvedRoute> {
-        self.config.resolve(client_model)
+    /// The configuration snapshot new work is admitted under.
+    pub fn runtime(&self) -> Arc<Runtime> {
+        match self.runtime.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// Publish a configuration snapshot. Requests admitted afterwards use it;
+    /// requests already running keep the snapshot they captured. The live price
+    /// table follows the snapshot so learned rates and request settlement never
+    /// point at different tables.
+    pub fn install_runtime(&self, runtime: Arc<Runtime>) {
+        // prices before runtime: the only other place that holds both, price
+        // learning, takes them in this order too.
+        let mut prices = self.prices.write().unwrap_or_else(|e| e.into_inner());
+        let mut installed = self.runtime.write().unwrap_or_else(|e| e.into_inner());
+        *prices = runtime.prices_arc();
+        *installed = runtime;
     }
 
     /// Choose an account for a request.
     ///
     /// A routing failure is not a generic error: it carries how long the client
     /// should wait, so the HTTP layer can answer 429 with a real Retry-After.
+    // Eight arguments, each a different fact about the attempt; see ProxyBackend.
+    #[allow(clippy::too_many_arguments)]
     pub fn plan(
         &self,
+        runtime: &Runtime,
         client_model: &str,
         session_key: Option<&str>,
         est_cost: Decimal,
@@ -195,8 +162,7 @@ impl Gateway {
         attempt_no: u32,
         exclude: &[String],
     ) -> Result<(ResolvedRoute, Reservation), PlanError> {
-        let route = self
-            .config
+        let route = runtime
             .resolve(client_model)
             .map_err(|_| PlanError::UnknownProvider(client_model.to_string()))?;
         let mut reservation = self.pool.select(
@@ -211,23 +177,8 @@ impl Gateway {
         // Fix the price tier now, from the time the request starts. Deciding it
         // later would let a request that began in one window be billed against
         // another.
-        reservation.set_tier(self.tier_at(&route.provider, &route.model, now()));
+        reservation.set_tier(runtime.tier_at(&route.provider, &route.model, now()));
         Ok((route, reservation))
-    }
-
-    /// Which price window a request starting now falls into.
-    ///
-    /// The default price applies when no configured window matches. Getting this
-    /// wrong is off by the peak multiplier -- toward spending when the peak rate
-    /// is higher.
-    pub fn tier_at(&self, provider: &str, model: &str, at: time::OffsetDateTime) -> TierKey {
-        let Some(schedule) = self
-            .schedules
-            .get(&(provider.to_string(), model.to_string()))
-        else {
-            return TierKey::Default;
-        };
-        schedule.tier_at(at)
     }
 
     /// Record a completed attempt that succeeded.
@@ -287,12 +238,17 @@ impl Gateway {
 
     /// Probe every account of every provider that has an adapter.
     pub async fn probe_all(&self) {
+        let runtime = self.runtime();
+        self.probe_all_in(&runtime).await;
+    }
+
+    async fn probe_all_in(&self, runtime: &Runtime) {
         for provider in self.pool.providers() {
-            let Some(_probe) = self.probes.get(&provider) else {
+            if runtime.probe(&provider).is_none() {
                 continue;
-            };
+            }
             for account in self.pool.accounts_of(&provider) {
-                self.probe_one(&provider, &account).await;
+                self.probe_one(runtime, &provider, &account).await;
             }
             self.learn_from_probe(&provider);
         }
@@ -300,6 +256,11 @@ impl Gateway {
 
     /// Probe a single account by id, looking up which provider owns it.
     pub async fn probe_account(&self, provider: &str, account_id: &str) {
+        let runtime = self.runtime();
+        self.probe_account_in(&runtime, provider, account_id).await;
+    }
+
+    async fn probe_account_in(&self, runtime: &Runtime, provider: &str, account_id: &str) {
         let Some(account) = self
             .pool
             .accounts_of(provider)
@@ -308,19 +269,20 @@ impl Gateway {
         else {
             return;
         };
-        self.probe_one(provider, &account).await;
+        self.probe_one(runtime, provider, &account).await;
         self.learn_from_probe(provider);
     }
 
-    /// Refresh one account if policy asks for it before switching to it.
-    pub async fn ensure_fresh(&self, provider: &str, account_id: &str) {
-        if !self.config.policy.probe_before_switch {
+    /// Refresh one account if policy asks for it before switching to it. The
+    /// decision and the probe both use the snapshot that admitted the request.
+    pub async fn ensure_fresh(&self, runtime: &Runtime, provider: &str, account_id: &str) {
+        if !runtime.config().policy.probe_before_switch {
             return;
         }
-        self.probe_account(provider, account_id).await;
+        self.probe_account_in(runtime, provider, account_id).await;
     }
 
-    async fn probe_one(&self, provider: &str, account: &Account) {
+    async fn probe_one(&self, runtime: &Runtime, provider: &str, account: &Account) {
         // Never probe an account we have no credential for. The request would be
         // sent unauthenticated and return 401, overwriting the far more useful
         // "no credential, run lgw keys add ..." message that is already on the
@@ -333,10 +295,10 @@ impl Gateway {
             );
             return;
         }
-        let Some(probe) = self.probes.get(provider).cloned() else {
+        let Some(probe) = runtime.probe(provider) else {
             return;
         };
-        match probe.probe(account, &self.http).await {
+        match probe.probe(account, runtime.http()).await {
             Ok(outcome) => {
                 if outcome.gates.is_empty() {
                     self.pool
@@ -354,7 +316,7 @@ impl Gateway {
                 self.warn_on_ledger_drift(
                     &account.qualified(),
                     &outcome.gates,
-                    self.config.policy.drift_threshold,
+                    runtime.config().policy.drift_threshold,
                 );
                 self.pool
                     .apply_probe(&account.qualified(), outcome.gates, now());
@@ -470,9 +432,18 @@ impl Gateway {
         }
 
         let spend = interval.spend;
-        let Ok(mut prices) = self.prices.lock() else {
+        // The learned table and the snapshot carrying it are published under
+        // both write locks, so a request can never be admitted between the two
+        // and see a stale price table. prices is taken before runtime, the same
+        // order as install_runtime; the two paths must agree or a concurrent
+        // apply and probe can deadlock.
+        let Ok(mut prices) = self.prices.write() else {
             return;
         };
+        let Ok(mut installed) = self.runtime.write() else {
+            return;
+        };
+        let mut learned = (**prices).clone();
 
         // Split the interval's spend across the tiers that were actually used, in
         // proportion to what each tier was expected to cost. A tick that only
@@ -483,7 +454,7 @@ impl Gateway {
             let expected: Vec<Decimal> = tiers
                 .iter()
                 .map(|(tier, usage)| {
-                    prices
+                    learned
                         .estimate(provider, &model, tier, usage, Decimal::ONE)
                         .unwrap_or_else(|| crate::meter::conservative_estimate(usage, Decimal::ONE))
                 })
@@ -495,10 +466,15 @@ impl Gateway {
                 } else {
                     Decimal::ONE / Decimal::from(tiers.len().max(1) as u64)
                 };
-                prices.observe(provider, &model, tier, spend * share, usage);
+                learned.observe(provider, &model, tier, spend * share, usage);
             }
         }
+        let learned = Arc::new(learned);
+        let current = Arc::clone(&installed);
+        *installed = current.with_prices(Arc::clone(&learned));
+        *prices = learned;
         drop(prices);
+        drop(installed);
 
         // Surface a model whose observed price no longer matches what was
         // configured: that is either a real repricing or a quiet one, and both
@@ -510,7 +486,7 @@ impl Gateway {
     /// Log every model whose observed price has diverged materially from the
     /// configured expectation.
     fn warn_on_price_drift(&self) {
-        let Ok(prices) = self.prices.lock() else {
+        let Ok(prices) = self.prices.read() else {
             return;
         };
         for (provider, model, tier, d) in prices.drifted() {
@@ -530,7 +506,7 @@ impl Gateway {
 
     /// Persist learned prices so a restart does not fall back to the default.
     pub fn save_prices(&self) {
-        let rows = match self.prices.lock() {
+        let rows = match self.prices.read() {
             Ok(p) => p.learned_rows(),
             Err(_) => return,
         };
@@ -574,20 +550,27 @@ impl Gateway {
             // Give the initial probe a moment to settle before the first tick.
             tokio::time::sleep(Duration::from_secs(5)).await;
             loop {
-                let idle = this.pool.idle_for();
-                let p = &this.config.policy;
-                let secs = if idle < Duration::from_secs(300) {
-                    p.poll_interval_active_secs
-                } else if idle < Duration::from_secs(1800) {
-                    p.poll_interval_secs
-                } else {
-                    p.poll_interval_idle_secs
-                }
-                .max(15);
+                let secs = {
+                    let runtime = this.runtime();
+                    let p = &runtime.config().policy;
+                    let idle = this.pool.idle_for();
+                    if idle < Duration::from_secs(300) {
+                        p.poll_interval_active_secs
+                    } else if idle < Duration::from_secs(1800) {
+                        p.poll_interval_secs
+                    } else {
+                        p.poll_interval_idle_secs
+                    }
+                    .max(15)
+                };
 
                 tokio::time::sleep(Duration::from_secs(secs)).await;
 
-                this.probe_all().await;
+                // The cadence above and the probes below each read the snapshot
+                // current at their moment, so a policy published during the sleep
+                // governs the probe it should.
+                let runtime = this.runtime();
+                this.probe_all_in(&runtime).await;
                 this.save_accounts();
             }
         });
@@ -603,4 +586,38 @@ impl Gateway {
     pub fn snapshot(&self) -> Vec<Account> {
         self.pool.snapshot()
     }
+}
+
+/// Seed the price table from configuration, then restore what earlier runs
+/// learned.
+fn seed_prices(config: &Config, db_path: &Path) -> PriceTable {
+    // seed_from_config skips non-finite and negative entries instead of coercing
+    // them: a NaN price silently becoming zero would make the model look free,
+    // and an under-estimated cost is what lets a request slip into metered spend.
+    let mut prices = PriceTable::new();
+    let configured_models: usize = config.prices.values().map(BTreeMap::len).sum();
+    let seeded = prices.seed_from_config(&config.prices);
+    if seeded < configured_models {
+        tracing::warn!(
+            skipped = configured_models - seeded,
+            "ignored configured prices that are not usable"
+        );
+    }
+
+    // Restore prices learned in an earlier run. Without this every restart
+    // reverts to the conservative default until the next probe, and that
+    // default was measured against live providers to be off by an order of
+    // magnitude in both directions.
+    match crate::store::Ledger::open(db_path) {
+        Ok(ledger) => match ledger.prices() {
+            Ok(rows) if !rows.is_empty() => {
+                let n = prices.load_learned(rows);
+                tracing::info!(count = n, "restored learned prices from disk");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not read learned prices"),
+        },
+        Err(e) => tracing::debug!(error = %e, "no price store to read yet"),
+    }
+    prices
 }

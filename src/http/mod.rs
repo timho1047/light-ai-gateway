@@ -18,6 +18,7 @@ use crate::config::{Config, ResolvedRoute};
 use crate::domain::{Account, ApiKey, AttemptRecord, RequestRecord, TokenUsage};
 use crate::error::UpstreamErrorClass;
 use crate::router::Gateway;
+use crate::runtime::Runtime;
 use crate::tier::TierKey;
 use anyhow::{Context, Result};
 use axum::Router;
@@ -39,13 +40,24 @@ use time::OffsetDateTime;
 /// This seam exists so the router can be driven end-to-end in tests without a
 /// live database or a probed pool. GatewayBackend is the production wiring;
 /// every method mirrors a frozen Gateway/pool signature.
+///
+/// Configuration is never lent out by the backend: a handler captures the
+/// [`Runtime`] once at admission with [`ProxyBackend::runtime`] and passes it to
+/// every method that needs configuration, so a later publication cannot change
+/// the route, timeout or price an in-flight request is running under.
 pub trait ProxyBackend: Send + Sync + 'static {
-    fn config(&self) -> &Config;
+    /// The configuration snapshot new requests are admitted under.
+    fn runtime(&self) -> Arc<Runtime>;
 
-    fn resolve(&self, client_model: &str) -> Result<ResolvedRoute>;
+    fn resolve(&self, runtime: &Runtime, client_model: &str) -> Result<ResolvedRoute>;
 
+    // Eight arguments, each a different fact about the attempt: the snapshot it
+    // admits under, the model, the session, the estimate, and which attempt of
+    // which request this is. A struct would move the same list one line up.
+    #[allow(clippy::too_many_arguments)]
     fn plan(
         &self,
+        runtime: &Runtime,
         client_model: &str,
         session_key: Option<&str>,
         est_cost: Decimal,
@@ -83,6 +95,7 @@ pub trait ProxyBackend: Send + Sync + 'static {
     /// filled up since the last poll.
     fn ensure_fresh<'a>(
         &'a self,
+        _runtime: &'a Runtime,
         _provider: &'a str,
         _account_id: &'a str,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
@@ -91,15 +104,16 @@ pub trait ProxyBackend: Send + Sync + 'static {
 
     fn retry_after_for(&self, provider: &str) -> Option<Duration>;
 
-    fn http(&self) -> reqwest::Client;
+    fn http(&self, runtime: &Runtime) -> reqwest::Client;
 
     /// Which price window a request starting now falls into.
-    fn tier_at(&self, provider: &str, model: &str) -> TierKey;
+    fn tier_at(&self, runtime: &Runtime, provider: &str, model: &str) -> TierKey;
 
     /// Price a usage sample through the learned price table. None means the
     /// model is unknown and the caller must fall back conservatively.
     fn estimate_cost(
         &self,
+        runtime: &Runtime,
         provider: &str,
         model: &str,
         tier: &TierKey,
@@ -145,16 +159,17 @@ impl GatewayBackend {
 }
 
 impl ProxyBackend for GatewayBackend {
-    fn config(&self) -> &Config {
-        &self.gateway.config
+    fn runtime(&self) -> Arc<Runtime> {
+        self.gateway.runtime()
     }
 
-    fn resolve(&self, client_model: &str) -> Result<ResolvedRoute> {
-        self.gateway.resolve(client_model)
+    fn resolve(&self, runtime: &Runtime, client_model: &str) -> Result<ResolvedRoute> {
+        runtime.resolve(client_model)
     }
 
     fn plan(
         &self,
+        runtime: &Runtime,
         client_model: &str,
         session_key: Option<&str>,
         est_cost: Decimal,
@@ -163,6 +178,7 @@ impl ProxyBackend for GatewayBackend {
         exclude: &[String],
     ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError> {
         self.gateway.plan(
+            runtime,
             client_model,
             session_key,
             est_cost,
@@ -202,11 +218,14 @@ impl ProxyBackend for GatewayBackend {
 
     fn ensure_fresh<'a>(
         &'a self,
+        runtime: &'a Runtime,
         provider: &'a str,
         account_id: &'a str,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            self.gateway.ensure_fresh(provider, account_id).await;
+            self.gateway
+                .ensure_fresh(runtime, provider, account_id)
+                .await;
         })
     }
 
@@ -214,27 +233,26 @@ impl ProxyBackend for GatewayBackend {
         self.gateway.pool.retry_after_for(provider)
     }
 
-    fn http(&self) -> reqwest::Client {
-        self.gateway.http.clone()
+    fn http(&self, runtime: &Runtime) -> reqwest::Client {
+        runtime.http().clone()
     }
 
-    fn tier_at(&self, provider: &str, model: &str) -> TierKey {
-        self.gateway.tier_at(provider, model, crate::domain::now())
+    fn tier_at(&self, runtime: &Runtime, provider: &str, model: &str) -> TierKey {
+        runtime.tier_at(provider, model, crate::domain::now())
     }
 
     fn estimate_cost(
         &self,
+        runtime: &Runtime,
         provider: &str,
         model: &str,
         tier: &TierKey,
         usage: &TokenUsage,
         multiplier: Decimal,
     ) -> Option<Decimal> {
-        self.gateway
-            .prices
-            .lock()
-            .ok()
-            .and_then(|prices| prices.estimate(provider, model, tier, usage, multiplier))
+        runtime
+            .prices()
+            .estimate(provider, model, tier, usage, multiplier)
     }
 
     fn record_success(
@@ -290,8 +308,11 @@ pub fn build_router(gateway: Arc<Gateway>) -> axum::Router {
 
 /// Build the router against any backend. Exposed for integration tests.
 pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
-    let max_body_bytes = backend.config().policy.max_body_bytes;
-    let auth = match &backend.config().server.local_key {
+    // Authentication and the body limit are startup decisions: they follow the
+    // snapshot installed when the listener was assembled, not a later publish.
+    let runtime = backend.runtime();
+    let max_body_bytes = runtime.config().policy.max_body_bytes;
+    let auth = match &runtime.config().server.local_key {
         None => {
             // Serving without a local key means anything that can reach the port
             // can spend this account's quota. The configuration template calls
@@ -299,7 +320,7 @@ pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
             // it was missing -- the operator's only evidence was a template they
             // had already closed.
             tracing::warn!(
-                listen = %backend.config().server.listen,
+                listen = %runtime.config().server.listen,
                 "server.local_key is not configured: anything able to reach this address \
                  can spend the pooled quota. Set one with 'lgw keys add local gateway', \
                  then local_key = {{ keychain = true }}"

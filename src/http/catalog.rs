@@ -5,6 +5,7 @@
 
 use super::{ProxyBackend, read_bounded, upstream_error_message};
 use crate::domain::ApiKey;
+use crate::runtime::Runtime;
 use axum::http::header;
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -72,6 +73,7 @@ fn catalog_from(value: Value) -> Catalog {
 /// Read one provider's catalog with an eligible account's key, through the pool.
 pub(super) async fn catalog_for_provider(
     backend: &dyn ProxyBackend,
+    runtime: &Runtime,
     provider: &str,
     request_id: &str,
 ) -> std::result::Result<Catalog, String> {
@@ -86,7 +88,7 @@ pub(super) async fn catalog_for_provider(
     let Some(account) = backend.account(&plan.qualified_account()) else {
         return Err("the planned account is no longer in the pool".to_string());
     };
-    fetch_catalog(&backend.http(), &account.base_url, &account.api_key).await
+    fetch_catalog(&backend.http(runtime), &account.base_url, &account.api_key).await
 }
 
 /// Read and parse one provider's model catalog.

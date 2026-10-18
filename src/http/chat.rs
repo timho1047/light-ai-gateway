@@ -25,6 +25,7 @@ use super::{
 use crate::accounts::{AttemptPlan, PlanError, Reservation};
 use crate::domain::{AttemptRecord, GateClass, RequestRecord, RequestStatus, TokenUsage, now};
 use crate::error::{ErrorSignals, UpstreamErrorClass, parse_error_body, parse_retry_after};
+use crate::runtime::Runtime;
 use crate::sse::{MeterMode, StreamMeter, inject_include_usage};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -69,6 +70,10 @@ pub(super) async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // One snapshot for the whole request: routing, retries, timeouts and the
+    // price it settles at all come from the configuration that admitted it.
+    let runtime = state.backend.runtime();
+
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -104,7 +109,7 @@ pub(super) async fn chat_completions(
     // Captured outside the retry loop so a total failure can still be recorded.
     let request_started = now();
 
-    let route = match state.backend.resolve(&client_model) {
+    let route = match state.backend.resolve(&runtime, &client_model) {
         Ok(route) => route,
         Err(e) => {
             return error_response(
@@ -118,6 +123,7 @@ pub(super) async fn chat_completions(
     let estimated_prompt_tokens = crate::meter::estimate_prompt_tokens(&value);
     let est_cost = estimate_request_cost(
         state.backend.as_ref(),
+        &runtime,
         &route.provider,
         &route.model,
         &value,
@@ -133,7 +139,7 @@ pub(super) async fn chat_completions(
         upstream_body = Bytes::from(bytes);
     }
 
-    let max_attempts = state.backend.config().policy.max_retries.max(1);
+    let max_attempts = runtime.config().policy.max_retries.max(1);
     // How long we wait for the upstream to START answering.
     //
     // This used to be connect_timeout_secs, which is a TCP-connect budget. A
@@ -141,8 +147,7 @@ pub(super) async fn chat_completions(
     // generated the entire completion, so any legitimate non-streaming request
     // slower than ten seconds was cancelled, marked unbilled, and retried --
     // possibly paying for the same completion twice.
-    let header_timeout =
-        Duration::from_secs(state.backend.config().policy.ttft_timeout_secs.max(1));
+    let header_timeout = Duration::from_secs(runtime.config().policy.ttft_timeout_secs.max(1));
 
     let mut attempt_no: u32 = 1;
     let mut last_failure: Option<Failure> = None;
@@ -155,6 +160,7 @@ pub(super) async fn chat_completions(
 
     while attempt_no <= max_attempts {
         let reservation = match state.backend.plan(
+            &runtime,
             &client_model,
             session_key.as_deref(),
             est_cost,
@@ -175,7 +181,7 @@ pub(super) async fn chat_completions(
         {
             state
                 .backend
-                .ensure_fresh(&reservation.provider, &reservation.account_id)
+                .ensure_fresh(&runtime, &reservation.provider, &reservation.account_id)
                 .await;
         }
         previous_account = Some(qualified.clone());
@@ -222,7 +228,7 @@ pub(super) async fn chat_completions(
         let started = Instant::now();
         let request = state
             .backend
-            .http()
+            .http(&runtime)
             .post(&url)
             .bearer_auth(account.api_key.expose())
             .header(header::CONTENT_TYPE, "application/json")
@@ -419,6 +425,7 @@ pub(super) async fn chat_completions(
         let is_sse = content_type.contains("text/event-stream");
         let finalizer = Finalizer {
             backend: state.backend.clone(),
+            runtime: runtime.clone(),
             reservation,
             request_id: request_id.clone(),
             client_model: client_model.clone(),
@@ -435,8 +442,7 @@ pub(super) async fn chat_completions(
             MeterMode::Sse => StreamMeter::sse(),
             MeterMode::Json => StreamMeter::json(),
         };
-        let idle_timeout =
-            Duration::from_secs(state.backend.config().policy.idle_timeout_secs.max(1));
+        let idle_timeout = Duration::from_secs(runtime.config().policy.idle_timeout_secs.max(1));
         let relay = RelayStream {
             inner: Box::pin(response.bytes_stream()),
             meter,
@@ -598,6 +604,7 @@ fn record_attempt_failure(
 
 fn estimate_request_cost(
     backend: &dyn ProxyBackend,
+    runtime: &Runtime,
     provider: &str,
     model: &str,
     body: &Value,
@@ -613,9 +620,9 @@ fn estimate_request_cost(
         completion_tokens: completion,
         ..Default::default()
     };
-    let tier = backend.tier_at(provider, model);
+    let tier = backend.tier_at(runtime, provider, model);
     backend
-        .estimate_cost(provider, model, &tier, &probe, Decimal::ONE)
+        .estimate_cost(runtime, provider, model, &tier, &probe, Decimal::ONE)
         // One shared definition of "unknown model" across the whole request
         // path: two different fallback constants would mean the gate and the
         // finalizer disagreed about what a request costs.
@@ -659,6 +666,8 @@ fn provider_request_id(headers: &HeaderMap) -> Option<String> {
 /// dropping the partial usage on the floor would understate the ledger.
 pub(super) struct Finalizer {
     pub(super) backend: Arc<dyn ProxyBackend>,
+    /// The snapshot that admitted this attempt; settlement prices from it.
+    pub(super) runtime: Arc<Runtime>,
     /// The attempt's commitment. The relay settles it when the body ends, and
     /// dropping it unsettled returns it.
     pub(super) reservation: Reservation,
@@ -730,6 +739,7 @@ impl RelayStream {
         let cost = f
             .backend
             .estimate_cost(
+                &f.runtime,
                 &f.reservation.provider,
                 &f.reservation.model,
                 &f.reservation.tier,

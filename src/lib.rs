@@ -14,6 +14,7 @@ pub mod meter;
 pub mod quota;
 pub mod quota_report;
 pub mod router;
+pub mod runtime;
 pub mod secrets;
 pub mod sse;
 pub mod store;

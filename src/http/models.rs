@@ -36,10 +36,13 @@ pub(super) async fn list_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
 ) -> Response {
+    // One snapshot for the whole list: the routes and provider views it renders
+    // come from the configuration that admitted it.
+    let runtime = state.backend.runtime();
     let backend = state.backend.as_ref();
 
     if let Some(named) = &query.provider
-        && !backend.config().providers.contains_key(named)
+        && !runtime.config().providers.contains_key(named)
     {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -50,7 +53,7 @@ pub(super) async fn list_models(
 
     // routes is model -> provider, and it iterates in model order, which is the
     // order a reader scans a model list in.
-    let routes: Vec<(String, String)> = backend
+    let routes: Vec<(String, String)> = runtime
         .config()
         .routes
         .iter()
@@ -71,7 +74,7 @@ pub(super) async fn list_models(
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut catalogs: BTreeMap<&str, Catalog> = BTreeMap::new();
     for provider in wanted.keys() {
-        match catalog_for_provider(backend, provider, &request_id).await {
+        match catalog_for_provider(backend, &runtime, provider, &request_id).await {
             Ok(catalog) => {
                 let unmatched: Vec<&str> = wanted[provider]
                     .iter()

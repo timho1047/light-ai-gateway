@@ -5,10 +5,13 @@ use super::*;
 use crate::accounts::{Pool, gate};
 use crate::config::{Config, SecretRef};
 use crate::domain::{GateClass, GateKind, RequestStatus, now};
+use crate::meter::PriceTable;
+use crate::runtime::Runtime;
 use crate::sse::StreamMeter;
 use axum::body::Bytes;
 use serde_json::json;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -27,6 +30,11 @@ enum MockMode {
     /// refused at planning time and the upstream text never reaches a
     /// client at all.
     EchoKeyOn400,
+    /// Sends the response headers, reports that the request has arrived, then
+    /// waits for the test to release the body before the first SSE chunk. Later
+    /// calls stream normally, so one mock can hold the first request and serve
+    /// the next.
+    HoldStream,
 }
 
 /// What a provider answers `GET /models` with. The default is the one model
@@ -39,6 +47,11 @@ struct MockUpstream {
     bearers: Mutex<Vec<String>>,
     bodies: Mutex<Vec<Value>>,
     catalog: String,
+    /// `HoldStream`: fired once the request has arrived and its headers are
+    /// about to be sent.
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// `HoldStream`: waited on before the first body chunk.
+    release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 async fn mock_models(State(m): State<Arc<MockUpstream>>, headers: HeaderMap) -> Response {
@@ -120,6 +133,34 @@ async fn mock_chat(
         return response;
     }
 
+    let sse = mock_sse();
+    let body = if m.mode == MockMode::HoldStream {
+        // Headers go out with the response; the first body chunk waits for the
+        // test. That makes "in flight" observable: the request has been admitted
+        // and relayed, and nothing has settled yet.
+        if let Some(started) = m.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let release = m.release.lock().unwrap().take();
+        Body::from_stream(futures_util::stream::once(async move {
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            Ok::<Bytes, std::io::Error>(Bytes::from(sse))
+        }))
+    } else {
+        Body::from(sse)
+    };
+    let mut response = Response::new(body);
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    response
+}
+
+/// The SSE body every successful streaming response carries: hello, finish and
+/// the usage frame the settlement assertions read.
+fn mock_sse() -> String {
     let mut sse = String::new();
     for chunk in [
         json!({"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
@@ -132,11 +173,7 @@ async fn mock_chat(
         sse.push_str("\n\n");
     }
     sse.push_str("data: [DONE]\n\n");
-    let mut response = Response::new(Body::from(sse));
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
-    response
+    sse
 }
 
 async fn spawn_mock(mode: MockMode) -> (String, Arc<MockUpstream>) {
@@ -151,7 +188,36 @@ async fn spawn_mock_with_catalog(mode: MockMode, catalog: &str) -> (String, Arc<
         bearers: Mutex::new(Vec::new()),
         bodies: Mutex::new(Vec::new()),
         catalog: catalog.to_string(),
+        started: Mutex::new(None),
+        release: Mutex::new(None),
     });
+    spawn_mock_state(state).await
+}
+
+/// A mock that reports when a chat request has arrived, then holds its first SSE
+/// chunk until the test releases it.
+async fn spawn_held_mock() -> (
+    String,
+    Arc<MockUpstream>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let state = Arc::new(MockUpstream {
+        mode: MockMode::HoldStream,
+        calls: AtomicUsize::new(0),
+        bearers: Mutex::new(Vec::new()),
+        bodies: Mutex::new(Vec::new()),
+        catalog: MOCK_CATALOG.to_string(),
+        started: Mutex::new(Some(started)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let (url, state) = spawn_mock_state(state).await;
+    (url, state, started_rx, release)
+}
+
+async fn spawn_mock_state(state: Arc<MockUpstream>) -> (String, Arc<MockUpstream>) {
     let app = Router::new()
         .route("/chat/completions", post(mock_chat))
         .route("/models", get(mock_models))
@@ -181,9 +247,8 @@ struct RecordedFailure {
 }
 
 struct FakeBackend {
-    config: Config,
+    runtime: RwLock<Arc<Runtime>>,
     pool: Pool,
-    http: reqwest::Client,
     successes: Mutex<Vec<RecordedSuccess>>,
     failures: Mutex<Vec<RecordedFailure>>,
 }
@@ -191,26 +256,40 @@ struct FakeBackend {
 impl FakeBackend {
     fn new(config: Config, pool: Pool) -> Self {
         FakeBackend {
-            config,
+            runtime: RwLock::new(runtime_for(&config)),
             pool,
-            http: reqwest::Client::new(),
             successes: Mutex::new(Vec::new()),
             failures: Mutex::new(Vec::new()),
         }
     }
+
+    /// The publication the production gateway exposes to the apply engine:
+    /// requests admitted after this call use the new snapshot.
+    fn install_runtime(&self, runtime: Arc<Runtime>) {
+        *self.runtime.write().unwrap() = runtime;
+    }
+}
+
+/// The snapshot a test backend admits under: configured prices seeded the way
+/// `Gateway::with_credentials` seeds them.
+fn runtime_for(config: &Config) -> Arc<Runtime> {
+    let mut prices = PriceTable::new();
+    prices.seed_from_config(&config.prices);
+    Arc::new(Runtime::new(Arc::new(config.clone()), Arc::new(prices)).unwrap())
 }
 
 impl ProxyBackend for FakeBackend {
-    fn config(&self) -> &Config {
-        &self.config
+    fn runtime(&self) -> Arc<Runtime> {
+        self.runtime.read().unwrap().clone()
     }
 
-    fn resolve(&self, client_model: &str) -> Result<ResolvedRoute> {
-        self.config.resolve(client_model)
+    fn resolve(&self, runtime: &Runtime, client_model: &str) -> Result<ResolvedRoute> {
+        runtime.resolve(client_model)
     }
 
     fn plan(
         &self,
+        runtime: &Runtime,
         client_model: &str,
         session_key: Option<&str>,
         est_cost: Decimal,
@@ -218,8 +297,7 @@ impl ProxyBackend for FakeBackend {
         attempt_no: u32,
         exclude: &[String],
     ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError> {
-        let route = self
-            .config
+        let route = runtime
             .resolve(client_model)
             .map_err(|e| PlanError::UnknownProvider(e.to_string()))?;
         let plan = self.pool.select(
@@ -262,23 +340,26 @@ impl ProxyBackend for FakeBackend {
         self.pool.retry_after_for(provider)
     }
 
-    fn http(&self) -> reqwest::Client {
-        self.http.clone()
+    fn http(&self, runtime: &Runtime) -> reqwest::Client {
+        runtime.http().clone()
     }
 
-    fn tier_at(&self, _provider: &str, _model: &str) -> TierKey {
+    fn tier_at(&self, _runtime: &Runtime, _provider: &str, _model: &str) -> TierKey {
         TierKey::Default
     }
 
     fn estimate_cost(
         &self,
-        _provider: &str,
-        _model: &str,
-        _tier: &TierKey,
-        _usage: &TokenUsage,
-        _multiplier: Decimal,
+        runtime: &Runtime,
+        provider: &str,
+        model: &str,
+        tier: &TierKey,
+        usage: &TokenUsage,
+        multiplier: Decimal,
     ) -> Option<Decimal> {
-        None
+        runtime
+            .prices()
+            .estimate(provider, model, tier, usage, multiplier)
     }
 
     fn record_success(
@@ -361,8 +442,50 @@ fn activate(pool: &Pool, qualified_id: &str, used: i64) {
     pool.apply_probe(qualified_id, gates, now());
 }
 
+/// A config whose mock provider publishes a per-million price, so settlement can
+/// be attributed to the snapshot a request admitted under.
+fn priced_config(base_url: &str, input: f64, output: f64) -> Config {
+    let toml = format!(
+        r#"
+[server]
+listen = "127.0.0.1:0"
+
+[policy]
+max_retries = 3
+
+[providers.mock]
+adapter = "none"
+base_url = "{base_url}"
+
+[providers.mock.accounts.a1]
+key = "sk-a1"
+
+[providers.mock.accounts.a2]
+key = "sk-a2"
+
+[prices.mock."mock/model"]
+input = {input}
+output = {output}
+
+[routes]
+"mock/model" = "mock"
+"#
+    );
+    Config::from_toml_str(&toml).unwrap()
+}
+
+fn table_for(config: &Config) -> PriceTable {
+    let mut table = PriceTable::new();
+    table.seed_from_config(&config.prices);
+    table
+}
+
 fn fake_backend(base_url: &str) -> Arc<FakeBackend> {
-    let config = test_config(base_url);
+    fake_backend_with_config(test_config(base_url))
+}
+
+/// A fake backend with both mock accounts probed, built from any config.
+fn fake_backend_with_config(config: Config) -> Arc<FakeBackend> {
     let accounts = config
         .build_accounts(&crate::secrets::CredentialStore::memory())
         .unwrap();
@@ -1043,6 +1166,7 @@ async fn dropping_the_relay_records_a_partial_aborted_request() {
         b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n";
     let finalizer = Finalizer {
         backend: fake.clone(),
+        runtime: fake.runtime(),
         reservation,
         request_id: "req-1".to_string(),
         client_model: "mock/model".to_string(),
@@ -1080,4 +1204,117 @@ async fn dropping_the_relay_records_a_partial_aborted_request() {
     assert_eq!(successes[0].attempt.bytes_sent, payload.len() as u64);
     assert!(successes[0].attempt.billed);
     assert!(successes[0].attempt.ttft_ms.is_some());
+}
+
+/// A snapshot published while a request is in flight: that request settles on
+/// the snapshot that admitted it, and a request started afterwards uses the new
+/// one. This is the seam the apply engine will publish through.
+#[tokio::test]
+async fn a_published_snapshot_does_not_reprice_an_in_flight_request() {
+    let (upstream_url, _mock, started, release) = spawn_held_mock().await;
+    let config = priced_config(&upstream_url, 1.0, 2.0);
+    let fake = fake_backend_with_config(config.clone());
+    let addr = spawn_router(build_router_with(fake.clone())).await;
+
+    // The first request is admitted, reaches the upstream and holds before its
+    // first chunk: it is genuinely in flight.
+    let client = reqwest::Client::new();
+    let url = format!("{addr}/v1/chat/completions");
+    let first = {
+        let client = client.clone();
+        let url = url.clone();
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .json(&chat_body(true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        })
+    };
+    started.await.unwrap();
+    assert!(
+        fake.successes.lock().unwrap().is_empty(),
+        "the request must still be in flight when the snapshot is published"
+    );
+
+    // Publish a snapshot whose configured price is a hundred times higher.
+    let second_config = priced_config(&upstream_url, 100.0, 200.0);
+    fake.install_runtime(runtime_for(&second_config));
+    release.send(()).unwrap();
+
+    let relayed = first.await.unwrap();
+    assert!(
+        relayed.contains("[DONE]"),
+        "the held stream must complete: {relayed}"
+    );
+    wait_for_successes(&fake, 1).await;
+
+    let old_prices = table_for(&config);
+    let new_prices = table_for(&second_config);
+    let usage = fake.successes.lock().unwrap()[0].usage.clone();
+    let at_admission = old_prices
+        .estimate(
+            "mock",
+            "mock/model",
+            &TierKey::Default,
+            &usage,
+            Decimal::ONE,
+        )
+        .expect("the first snapshot prices this model");
+    let after_publish = new_prices
+        .estimate(
+            "mock",
+            "mock/model",
+            &TierKey::Default,
+            &usage,
+            Decimal::ONE,
+        )
+        .expect("the second snapshot prices this model");
+    assert_ne!(
+        at_admission, after_publish,
+        "the published config must actually change the price"
+    );
+
+    {
+        let successes = fake.successes.lock().unwrap();
+        assert_eq!(
+            successes[0].cost, at_admission,
+            "the in-flight request must settle at the price that admitted it"
+        );
+        assert_eq!(
+            successes[0].record.cost, at_admission,
+            "the ledger row must carry the admission-time cost"
+        );
+    }
+
+    // A request admitted after the publish uses the new price.
+    let response = client
+        .post(format!("{addr}/v1/chat/completions"))
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let _ = response.text().await.unwrap();
+    wait_for_successes(&fake, 2).await;
+
+    let successes = fake.successes.lock().unwrap();
+    let later = &successes[1];
+    let later_expected = new_prices
+        .estimate(
+            "mock",
+            "mock/model",
+            &TierKey::Default,
+            &later.usage,
+            Decimal::ONE,
+        )
+        .expect("the second snapshot prices this model");
+    assert_eq!(
+        later.cost, later_expected,
+        "a request admitted after the publish uses the new price"
+    );
 }
