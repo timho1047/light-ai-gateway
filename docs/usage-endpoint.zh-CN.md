@@ -1,6 +1,6 @@
 # GET /v1/usage
 
-**状态：** 已实现，代码在 `src/quota_report.rs` 和 `src/proxy.rs` 里的 `usage` 处理器。本文件是这两者要守的契约：下面这些路径是公开的，挂件模板一旦钉在上面，路径一动就会坏。
+**状态：** 已实现，代码在 `src/quota_report.rs` 和 `src/http/usage.rs` 里的 `usage` 处理器。本文件是这两者要守的契约：下面这些路径是公开的，挂件模板一旦钉在上面，路径一动就会坏。
 
 [English](usage-endpoint.md) | **简体中文**
 
@@ -285,7 +285,7 @@ disabled 账号仍然贡献它们手里的 gate。全部 disabled 但 gate 还�
 - `src/usage.rs`：纯函数 `usage_report`，输入是快照加查询过滤，输出响应 DTO
   （或错误）。
 - `ProxyBackend::snapshot()`：最近已知的账号。handler 读内存，不探测。
-- `proxy.rs`：`GET /v1/usage` 挂在与 `/v1/models` 同一条 router 上，
+- `src/http/usage.rs`：`GET /v1/usage` 挂在与 `/v1/models` 同一条 router 上，
   `require_local_key` 后面。
 - `accounts[]` 的金额字段是 Decimal **文本**，不是 `f64`。
 

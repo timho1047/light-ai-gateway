@@ -265,10 +265,12 @@ pub(super) async fn cmd_doctor(
             println!("  {provider}: skipped, no usable credential to ask with");
             continue;
         };
-        match crate::proxy::fetch_catalog(&client, &account.base_url, &account.api_key).await {
+        match crate::http::catalog::fetch_catalog(&client, &account.base_url, &account.api_key)
+            .await
+        {
             Ok(catalog) => {
                 for model in routes {
-                    if crate::proxy::publishes(&catalog, model) {
+                    if crate::http::catalog::publishes(&catalog, model) {
                         println!("  {model} ({provider}): {}", pal.green("ok"));
                         continue;
                     }

@@ -1,7 +1,7 @@
 # GET /v1/usage
 
 **Status:** implemented, in `src/quota_report.rs` and the `usage` handler in
-`src/proxy.rs`. This file is the contract those two are held to: the paths below
+`src/http/usage.rs`. This file is the contract those two are held to: the paths below
 are public, and a widget template pinned to them breaks if they move.
 
 **English** | [简体中文](usage-endpoint.zh-CN.md)
@@ -305,7 +305,7 @@ Do not live-probe to recover from 503.
   query filter to the response DTO (or an error).
 - `ProxyBackend::snapshot()`: the last-known accounts. The handler reads
   memory; it does not probe.
-- `proxy.rs`: `GET /v1/usage` on the same router as `/v1/models`, behind
+- `src/http/usage.rs`: `GET /v1/usage` on the same router as `/v1/models`, behind
   `require_local_key`.
 - `accounts[]` money fields are Decimal **text**, not `f64`.
 

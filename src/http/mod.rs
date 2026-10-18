@@ -1,0 +1,482 @@
+//! HTTP front end: the OpenAI-compatible `/v1` surface.
+//!
+//! [`build_router`] is the one assembly point: the routes, the local-key
+//! middleware, the request body limit and the listener. Handlers live in the
+//! modules beside this file; the chat-completions retry and relay rules are
+//! documented in `chat`.
+
+pub(crate) mod catalog;
+mod chat;
+mod models;
+mod usage;
+
+#[cfg(test)]
+mod tests;
+
+use crate::accounts::{AttemptPlan, PlanError, Reservation};
+use crate::config::{Config, ResolvedRoute};
+use crate::domain::{Account, ApiKey, AttemptRecord, RequestRecord, TokenUsage};
+use crate::error::UpstreamErrorClass;
+use crate::router::Gateway;
+use crate::tier::TierKey;
+use anyhow::{Context, Result};
+use axum::Router;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use axum::routing::{get, post};
+use rust_decimal::Decimal;
+use serde_json::{Value, json};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use time::OffsetDateTime;
+
+/// The slice of gateway behaviour the HTTP layer needs.
+///
+/// This seam exists so the router can be driven end-to-end in tests without a
+/// live database or a probed pool. GatewayBackend is the production wiring;
+/// every method mirrors a frozen Gateway/pool signature.
+pub trait ProxyBackend: Send + Sync + 'static {
+    fn config(&self) -> &Config;
+
+    fn resolve(&self, client_model: &str) -> Result<ResolvedRoute>;
+
+    fn plan(
+        &self,
+        client_model: &str,
+        session_key: Option<&str>,
+        est_cost: Decimal,
+        request_id: &str,
+        attempt_no: u32,
+        exclude: &[String],
+    ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError>;
+
+    /// Pick an account for a request that has no model of its own, such as the
+    /// model-list passthrough.
+    fn pick_account(
+        &self,
+        provider: &str,
+        est_cost: Decimal,
+        request_id: &str,
+        attempt_no: u32,
+    ) -> std::result::Result<AttemptPlan, PlanError>;
+
+    /// Look up an account by canonical provider/id identity.
+    fn account(&self, qualified_id: &str) -> Option<Account>;
+
+    /// Every account the pool knows, with its last-known gates.
+    ///
+    /// What the poller last saw, never a fresh probe. The usage report is read
+    /// on a dashboard's timer, and a report that costs an upstream call is one
+    /// nobody can afford to leave open.
+    fn snapshot(&self) -> Vec<Account>;
+
+    /// Refresh an account's quota reading immediately before switching to it.
+    ///
+    /// A boxed future rather than an async-trait method so the default can be a
+    /// no-op and test backends need no implementation. The real gateway honours
+    /// policy.probe_before_switch; without this call that setting was parsed and
+    /// then never read, so a switch could land on an account that had already
+    /// filled up since the last poll.
+    fn ensure_fresh<'a>(
+        &'a self,
+        _provider: &'a str,
+        _account_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn retry_after_for(&self, provider: &str) -> Option<Duration>;
+
+    fn http(&self) -> reqwest::Client;
+
+    /// Which price window a request starting now falls into.
+    fn tier_at(&self, provider: &str, model: &str) -> TierKey;
+
+    /// Price a usage sample through the learned price table. None means the
+    /// model is unknown and the caller must fall back conservatively.
+    fn estimate_cost(
+        &self,
+        provider: &str,
+        model: &str,
+        tier: &TierKey,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal>;
+
+    fn record_success(
+        &self,
+        reservation: Reservation,
+        usage: &TokenUsage,
+        cost: Decimal,
+        attempt: AttemptRecord,
+        record: RequestRecord,
+    );
+
+    fn record_failure(
+        &self,
+        reservation: Reservation,
+        class: UpstreamErrorClass,
+        retry_after: Option<Duration>,
+        window_reset: Option<OffsetDateTime>,
+        attempt: AttemptRecord,
+    );
+
+    /// Persist a request-level row once every attempt has failed.
+    ///
+    /// Attempts are already stored individually; this exists so a total failure
+    /// still shows up in history and usage reports instead of leaving orphaned
+    /// attempt rows behind.
+    fn record_failed_request(&self, _record: RequestRecord) {}
+}
+
+/// Production wiring: a thin adapter over the frozen Gateway API.
+pub struct GatewayBackend {
+    gateway: Arc<Gateway>,
+}
+
+impl GatewayBackend {
+    pub fn new(gateway: Arc<Gateway>) -> Self {
+        GatewayBackend { gateway }
+    }
+}
+
+impl ProxyBackend for GatewayBackend {
+    fn config(&self) -> &Config {
+        &self.gateway.config
+    }
+
+    fn resolve(&self, client_model: &str) -> Result<ResolvedRoute> {
+        self.gateway.resolve(client_model)
+    }
+
+    fn plan(
+        &self,
+        client_model: &str,
+        session_key: Option<&str>,
+        est_cost: Decimal,
+        request_id: &str,
+        attempt_no: u32,
+        exclude: &[String],
+    ) -> std::result::Result<(ResolvedRoute, Reservation), PlanError> {
+        self.gateway.plan(
+            client_model,
+            session_key,
+            est_cost,
+            request_id,
+            attempt_no,
+            exclude,
+        )
+    }
+
+    fn pick_account(
+        &self,
+        provider: &str,
+        est_cost: Decimal,
+        request_id: &str,
+        attempt_no: u32,
+    ) -> std::result::Result<AttemptPlan, PlanError> {
+        let reservation =
+            self.gateway
+                .pool
+                .select(provider, "", None, est_cost, request_id, attempt_no, &[])?;
+        // A model-list passthrough spends no tokens, so it gives the commitment
+        // straight back. Leaving it committed burned one concurrency slot per
+        // call against the account's own concurrency_limit, and after N calls
+        // that account could never be chosen again.
+        let plan = reservation.plan().clone();
+        reservation.settle(Decimal::ZERO, false);
+        Ok(plan)
+    }
+
+    fn account(&self, qualified_id: &str) -> Option<Account> {
+        self.gateway.pool.account(qualified_id)
+    }
+
+    fn snapshot(&self) -> Vec<Account> {
+        self.gateway.snapshot()
+    }
+
+    fn ensure_fresh<'a>(
+        &'a self,
+        provider: &'a str,
+        account_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.gateway.ensure_fresh(provider, account_id).await;
+        })
+    }
+
+    fn retry_after_for(&self, provider: &str) -> Option<Duration> {
+        self.gateway.pool.retry_after_for(provider)
+    }
+
+    fn http(&self) -> reqwest::Client {
+        self.gateway.http.clone()
+    }
+
+    fn tier_at(&self, provider: &str, model: &str) -> TierKey {
+        self.gateway.tier_at(provider, model, crate::domain::now())
+    }
+
+    fn estimate_cost(
+        &self,
+        provider: &str,
+        model: &str,
+        tier: &TierKey,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal> {
+        self.gateway
+            .prices
+            .lock()
+            .ok()
+            .and_then(|prices| prices.estimate(provider, model, tier, usage, multiplier))
+    }
+
+    fn record_success(
+        &self,
+        reservation: Reservation,
+        usage: &TokenUsage,
+        cost: Decimal,
+        attempt: AttemptRecord,
+        record: RequestRecord,
+    ) {
+        self.gateway
+            .record_success(reservation, usage, cost, attempt, record);
+    }
+
+    fn record_failure(
+        &self,
+        reservation: Reservation,
+        class: UpstreamErrorClass,
+        retry_after: Option<Duration>,
+        window_reset: Option<OffsetDateTime>,
+        attempt: AttemptRecord,
+    ) {
+        self.gateway
+            .record_failure(reservation, class, retry_after, window_reset, attempt);
+    }
+
+    fn record_failed_request(&self, record: RequestRecord) {
+        self.gateway.record_failed_request(record);
+    }
+}
+
+/// Run the gateway until shutdown.
+pub async fn serve(config: Config) -> Result<()> {
+    let listen = config.server.listen.clone();
+    let addr: std::net::SocketAddr = listen
+        .parse()
+        .with_context(|| format!("invalid server.listen address {listen}"))?;
+    let gateway = Gateway::new(config).await?;
+    gateway.spawn_poller();
+    let app = build_router(gateway);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    tracing::info!(%addr, "light-ai-gateway listening");
+    axum::serve(listener, app).await.context("serving HTTP")?;
+    Ok(())
+}
+
+/// Build the axum router. Exposed for integration tests.
+pub fn build_router(gateway: Arc<Gateway>) -> axum::Router {
+    build_router_with(Arc::new(GatewayBackend::new(gateway)))
+}
+
+/// Build the router against any backend. Exposed for integration tests.
+pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
+    let max_body_bytes = backend.config().policy.max_body_bytes;
+    let auth = match &backend.config().server.local_key {
+        None => {
+            // Serving without a local key means anything that can reach the port
+            // can spend this account's quota. The configuration template calls
+            // the key "strongly recommended", and then nothing said a word when
+            // it was missing -- the operator's only evidence was a template they
+            // had already closed.
+            tracing::warn!(
+                listen = %backend.config().server.listen,
+                "server.local_key is not configured: anything able to reach this address \
+                 can spend the pooled quota. Set one with 'lgw keys add local gateway', \
+                 then local_key = {{ keychain = true }}"
+            );
+            LocalAuth::Open
+        }
+        Some(secret) => match secret.resolve(
+            &crate::secrets::CredentialStore::from_env(),
+            crate::secrets::LOCAL_KEY_PROVIDER,
+            crate::secrets::LOCAL_KEY_ACCOUNT,
+        ) {
+            Ok(key) => LocalAuth::Required(key),
+            Err(e) => {
+                // Fail closed: without our key on disk this proxy would be an
+                // open door to paid subscription credentials.
+                tracing::error!(error = %e, "local_key could not be resolved; refusing every request");
+                LocalAuth::Broken
+            }
+        },
+    };
+    let state = Arc::new(AppState { backend, auth });
+    Router::new()
+        .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/models", get(models::list_models))
+        .route("/v1/usage", get(usage::usage))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_local_key,
+        ))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .with_state(state)
+}
+
+struct AppState {
+    backend: Arc<dyn ProxyBackend>,
+    auth: LocalAuth,
+}
+
+/// Local bearer authentication state.
+enum LocalAuth {
+    /// No local_key configured.
+    Open,
+    Required(ApiKey),
+    /// local_key is configured but unreadable: reject everything.
+    Broken,
+}
+
+impl LocalAuth {
+    fn authorizes(&self, headers: &HeaderMap) -> bool {
+        let required = match self {
+            LocalAuth::Open => return true,
+            LocalAuth::Broken => return false,
+            LocalAuth::Required(key) => key,
+        };
+        let Some(value) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return false;
+        };
+        let Some((scheme, token)) = value.split_at_checked(7) else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("bearer ") {
+            return false;
+        }
+        constant_time_eq(token.trim().as_bytes(), required.expose().as_bytes())
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    crate::secrets::constant_time_eq(a, b)
+}
+
+async fn require_local_key(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if state.auth.authorizes(request.headers()) {
+        next.run(request).await
+    } else {
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "missing or invalid Authorization bearer token",
+        )
+    }
+}
+
+/// Read at most the given number of bytes of an upstream error body.
+async fn read_bounded(mut response: reqwest::Response, limit: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < limit {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(limit - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Pull the human-readable message out of an OpenAI/Anthropic error envelope.
+fn upstream_error_message(body: &str, key: &ApiKey) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let obj = value.get("error").unwrap_or(&value);
+    let message = obj
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))?;
+    let message = message.trim();
+    if message.is_empty() {
+        None
+    } else {
+        // The text comes from the upstream, so it goes through the presented
+        // key's redaction before it can reach the client: a provider that
+        // echoes the credential back in its error body would otherwise hand it
+        // to anyone who asked. The probe path has always done this.
+        Some(key.redact(message))
+    }
+}
+
+fn sanitize_message(message: &str) -> String {
+    let cleaned: String = message
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(300)
+        .collect();
+    if cleaned.trim().is_empty() {
+        "upstream request failed".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// A JSON body with the status the OpenAI SDKs expect from a success.
+fn json_response(payload: Value) -> Response {
+    let mut response = Response::new(Body::from(payload.to_string()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+fn error_response(status: StatusCode, kind: &str, message: &str) -> Response {
+    error_response_retry(status, kind, message, None)
+}
+
+fn error_response_retry(
+    status: StatusCode,
+    kind: &str,
+    message: &str,
+    retry_after: Option<Duration>,
+) -> Response {
+    let payload = json!({
+        "error": {
+            "message": sanitize_message(message),
+            "type": kind,
+            "code": kind,
+        }
+    });
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(delay) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, delay.as_secs().to_string());
+    }
+    builder
+        .body(Body::from(payload.to_string()))
+        .unwrap_or_else(|_| Response::new(Body::from("{}")))
+}

@@ -11,5 +11,5 @@ pub(super) async fn cmd_serve(path: &Path, origin: ConfigOrigin) -> Result<()> {
         path.display(),
         origin.label()
     );
-    crate::proxy::serve(config).await
+    crate::http::serve(config).await
 }

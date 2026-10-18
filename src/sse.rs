@@ -47,7 +47,7 @@ impl SseResult {
     /// Whether the stream ended with a terminal marker.
     ///
     /// A missing marker means the stream was cut short -- the client
-    /// disconnected, or the upstream died mid-answer -- and proxy.rs needs to
+    /// disconnected, or the upstream died mid-answer -- and the chat handler needs to
     /// see that to flag the request instead of recording a truncated stream as
     /// a complete one. The field stays public so existing construction is
     /// unchanged.
