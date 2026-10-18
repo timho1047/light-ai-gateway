@@ -2,486 +2,250 @@
 
 [English](README.md) | **简体中文**
 
-一个很小的 OpenAI 兼容网关。它把同一家 provider 的多个账号汇成一个池子，配额窗口用尽时
-自动换号，省得你手工切 API key。
+一个很小的 OpenAI 兼容网关。它把同一家 provider 的多个账号汇成池子，配额窗口用尽时自动
+绕开，省得你手工切 API key。
 
-任何 OpenAI 客户端指过来即可，模型名照旧。它会替每个请求挑账号，窗口满了就切，并把花了
-多少钱记下来。
+把任何 OpenAI 客户端指过来即可，模型名照旧。它替每个请求挑账号，窗口满了就切，并把每笔
+花费都记下来。
+
+![运维看板：账号、covered 额度、metered 余额和实时存货](docs/assets/console-board.png)
+
+*演示用控制台；实际监听端口以你的配置为准。*
 
 **目录**
 
-- [它做什么](#它做什么)
+- [为什么用它](#为什么用它)
 - [安装](#安装)
 - [快速开始](#快速开始)
-- [凭据](#凭据)
-- [命令](#命令)
-- [控制台](#控制台)
-- [读懂输出](#读懂输出)
-- [账号恢复](#账号恢复)
-- [价格](#价格)
-- [两种钱](#两种钱)
-- [账号是怎么选的](#账号是怎么选的)
-- [失败处理](#失败处理)
-- [指标](#指标)
-- [出问题的时候](#出问题的时候)
-- [明确不做](#明确不做)
+- [工作方式](#工作方式)
+- [配置](#配置)
+- [控制台与运维](#控制台与运维)
+- [排障](#排障)
+- [文档](#文档)
 - [开发](#开发)
+- [安全](#安全)
 - [许可证](#许可证)
-- [安全说明](#安全说明)
 
-## 它做什么
+## 为什么用它
 
 - **说 OpenAI Chat Completions。** 只有一个端点，继续用你现有的 SDK，不用改代码。
-- **按 provider 汇账号池。** 同一家 provider、同一个模型，可以挂好几把 key。
-- **在你察觉之前就换号。** 用量到 80% 的账号不再接新会话，请求转给下一个；窗口重置后它
+- **按 provider 汇账号池。** 同一家 provider、同一个模型，可以挂好几把 key；网关按请求
+  挑一个。
+- **在你察觉之前就换号。** 接近软阈值的账号不再接新会话；请求转给下一个账号，窗口重置后
   再回来。
-- **不烧真钱。** 充值余额和钱包支出默认锁死，只有你显式打开才会动用，而且可以只对某一家
-  provider 打开。
-- **把用量记全。** 输入、输出、缓存、推理 token，加 TTFT、TPS、成本和缓存命中率，逐次
-  尝试分别记。
-- **把数字摆出来。** 终端里一块看板：订阅额度还剩多少、真钱余额还剩多少，都带重置倒计时。
-- **在浏览器里配置和查看。** `lgw serve` 还在同一地址提供一个只绑 loopback
-  的控制台：看板、用量图、最近的请求、每个 CLI 动作，还有配置文件的表单编辑器。
+- **绝不误烧 metered 的真钱。** 付费余额默认锁死，只有按 provider 显式开启才会动用。
+- **看得到发生了什么。** 终端看板和浏览器控制台展示额度、重置倒计时、成本、token、缓存
+  命中率和最近的尝试。
+- **在浏览器里配置。** 控制台编辑同一份配置文件，发布改动时不打断在途请求。只绑
+  loopback，没有登录。
 
 ## 安装
 
-要求 Rust **1.88 或更新**。凭据存在操作系统自带的凭据库里（macOS 钥匙串、Windows
-Credential Manager、freedesktop Secret Service），只有 macOS 需要下面那一步签名。
+要求 Rust **1.88 或更新**。凭据库使用 macOS 钥匙串、Windows Credential Manager 或
+freedesktop Secret Service；只有 macOS 需要下面那一步签名。
 
-编译产物是两个自包含的二进制 `lgw` 和 `lgwl`：没有运行时，没有解释器。
+```
+cargo install --path . --locked
+lgw --version
+```
 
-    cargo install --path . --locked
+它把 `lgw` 和 `lgwl` 的 release 二进制装进 `~/.cargo/bin`。
 
-它以 release 模式编译，并把两个二进制装进 PATH（`~/.cargo/bin`）。验证一下：
+**macOS 上请改用这个包装脚本：**
 
-    lgw --version
+```
+scripts/lgw-identity.sh      # 一次：创建签名证书
+scripts/lgw-install.sh       # cargo install，然后给两个二进制签名
+```
 
-**macOS 上请改用这个脚本：**
+普通的 `cargo install` 会用 ad-hoc 签名覆盖已签名的二进制，钥匙串又开始问你要密码。不
+介意这些弹窗才跳过包装脚本。
 
-    scripts/lgw-install.sh
+拿到二进制的其它办法：`cargo build --release` 后复制 `target/release/lgw`，或者
+`cargo install --git <repo-url> --locked`。用 `cargo uninstall light-ai-gateway` 可以把
+两个二进制一起删掉。
 
-它做的是同一条 `cargo install`，然后给两个二进制签名。跳过这步，钥匙串会在每次运行时按每个
-已存的 key 弹一次密码框 —— 见 [凭据](#凭据)。第一次还需要先跑
-`scripts/lgw-identity.sh` 生成证书。
-
-拿到同一个二进制的其它办法：
-
-    # 自己编译，再拷到任意位置；它没有依赖
-    cargo build --release && cp target/release/lgw /usr/local/bin/
-
-    # 直接从 git 远端装（等这个仓库推到某处之后）
-    cargo install --git <repo-url> --locked
-
-卸载：
-
-    cargo uninstall light-ai-gateway
-
-拉到新代码后运行 `lgwl update`：它会停掉正在运行的网关、重跑安装器，并用原参数重启；
-`--no-restart` 则保持停止。详见 [docs/launcher.zh-CN.md](docs/launcher.zh-CN.md)。
+拉到新代码后运行 `lgwl update`。它会停掉正在运行的网关、重装，并用原参数重启；
+`--no-restart` 则保持停止。见[启动器契约](docs/launcher.zh-CN.md)。
 
 ## 快速开始
 
-    lgw init                                      # 生成 ~/.light-ai-gateway/config.toml
-    $EDITOR ~/.light-ai-gateway/config.toml         # 填 providers、accounts、routes
+```
+lgw init                                      # 写入 ~/.light-ai-gateway/config.toml
+$EDITOR ~/.light-ai-gateway/config.toml        # 填 providers、accounts 和 routes
+lgw keys add xkiro acc-1                      # 隐藏输入；每个账号一次
+lgw keys add xkiro acc-2
+lgw keys list                                 # 确认每份凭据都能解析
 
-    lgw keys add xkiro acc-1                      # 隐藏输入；每个账号一次
-    lgw keys add xkiro acc-2
-    lgw keys list                                 # 确认都能解析出密钥
+lgw doctor                                    # 配置、凭据、探测连通性
+lgwl launch                                   # 后台启动代理 + 控制台
+lgwl status                                   # 在跑吗？
+lgwl log                                      # 跟随日志；Ctrl-C 只退出查看器
+```
 
-    lgw doctor                                    # 配置、凭据、探测连通性
-    lgwl launch                                   # 后台启动代理 + 控制台
-    lgwl status                                   # 在跑吗？
-    lgwl log                                      # 跟随日志；Ctrl-C 只退出查看器
-    lgwl exit                                     # 停掉它
+生成的配置本身就是一份能跑的例子。你必须改的部分长这样：
 
-想在终端里直接看日志时，仍可以用 `lgw serve`。
+```
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+currency = "USD"
 
-同一个地址也提供控制台：打开 http://127.0.0.1:8787/，看板、用量、最近的请求和配置编辑器
-都在这里。它只回应 loopback 请求，不需要登录。
+[providers.xkiro.accounts.acc-1]
 
-各文件的位置：
+[routes]
+"z-ai/glm-5.3-flash" = "xkiro"
+```
 
-    ~/.cargo/bin/lgw                          网关二进制
-    ~/.cargo/bin/lgwl                         后台启动器
-    ~/.light-ai-gateway/lgwl/                 启动器 pid/日志状态
-    ~/.light-ai-gateway/config.toml           配置
-    ~/.light-ai-gateway/gateway.db            用量账本（SQLite）
-    操作系统的凭据库                          API key
+没写 `key` 的账号会去系统凭据库里按 `<provider>/<account>` 读取。路由的 key 就是发往上游
+的模型 id。
 
-配置文件按这个顺序查找：`--config PATH` → `$LGW_CONFIG` → `./lgw.toml` →
-`~/.light-ai-gateway/config.toml`。`lgw doctor` 会告诉你它用的是哪一个。改名前的
-`$AI_GW_CONFIG`、`$AI_GW_CREDENTIAL_BACKEND` 仍然有效，但会打一条弃用警告。
+把客户端指过来：
 
-然后把客户端指过来：
+```
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=unused          # 或者你配的 local_key
+```
 
-    export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
-    export OPENAI_API_KEY=unused          # 或者你配的 local_key
+```
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer unused' \
+  -d '{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"hello"}]}'
+```
 
-### 端点
+应该拿到一个正常的 Chat Completions 响应。同一个地址也提供控制台：打开
+<http://127.0.0.1:8787/>。
 
-    GET  /                        运维控制台（只绑 loopback）
-    POST /v1/chat/completions     代理：重试、换号、记账
-    GET  /v1/models               本网关会服务的模型，由 provider 描述
-    GET  /v1/usage                池子的额度用掉了多少、什么时候回来
+想在终端里直接看日志时，仍然可以用 `lgw serve`。`lgwl exit` 停掉后台实例。
 
-`/v1/models` 返回的就是你的 `[routes]`，一个不多：provider 在卖、但你没路由过去的模型
-不会出现 —— 请求它只会拿到「no route for model」。其余字段（上下文长度、价格、能力标志）
-原样来自该 provider 的 `/v1/models`；只有 `id`、`object` 是我们写的，`owned_by` 也
-只在上游自己没给的时候才填 provider 名：
+## 工作方式
 
-    curl http://127.0.0.1:8787/v1/models                     # 所有路由
-    curl "http://127.0.0.1:8787/v1/models?provider=xkiro"    # 某个 provider 的路由
+**账号**是一份 provider 凭据，外加它自己的配额状态。配额以**窗口**的形式到达（比如 5 小时、
+每周或每月），每个窗口有上限和重置时间。网关跟踪每个账号的窗口，并在每个请求上决定由哪个
+账号来服务。
 
-每个 provider 每次请求只问一次上游，用的是有资格账号的 key；模型列表不花 token。哪家的
-目录读不到，也不会让整个列表失败：它的路由照常返回，只是没有那家的字段，原因写进日志。
-路由不在 provider 目录里也照常列出 —— 路由才是真正能用的东西 —— 开 `RUST_LOG=debug` 时，
-日志会打出最接近的已发布 id；vendor 前缀写错就是这么查出来的（`glm/glm-5.3-flash`，而
-xkiro 发布的是 `z-ai/glm-5.3-flash`）。
-
-`/v1/usage` 是给面板用的：把轮询器最后看到的读数换算成百分比。它不碰 provider，所以挂件
-按秒刷新也不花钱。窗口是有名字的（`rolling`、`weekly`、`monthly`），不是数组下标，只会
-读 JSON 路径的客户端也取得到；没有读数的窗口直接不出现，而不是给个 `0`：
-
-    curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8787/v1/usage
-    curl -H "Authorization: Bearer $KEY" "http://127.0.0.1:8787/v1/usage?provider=xkiro"
-    curl -H "Authorization: Bearer $KEY" "http://127.0.0.1:8787/v1/usage?account=xkiro/acc-1"
-
-百分比算的是整个范围的存货 —— sum(used) 除以 sum(cap)，parked 的账号也算在分母里 ——
-所以一个用光的账号配一个全新的账号，读数是 50%，不是 0%。`usage` 和 `balance` 里是
-JSON 数字，方便直接画；`accounts[]` 里同样的数保留精确小数，是文本，方便对账。包月的额度
-不会进 `balance`：订阅里剩下的份额不是你能拿去别处花的钱。一次都没探过的范围返回 503 ——
-一堆 0 和「额度还没动过」长得一模一样。完整结构见
-[docs/usage-endpoint.zh-CN.md](docs/usage-endpoint.zh-CN.md)。
-
-## 凭据
-
-密钥存进操作系统自带的凭据库（macOS 钥匙串、Windows Credential Manager、freedesktop
-Secret Service），走的是 keyring crate。配置里的账号一个 key 字段都不用写；不写就是按
-provider/account 名字去查。
-
-    lgw keys add <provider> <account>     # 隐藏输入，绝不作为命令行参数
-    lgw keys add <provider> <account> --stdin
-    lgw keys list                         # 显示来源和状态，从不显示密钥
-    lgw keys test <provider> <account>    # 真的向上游探一次
-    lgw keys remove <provider> <account>
-
-密钥走隐藏输入，不作为命令行参数 —— 参数对本机任何进程都可见，还会留在 shell 历史里。
-
-网关自己也有一把 token，它是唯一没有 provider 的凭据：一旦有别的东西能够到这个端口，
-客户端就必须带上它。随便编一个字符串即可，它只用于比对，绝不发往上游：
-
-    lgw keys add local gateway            # 隐藏输入，和其它 key 一样
-    # 然后在配置的 [server] 下加一行：
-    # local_key = { keychain = true }
-
-`local/gateway` 是唯一的保留名，不需要 `[providers.*]` 条目。`lgw keys list` 会把它和
-provider 的 key 列在一起；`lgw doctor` 会真的去解析它；`lgw keys test local gateway`
-报告它已存储。
-
-想显式指定也可以：`key = { keychain = true }`、`key = { env = "X" }`、
-`key = { key_file = "/run/secrets/x" }`，或者内联字面量（不推荐）。
-
-### macOS 为什么它老是问你要密码
-
-macOS 把钥匙串条目的访问控制绑在**调用方的代码签名**上。`cargo install` 产出的是
-*ad-hoc* 签名，身份就是代码本身的哈希；于是每次重新编译，在钥匙串眼里都算换了一个应用，
-「Always Allow」这种授权活不过一次重建。
-
-授权**按条目**给，而旧版本每个账号一个条目：冷启动按账号各弹一次，每条命令还会再各弹
-一次 —— 它们各自是新进程，读的是同一批条目。
-
-两招解决：
-
-    scripts/lgw-identity.sh       # 一次性：创建并信任证书
-    scripts/lgw-install.sh        # cargo install，然后给产物签名
-
-第一招让授权留得住：访问控制条目从此指向一张不随代码变化的证书。第二招给真正装上去的
-二进制签名。两招都可选。
-
-另一个变化是只剩一个条目需要授权：所有 key 都住在唯一的 `vault` 条目里。`lgw keys list`
-会显示每个 key 来自哪个条目。
-
-如果你是从早于 vault 的版本升上来的：那些按账号分开的旧条目不再被读取。重新
-`lgw keys add <provider> <account>` 把密钥存进 vault，旧条目可以在「钥匙串访问」里删掉。
-
-注意：直接 `cargo install --path .` 会用 ad-hoc 签名覆盖掉已签名的二进制，弹窗又回来了；
-请用 `scripts/lgw-install.sh`。重新签名会恢复原有授权。
-
-如果你干脆不想用凭据库：
-
-    [providers.xkiro.accounts.acc-1]
-    key = { key_file = "~/.light-ai-gateway/keys/xkiro-acc-1" }   # chmod 600
-
-0600 的文件能挡住同机其他用户和误提交，但挡不住备份和磁盘镜像 —— 那正是凭据库多出来的
-那一件事。
-
-### 这套东西到底保护了什么
-
-- **挡得住：** 机器上的其他用户、备份和磁盘镜像、误提交，以及任何能读文件但读不到凭据库
-  的东西。
-- **挡不住：** 一个已经以你的身份跑起来的进程。它能直接向系统要同一个密钥；macOS 在会话
-  期间会把登录钥匙串解锁。
-
-把密钥编译进二进制再拿去加密文件，挡不住第二种情况：谁拿到二进制，谁就拿到密钥。需要让
-凭据在多台机器之间流转，请从系统凭据库里导出，而不是提交一段密文。
-
-设 `LGW_CREDENTIAL_BACKEND=memory` 可以强制使用临时存储，测试和干跑很有用，也绝不碰你
-真实的钥匙串。
-
-## 命令
-
-    lgw serve                          启动代理和控制台
-    lgw status [--refresh]             账号看板
-    lgw usage --since 7d --group-by provider,model,account
-    lgw prices [--drift-only]          配置价 vs 从真实花费学到的价
-    lgw prices --forget [PROVIDER [MODEL]]
-                                       丢掉学到的价，回到配置价
-    lgw keys add|list|remove|test      provider 凭据
-    lgw accounts list|probe|disable    账号维护
-    lgw accounts enable <id>           把被停用的账号放回池子
-    lgw tail                           最近的请求
-    lgw doctor                         配置、凭据、探测连通性
-    lgw init                           生成一份示例配置
-
-## 控制台
-
-`lgw serve` 在同一地址提供控制台：打开 http://127.0.0.1:8787/。
-
-它是单个运维用的工具，只有 loopback 能到达：来自其它主机的请求拿到 404，它也不属于
-OpenAI 兼容 API。没有登录、没有 cookie、没有会话。CLI 能干的事这里都有 —— 看板、用量、
-最近的请求、探测和启用账号、诊断、已存的凭据、价格和漂移 —— 外加一件 CLI 没有的：用
-表单编辑 `config.toml`。
-
-表单会利用宽屏：配置分成服务、策略、Provider 与账号、路由与别名、价格和原始 TOML
-几个区，由左侧粘性导航切换。应用会写回同一个文件 —— 表单不认识的注释和键都会保留
-—— 并把它应用到运行中的进程，不打断在途请求。少数必须重启才能生效的设置（`listen`、`db_path`、`max_body_bytes`）在
-控制台里是只读的，并且会点名，而不是被默默忽略。页面文案可以在顶栏里切换中英文。
-
-访问规则、完整的 CLI 与控制台对照，以及重新加载的契约见
-[docs/web-ui.zh-CN.md](docs/web-ui.zh-CN.md)。
-
-## 读懂输出
-
-每张表的列宽都是自己量出来的：某个名字变长，不会把后面的列顶歪。数字也按读它的量级打印：
-token 数写成 `921.4K`；金额在总额位置保留一位小数，而单次请求的成本会保留足够位数。
-
-标题（表头、节标题、价格面板归属的模型名）用加粗青色。青色没有含义，所以标题不会被误读成
-状态 —— 绿是正常、黄是变差、红是出错。暗色行是图例和建议，不是读数。
-
-颜色只标需要看一眼的读数：不是 ACTIVE 的状态、STALE 或只是估算的读数、已经漂移的价格、
-花了真钱的请求，别的都不标。颜色不单独承载信息，而且输出不是终端时自动关闭，所以管道、
-重定向和日志文件拿到的字节和以前一模一样：
-
-    lgw --color always status     # 给截图或编辑器运行面板上色
-    lgw --color never status      # 不管终端怎么说，都不上色
-
-`NO_COLOR=1` 关，`CLICOLOR_FORCE=1` 开，用于那些检测不出终端的场景（`docker run -t`、
-会抓走输出的 CI）。
-
-## 账号恢复
-
-有两种原因会把账号踢出池子，解法完全不同。
-
-**失败导致停用** —— 401、403 或 402。池子会一直不用它，直到一次探测证明它既能连通、又有钱：
-
-    lgw keys add <provider> <account>    # 如果问题出在凭据，先做这个
-    lgw accounts probe <id>
-
-探测回来还有余量，账号就自动回到池子；探测成功但仍然没钱的则不会：否则它每个轮询周期都会
-重新进轮转，然后每次都失败。
-
-**运维手工停用** —— `lgw accounts disable <id>`。这是一个决定，探测不会替你撤销：探测只能
-证明凭据可用，证明不了你改了主意。回程得显式走：
-
-    lgw accounts enable <id>
-
-它把账号设成 UNKNOWN 而不是 ACTIVE，所以必须有一次探测确认它才会接流量 —— 和重启同一条
-规则。
-
-两者都只影响单个账号：`accounts disable X` 只写 X 那一行，其它账号的配额读数和重置时间
-原封不动。
-
-## 价格
-
-网关必须在发请求之前知道这一单要花多少钱：硬闸门拿这个估算值去和剩余额度比。这个数字有
-两个来源。
-
-**配置价（configured）**是你自己说的成本，按 provider 分开写，名字沿用价格页的写法，单位
-是 USD / 百万 token：
-
-    [prices.xkiro."z-ai/glm-5.3-flash"]
-    input = 0.30
-    output = 1.20
-    "cache read" = 0.03     # 可选；默认按 input / 10
-
-`cache read` 写的是价格，不是比例，所以读法和前两个一样。不写它就按输入的十分之一算，
-而不是按零算。
-
-**学到的价（learned）**来自两次配额探测之间的花费差，反映的是实际成本。provider 会按模型
-加倍率、做促销、走信用额度，所以观测值更可信；一旦有观测值，计费就改用它，配置值原样保留。
-
-但这个差值要有意义，得同时满足两个条件，而现实中两个都很容易不成立：
-
-- **这个账号只能经过本网关调用。** provider 按账号报花费，不按客户端分。同一个账号如果在
-  编辑器里也用过，那部分花费会落进这个区间，被算到网关的 token 上。
-- **区间里得有像样的 token 量。** 花费除以一小把 token，就是一个按次收费披着费率的外衣。
-  超过 1000 USD/百万的费率会被拒绝入库，从旧账本里读出来的这种行也一样。
-
-只要有一个条件存疑，就把价格写下来，别等它被学出来。坏区间永远覆盖不了配置价；一个说得通
-的数字，比一张悄悄卡死硬闸门的表值钱。
-
-    lgw prices
-
-    PROVIDER  MODEL               SOURCE   MIX       EXPECTED  ACTUAL  DRIFT      SAMPLES
-    xkiro     z-ai/glm-5.3-flash  learned  79/1/20%  $0.2554   $0.9    +252.3% !       12
-
-两列金额都是**在同一观测混合比下的 USD / 百万 token**：EXPECTED 是把你的配置价套到那个
-混合比上的结果，ACTUAL 是观测到的花费折算到同样用量上的结果。合起来读就是：「我以为每百万
-$0.26，实际在付 $0.9」。
-
-同样的价格，混合比不同，每百万能差很远（输入为主 $0.2166/M，输出为主 $0.9/M），所以一个
-每百万的数字，只有配着它依据的混合比看才有意义。DRIFT 是例外：只要价格对得上就是零，跟
-混合比无关。
-
-学到的价是一个混合后的单一数字：除非你的用量混合比会变，输入和输出分不开，所以只有你配置
-过的地方才信任这个拆分。
-
-两边对得上，说明什么都没变；差到 20% 或以上，该行会被标记。日志里的警告从更低的一条线
-`policy.drift_threshold`（默认 0.05）就开始打，所以一次重新定价会先出现在日志里，之后才轮到
-看板标记它。`--drift-only` 只打印被标记的行。
-
-既没配价、也没观测值的模型，会按一个刻意定高的默认价计费，所以未定价的模型绝不会显得免费。
-
-学到的价会持久化，重启不会掉回那个默认值。
-
-学到的价是全历史均值，一旦被外部用量污染，就会一直偏高。忘掉它，配置价立刻生效：
-
-    lgw prices --forget                          # 全部学到的行
-    lgw prices --forget xkiro                    # 某一个 provider
-    lgw prices --forget xkiro z-ai/glm-5.3-flash # 某一个模型
-
-    PROVIDER  MODEL               TIER  RATE     CACHE READ  SAMPLES
-    xkiro     z-ai/glm-5.3-flash     0  $0.4071  $0.0081          44
-
-跑着的 `lgw serve` 自己存着一份表，下次探测还会写回来，所以要重启才生效。忘掉一个本来就没
-配价的模型，它会掉到那个刻意定高的默认价 —— 要么先把价格写上，要么就别动它。
-
-某个区间里花费涨了，网关这边却没有 token 可以摊，这笔钱会被记成无法归属，并跳过学习：账号
-在别处也在用，而这正是学到的价失去意义的时刻。
-
-## 两种钱
-
-每一次配额检查都属于两类之一，网关从不把它们混为一谈：
+钱有两种，网关刻意把它们分开：
 
 | 类别 | 例子 | 行为 |
 |---|---|---|
-| **Covered** | xKiro 的 5h/7d 花费窗口、Command Code 的月度额度 | 订阅已预付。窗口重置即作废。优先使用。 |
-| **Metered** | xKiro 钱包、Command Code 购买的 credits、DeepSeek 余额、HaoAI 余额 | 真钱。花掉就不再回来。运维没显式开启就拒绝。 |
+| **Covered** | 订阅花费窗口、月度套餐额度 | 预付，窗口重置即作废。优先使用。 |
+| **Metered** | 钱包余额、购买的 credits、API 余额 | 真钱，花掉就不再回来。运维没显式开启就拒绝。 |
 
-第三类不在这张表里：xKiro 每天的**免费 token 额度**。它会被读取、会被存储，但单位是 token
-而不是钱，所以不参与路由、不参与硬闸门、也不上看板。它只会以 provider 自己的 429 形式到达
-客户端。
+开关是全局的 `[policy] allow_metered`；`[providers.<name>] allow_metered` 按 provider
+覆盖它。
 
-这个区分很重要。Command Code 在 5 小时窗口用尽时不报错，它会悄悄从你买的 credits 里扣钱
-—— 请求成功了，余额却少了。下面那道硬闸门防的就是这个。
+账号选择，一口气说完：
 
-开不开放按 provider 逐家回答：`[policy] allow_metered` 对所有人生效，`[providers.<name>]
-allow_metered` 针对一家覆盖它，两个方向都算。只有它存在，纯钱包的 provider（DeepSeek、
-HaoAI）才能接流量，而不用顺手把 Command Code 的溢出扣费也打开。
+1. **硬闸门。** 只有 covered 余量能覆盖「估算成本 + 预留」的账号才是候选。
+2. **粘性优先。** 会话当前的账号仍是候选时，就继续用它；搬一次会毁掉 provider 的提示缓存。
+3. **先用尽优先。** 软阈值以下，用已用量最大的账号，让切换尽量少。
+4. **软阈值是偏好，不是墙。** 所有账号都超过 80% 时，只要还有余量，用量最少的那个照常服务。
 
-## 账号是怎么选的
+池子空了，网关就回答 429，附带一个真实的 Retry-After，取自最早的重置时间。它绝不悄悄跌到
+另一家 provider，也不会花 metered 余额。完整规则（含失败处理）见
+[路由](docs/routing.zh-CN.md)和[运维](docs/operations.zh-CN.md)。
 
-对每个请求：
+## 配置
 
-1. **硬闸门。** 只有「订阅侧余量 ≥ 估算成本 + 预留」的账号才是候选。预留取两者中较大的：
-   最近请求成本的 p95、该账号已在途占用的额度，再加一个配置的余量。
-2. **粘性优先。** 会话已经绑在某个候选账号上，就别动它。搬一次对话会丢掉 provider 的提示
-   缓存，整段历史按完整输入价重新计费。
-3. **先用尽优先。** 软阈值以下的候选里，挑已用量最大的那个。把一个账号榨干再换，切换次数
-   最少，而每次切换都意味着一次缓存未命中。
-4. **软阈值是偏好，不是墙。** 所有账号都超过 80% 时，仍然用最少的那个。你配的阈值不能在
-   确实还有余量的时候变成一次故障。
-5. **所有账号都不可用。** 返回 HTTP 429，带真实的 Retry-After（取最早的窗口重置时间）。
-   它不会悄悄跌到另一家 provider，也不会悄悄花掉 metered 余额。
+查找顺序：`--config PATH` → `$LGW_CONFIG` → `./lgw.toml` →
+`~/.light-ai-gateway/config.toml`。`lgw doctor` 会打印它用的是哪一个。
 
-## 失败处理
+```
+~/.light-ai-gateway/config.toml       配置
+~/.light-ai-gateway/gateway.db        用量账本（SQLite）
+~/.light-ai-gateway/lgwl/             启动器 pid/日志状态
+操作系统的凭据库                      provider API key
+```
 
-同一个 429 可能是好几件不同的事，每件要有不同的反应：
+密钥默认绝不写进文件：`lgw keys add` 把它放进系统凭据库，配置按 provider/account 名字
+引用它。监听器一旦能被 loopback 之外访问，就需要一把本地 token 保护；设 `server.local_key`
+后要求客户端携带。详见[凭据](docs/credentials.zh-CN.md)。
 
-| 信号 | 含义 | 动作 |
-|---|---|---|
-| 429 且 Retry-After 很短 | 限速 | 重试，优先换这个请求还没用过的账号；没有别的候选才回到同一个 |
-| 429 且 Retry-After 很长，或错误码是配额形状 | 窗口用尽 | park 该账号，换下一个 |
-| 402 / insufficient_quota | 没钱了 | 停用该账号并告警，之后不再发给它；这个请求会改派到别的可用账号 |
-| 401 / 403 | 凭据坏了 | 停用该账号 |
-| 529 / 5xx | 上游故障 | 在**另一个**账号上有界重试 |
-| 400 / 404 | 请求本身有问题 | 绝不重试 |
+控制台的表单把改动应用到运行中的进程，不打断在途请求。只在重启后生效的设置（`listen`、
+`db_path`、`max_body_bytes`）会标成仅重启，而不是被默默忽略。控制台从不改写它不认识的
+注释和键。访问与重载的完整契约见[控制台文档](docs/web-ui.zh-CN.md)。
 
-换号只可能发生在**第一个字节到达客户端之前**。响应一旦开始流式传输就原样转发；流到一半的
-失败会被如实报告，而不是重试 —— 重试一个已经开始的流，可能被计两次费。
+## 控制台与运维
 
-## 指标
+控制台由与代理相同的进程、相同的监听器提供：
 
-TTFT 测到第一个**内容** token，跳过只带 role 和开场白性质的块。TPS 的分母不含 TTFT。每次
-上游尝试单独入库，所以重试和换号不会污染计时。
+- 看板：账号、covered 额度、metered 余额、重置倒计时、存货和价格漂移。
+- 用量：按 provider/模型/账号的合计、每日图表、TTFT 和缓存命中率。
+- 请求：最近的尝试、重试、筛选和覆盖情况。
+- 价格、密钥、诊断和配置：CLI 的运维动作，外加配置表单。
+- 只绑 loopback，没有登录、没有 cookie、没有会话。会改状态的请求还需要 JSON 请求体和
+  同源头。
 
-缓存命中率（缓存 token ÷ 提示 token）是最该盯的成本指标：账号切换破坏的正是它。
+常用命令：
 
-## 出问题的时候
-
-先跑 `lgw doctor`。它会解析配置、解析每一份凭据、探测每一家 provider，还会检查两件「模型
-名会悄悄对不上」的事 —— 没有路由能到达的价格条目，以及 provider 自己的 `/v1/models` 里
-没有的路由（它会给出最接近的已发布 id）—— 再标出别的机器能连上的端口，最后以非零退出码
-和问题计数结束。
-
-路由的 key 就是发往上游的模型 id，所以 vendor 前缀写错既是上游会拒的请求，也会让为真实 id
-写的那条价格变成孤儿，让该路由按保守默认价（输入 15 / 输出 75 每百万）计费。
-
-| 症状 | 往哪看 |
+| 命令 | 作用 |
 |---|---|
-| 每个请求都是 `no eligible account` | `lgw status` —— 账号可能被 park、被停用，或者卡在硬闸门下。429 的响应体会点名余量最大的账号、还剩多少，以及那个没装下的估算值 |
-| 修好 key 之后账号仍是 DISABLED | 探测只会恢复同时还有余量的账号，而运维手工停用永远不会被探测撤销 —— 见 [账号恢复](#账号恢复) |
-| 每次运行都弹密码框（macOS） | 授权绑在代码签名上，ad-hoc 签名每次重建都会变：跑 `scripts/lgw-install.sh` |
-| 价格看着不对 | `lgw prices --drift-only`。学到的价是观测值，不是真理，而配置价永远不会被它覆盖 |
-| 学到的价明显高于价目表 | 账号在网关之外也被用过，那部分花费被算到了这些 token 上。`lgw prices --forget <provider> <model>`，然后重启 `lgw serve` |
-| 每个请求都是 429，Retry-After 还是几周 | 某个 covered 窗口用尽了，最早的窗口重置就有那么远。`lgw status` 会按闸门显示倒计时 |
-| 换过数据库位置后看板是空的 | 账本路径是配置里的 `server.db_path`。空看板的意思是「还没探测过」，不是「没有账号」 |
+| `lgw serve` | 前台运行代理和控制台 |
+| `lgwl launch` / `lgwl exit` | 后台运行 / 停止 |
+| `lgw status` | 账号看板，带重置倒计时 |
+| `lgw doctor` | 配置、凭据、探测连通性和常见配置错误 |
+| `lgw keys add/list/remove/test` | 管理 provider 凭据 |
+| `lgw accounts list/probe/disable/enable` | 查看并恢复账号 |
+| `lgw usage --since 7d --group-by provider,model` | 用量报告 |
+| `lgw prices [--drift-only]` | 配置价与学到的价 |
+| `lgw tail` | 最近的请求 |
 
-## 明确不做
+出问题时先跑 `lgw doctor`。启动器、日志和进程生命周期见
+[docs/launcher.zh-CN.md](docs/launcher.zh-CN.md)；日常恢复和输出解读见
+[docs/operations.zh-CN.md](docs/operations.zh-CN.md)。
 
-跨 provider 兜底、跨模型降级、协议翻译、语义缓存、多用户 RBAC —— 都不在范围内，这是
-刻意的。一个模型只映射到一家 provider；要改那是产品决定。控制台是单个运维用的、只绑
-loopback 的工具，不是多用户管理面板，也不是第二个 API：它没有自己的登录。
+## 排障
+
+| 症状 | 先看哪里 |
+|---|---|
+| 每个请求都是 `no eligible account` | `lgw status`：账号可能被 park、被停用，或者卡在硬闸门下。429 的响应体会点名余量最大的账号。 |
+| 修好 key 之后账号仍是 DISABLED | 探测只恢复还有余量的账号；运维手工停用需要 `lgw accounts enable`。 |
+| 每次运行都弹密码框（macOS） | 授权绑在代码签名上，而 `cargo install` 生成的是 ad-hoc 签名；跑 `scripts/lgw-install.sh`。 |
+| 价格看着不对 | `lgw prices --drift-only`。学到的价是观测值；配置价永远不会被它覆盖。 |
+| 每个请求都是 429，Retry-After 很长 | 某个 covered 窗口用尽了；`lgw status` 会显示重置倒计时。 |
+
+更多症状和修法：[运维](docs/operations.zh-CN.md)。
+
+## 文档
+
+- [控制台契约](docs/web-ui.zh-CN.md)
+- [后台启动器](docs/launcher.zh-CN.md)
+- [HTTP API](docs/api.zh-CN.md)
+- [凭据与 macOS 钥匙串](docs/credentials.zh-CN.md)
+- [价格、学到的价与漂移](docs/prices.zh-CN.md)
+- [路由与两种配额](docs/routing.zh-CN.md)
+- [运维与排障](docs/operations.zh-CN.md)
+- [GET /v1/usage 契约](docs/usage-endpoint.zh-CN.md)
+- [架构决策记录](docs/adr/)
 
 ## 开发
 
-    cargo test                              # 整个测试套件，几秒钟
-    cargo clippy --all-targets -- -D warnings
-    cargo fmt --check
+```
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
 
-仓库里没有 CI 流水线：改动离开本机之前，跑这三条，再加一次 release 构建。也没有 tests/
-目录 —— 测试就放在它覆盖的代码旁边、各个模块内部，并且按它断言的行为命名。
+仓库里没有 CI 流水线：这三条再加一次 release 构建，就是改动前的检查。单元测试放在它覆盖
+的代码旁边；CLI 生命周期测试在 `tests/lgwl_cli.rs`。
 
-各家 provider 的配额适配器在 src/quota。加一家 provider = 实现一个 trait，再声明它的
-base URL、凭据和错误词表。`adapter = "none"` 刻意不支持：账号只有探测成功后才进池子，
-所以没有配额来源的 provider 永远选不中。请用 xkiro、command-code、deepseek 或 haoai。
+各家 provider 的配额适配器在 `src/quota`。加一家 provider 就是实现一个 trait，再声明它
+的 base URL、凭据和错误词表。`adapter = "none"` 不能接流量：账号只有配额探测成功后才会
+进池子，所以请用 `xkiro`、`command-code`、`deepseek` 或 `haoai`。
+
+## 安全
+
+- 默认只绑 loopback。监听地址不是 loopback 就必须有本地 key；缺了配置会被直接拒绝，而
+  不是只留一条警告。
+- Provider 密钥存在操作系统的凭据库里，从不进日志，在所有调试和展示路径里都会被脱敏。
+- 探测主机写死在配置里，重定向一律拒绝，所以请求无法把凭据重定向到别处。
+- 配额探测失败时保留上一次读数并标记为 stale；绝不把读数清零。
+- 不存储提示和响应正文。
+- 控制台改动需要 JSON 和同源头，并会对照 `Host` 与 `Origin` 检查。
+- 配置写入整体校验、原子替换；在控制台底下被改过的文件绝不会被覆盖。
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。随便用、随便改、随便发布、随便卖 —— 不提供任何担保，而当你把
+MIT，见 [LICENSE](LICENSE)。随便用、随便改、随便发布、随便卖。不提供任何担保，而当你把
 它配置成会花钱时，它确实会花真钱。
-
-## 安全说明
-
-- 默认只绑 loopback，而它握着付费凭据。监听地址只要不是 loopback 就必须有本地 key：
-  缺 `local_key` 时配置会被直接拒绝，而不是只留一条日志警告。
-- 密钥来自环境变量或专用文件，从不进日志，在所有调试和展示路径里都会被脱敏。
-- 探测主机写死在配置里，重定向一律拒绝，所以凭据不可能被发到请求指定的地址，也不可能被发
-  到 Location 头点名的地址。
-- 配额探测失败时保留上一次读数并标记为 stale；绝不把读数清零。
-- 提示和响应正文从不存储。
-- 控制台只绑 loopback，没有登录，也没有 cookie。会改状态的请求需要 JSON 和自定义头，
-  还要过 `Host` 和 `Origin` 检查，所以另一个浏览器标签页里的页面驱动不了它。
-- 配置写入整体校验、原子替换；失败的写入什么都不改，在控制台底下被改过的文件也绝不会
-  被覆盖。
-- 控制台从不显示凭据。密钥只写不读，存放在操作系统的凭据库里。

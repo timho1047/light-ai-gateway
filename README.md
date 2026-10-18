@@ -2,574 +2,219 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-A very small OpenAI-compatible gateway that pools multiple provider accounts and
-routes around exhausted quota windows, so you stop switching API keys by hand.
+A small OpenAI-compatible gateway that pools multiple provider accounts and routes around exhausted quota windows, so you stop switching API keys by hand.
 
-Point any OpenAI client at it, keep using your normal model names, and it will
-pick an account for each request, switch when a window fills up, and record what
-everything cost.
+Point any OpenAI client at it, keep your normal model names, and it picks an account per request, switches when a window fills, and records what everything cost.
+
+![The operator console: accounts, covered allowance, metered balance and live inventory](docs/assets/console-board.png)
+
+*A demo console; the listener port in your config may differ.*
 
 **Contents**
 
-- [What it does](#what-it-does)
+- [Why](#why)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Credentials](#credentials)
-- [Commands](#commands)
-- [Console](#console)
-- [Reading the output](#reading-the-output)
-- [Account recovery](#account-recovery)
-- [Prices](#prices)
-- [The two pots of money](#the-two-pots-of-money)
-- [How an account is chosen](#how-an-account-is-chosen)
-- [Failure handling](#failure-handling)
-- [Metrics](#metrics)
-- [When it does not work](#when-it-does-not-work)
-- [Non-goals](#non-goals)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Console and operations](#console-and-operations)
+- [Troubleshooting](#troubleshooting)
+- [Docs](#docs)
 - [Development](#development)
+- [Safety](#safety)
 - [License](#license)
-- [Safety notes](#safety-notes)
 
-## What it does
+## Why
 
-- **Speaks OpenAI Chat Completions.** One endpoint, your existing SDK, no code change.
-- **Pools accounts per provider.** Same provider, same model, several keys.
-- **Switches before you notice.** Accounts at 80% stop taking new sessions;
-  requests move to the next account and come back when a window resets.
-- **Refuses to burn real money.** Paid-credit and wallet spend is fenced off
-  behind an explicit opt-in, and that opt-in can be granted per provider.
-- **Records usage.** Input, output, cached and reasoning tokens, TTFT, TPS, cost,
-  cache hit rate, per attempt.
-- **Shows you the numbers.** A terminal board of covered allowance against
-  metered balance, with reset countdowns.
-- **Lets you configure it and read it in a browser.** `lgw serve` also serves a
-  loopback-only console: the board, usage charts, recent requests, every CLI
-  action, and a form editor for the config file.
+- **OpenAI Chat Completions.** One endpoint, your existing SDK, no code change.
+- **Pool accounts per provider.** Same provider, same model, several keys; the gateway chooses one per request.
+- **Switch before you notice.** Accounts near the soft threshold stop taking new sessions; requests move to the next account and come back when the window resets.
+- **Never burn metered money by accident.** Paid balance stays behind an explicit per-provider opt-in.
+- **See what happened.** The terminal board and the browser console show allowance, reset countdowns, cost, tokens, cache hit rate and recent attempts.
+- **Configure it in the browser.** The console edits the same config file and publishes changes without dropping in-flight requests. Loopback only, no login.
 
 ## Install
 
-Requires Rust **1.88 or newer**. The credential store binds to macOS Keychain,
-Windows Credential Manager and the freedesktop Secret Service; only macOS needs
-the signing step below.
+Requires Rust **1.88 or newer**. The credential store uses macOS Keychain, Windows Credential Manager or the freedesktop Secret Service; only macOS needs the signing step below.
 
-The build produces two self-contained binaries, `lgw` and `lgwl`, with no runtime
-and no interpreter.
+```
+cargo install --path . --locked
+lgw --version
+```
 
-    cargo install --path . --locked
-
-That builds in release mode and puts both binaries on your PATH (`~/.cargo/bin`).
-Check them:
-
-    lgw --version
+That builds release binaries for `lgw` and `lgwl` into `~/.cargo/bin`.
 
 **On macOS, use the wrapper instead:**
 
-    scripts/lgw-install.sh
+```
+scripts/lgw-identity.sh      # once: creates the signing certificate
+scripts/lgw-install.sh       # cargo install, then signs the binaries
+```
 
-It runs the same `cargo install` and then signs both binaries. Skip it and the keychain
-asks for your password once per key, on every run -- see
-[Credentials](#credentials). The first time you also need
-`scripts/lgw-identity.sh`, which creates the certificate.
+A plain `cargo install` replaces the signed binary with an ad-hoc one, and the keychain starts asking for your password again. Skip the wrapper only if the prompts do not bother you.
 
-Other ways to get the same binary:
+Other ways to get the binary: `cargo build --release` and copy `target/release/lgw`, or `cargo install --git <repo-url> --locked`. Remove both binaries with `cargo uninstall light-ai-gateway`.
 
-    # build it and copy it wherever you like; it has no dependencies
-    cargo build --release && cp target/release/lgw /usr/local/bin/
-
-    # straight from a git remote, once this is pushed somewhere
-    cargo install --git <repo-url> --locked
-
-To remove it again:
-
-    cargo uninstall light-ai-gateway
-
-After pulling changes, run `lgwl update`. It stops a running gateway, re-runs this
-installer, and restarts the gateway with the same arguments; `--no-restart` leaves it
-stopped. See [docs/launcher.md](docs/launcher.md).
+After pulling changes, run `lgwl update`. It stops a running gateway, reinstalls, and restarts it with the same arguments; `--no-restart` leaves it stopped. See [the launcher contract](docs/launcher.md).
 
 ## Quick start
 
-    lgw init                                      # writes ~/.light-ai-gateway/config.toml
-    $EDITOR ~/.light-ai-gateway/config.toml         # add providers, accounts, routes
+```
+lgw init                                      # writes ~/.light-ai-gateway/config.toml
+$EDITOR ~/.light-ai-gateway/config.toml        # fill in providers, accounts and routes
+lgw keys add xkiro acc-1                      # hidden prompt; once per account
+lgw keys add xkiro acc-2
+lgw keys list                                 # check every credential resolves
 
-    lgw keys add xkiro acc-1                      # hidden prompt; once per account
-    lgw keys add xkiro acc-2
-    lgw keys list                                 # check everything resolves
+lgw doctor                                    # config, credentials, probe reachability
+lgwl launch                                   # proxy + console in the background
+lgwl status                                   # is it running?
+lgwl log                                      # follow its log; Ctrl-C stops only the viewer
+```
 
-    lgw doctor                                    # config, credentials, probe reachability
-    lgwl launch                                   # proxy + console in the background
-    lgwl status                                   # is it running?
-    lgwl log                                      # follow its log; Ctrl-C stops only the viewer
-    lgwl exit                                     # stop it
+The generated config is already a working example. The part you must edit has this shape:
 
-`lgw serve` remains available when you want the log in the foreground.
+```
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "https://api.xkiro.com/v1"
+currency = "USD"
 
-The same address serves the console: open http://127.0.0.1:8787/ for the board,
-usage, recent requests and the configuration editor. It answers loopback
-requests only and needs no login.
+[providers.xkiro.accounts.acc-1]
 
-Where things live:
+[routes]
+"z-ai/glm-5.3-flash" = "xkiro"
+```
 
-    ~/.cargo/bin/lgw                          the gateway binary
-    ~/.cargo/bin/lgwl                         the background launcher
-    ~/.light-ai-gateway/lgwl/                 launcher pid/log state
-    ~/.light-ai-gateway/config.toml             configuration
-    ~/.light-ai-gateway/gateway.db              usage ledger (SQLite)
-    the OS credential store                     API keys
+An account with no `key` reads its credential from the OS store, under `<provider>/<account>`. Route keys are the model ids sent upstream.
 
-Config resolution order: --config PATH, then $LGW_CONFIG, then ./lgw.toml,
-then ~/.light-ai-gateway/config.toml. lgw doctor prints which one it used. The
-pre-rename spellings ($AI_GW_CONFIG, $AI_GW_CREDENTIAL_BACKEND) still work and
-log a deprecation warning.
+Point a client at the proxy:
 
-Then point your client at it:
+```
+export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+export OPENAI_API_KEY=unused          # or the local_key you configured
+```
 
-    export OPENAI_BASE_URL=http://127.0.0.1:8787/v1
-    export OPENAI_API_KEY=unused          # or the local_key you configured
+```
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer unused' \
+  -d '{"model":"z-ai/glm-5.3-flash","messages":[{"role":"user","content":"hello"}]}'
+```
 
-### Endpoints
+You should get a normal Chat Completions response. The same address serves the console: open <http://127.0.0.1:8787/>.
 
-    GET  /                        the operator console (loopback only)
-    POST /v1/chat/completions     the proxy: retries, account switching, the usage ledger
-    GET  /v1/models               the models this gateway will serve, described by the provider
-    GET  /v1/usage                how much of the pool's allowance is gone, and when it comes back
+`lgw serve` is still available when you want the log in the foreground. `lgwl exit` stops the background instance.
 
-`/v1/models` answers with your `[routes]` and nothing else: a model the provider
-sells but you have not routed is left out, because asking for it gets a "no route
-for model" error. The fields come from the provider's own `/v1/models` response,
-passed through unchanged -- context length, prices, capability flags -- with `id`,
-`object` and, when the provider does not name an owner itself, `owned_by` set to
-the provider:
+## How it works
 
-    curl http://127.0.0.1:8787/v1/models                     # every route
-    curl "http://127.0.0.1:8787/v1/models?provider=xkiro"    # one provider's routes
+An **account** is one provider credential with its own quota state. Quota arrives as **windows** (for example 5-hour, weekly or monthly), each with a cap and a reset time. The gateway tracks every account's windows and decides per request which account may serve it.
 
-One upstream call per provider per request, made with an eligible account's key;
-a model list spends no tokens. A provider whose catalog cannot be read does not
-break the list: its routes are still returned, without that provider's fields, and
-the reason is logged. A route the provider's catalog does not mention is still
-listed -- the route is what works -- and `RUST_LOG=debug` prints the published ids
-closest to it, which is how a wrong vendor prefix gets found
-(`glm/glm-5.3-flash` where xkiro publishes `z-ai/glm-5.3-flash`).
-
-`/v1/usage` is for a dashboard: what the poller last saw, turned into
-percentages. It calls no provider, so a widget can refresh on a timer without
-spending anything. The windows are named rather than indexed (`rolling`,
-`weekly`, `monthly`) so a client that can only follow a JSON path can read them,
-and a window with no reading is left out rather than sent as `0`:
-
-    curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8787/v1/usage
-    curl -H "Authorization: Bearer $KEY" "http://127.0.0.1:8787/v1/usage?provider=xkiro"
-    curl -H "Authorization: Bearer $KEY" "http://127.0.0.1:8787/v1/usage?account=xkiro/acc-1"
-
-The percentages are inventory across the whole scope -- sum(used) over sum(cap),
-parked accounts included -- so one spent account beside one fresh one reads 50%,
-not 0%. `usage` and `balance` carry JSON numbers, for drawing; the same figures
-under `accounts[]` keep their exact decimals as text, for auditing. Covered
-allowance never lands in `balance`, because a subscription's headroom is not
-money you can spend anywhere else. A scope nobody has probed yet answers 503:
-zeros and an untouched allowance look identical. The full shape is in
-[docs/usage-endpoint.md](docs/usage-endpoint.md).
-
-## Credentials
-
-Keys go into the operating system's own credential store (macOS Keychain,
-Windows Credential Manager, freedesktop Secret Service) via the keyring crate.
-Accounts in the config need no key field at all; omitting it looks the account up
-by provider/account name.
-
-    lgw keys add <provider> <account>     # hidden prompt, never an argv flag
-    lgw keys add <provider> <account> --stdin
-    lgw keys list                         # source and status, never the secret
-    lgw keys test <provider> <account>    # prove it by probing the provider
-    lgw keys remove <provider> <account>
-
-The key is read from a hidden prompt rather than a command-line argument, because
-arguments are visible to every process on the machine and land in shell history.
-
-The gateway also has a token of its own: the one credential with no provider behind
-it, which clients must send once anything else can reach the port. Any string you
-invent works; it is never forwarded upstream:
-
-    lgw keys add local gateway            # hidden prompt, same as any other key
-    # then, under [server] in the config:
-    # local_key = { keychain = true }
-
-`local/gateway` is the single reserved name that needs no `[providers.*]` entry.
-`lgw keys list` shows it next to the provider keys, `lgw doctor` checks that it
-resolves, and `lgw keys test local gateway` reports that it is stored.
-
-Explicit alternatives are still supported when you want them:
-key = { keychain = true }, key = { env = "X" }, key = { key_file = "/run/secrets/x" },
-or an inline literal (discouraged).
-
-### macOS: why it keeps asking for your password
-
-macOS binds a keychain item's access control to the **code signature** of the
-program asking for it. `cargo install` produces an *ad-hoc* signature, whose
-identity is the hash of the code itself, so every rebuild looks like a different
-application to the keychain and an "Always Allow" grant does not survive it.
-
-A grant is also per ITEM, and an older build kept one item per account: a cold start
-asked once per account, and once more per command, because each is a new process
-reading the same items.
-
-Two things fix it:
-
-    scripts/lgw-identity.sh       # once: creates and trusts the certificate
-    scripts/lgw-install.sh        # cargo install, then signs the result
-
-The first makes the grant stick: the access-control entry then names a certificate
-that does not change when the code does. The second signs the binary that gets
-installed. Both are optional.
-
-There is also only one item to grant: every key lives in a single `vault` entry.
-`lgw keys list` shows which item each key came out of.
-
-If you are upgrading from a build that predates the vault, its per-account items
-are no longer read: `lgw keys add <provider> <account>` stores the key in the
-vault, and the old item can be deleted in Keychain Access.
-
-Note that a plain `cargo install --path .` replaces the signed binary with an
-ad-hoc one and brings the prompts back; use `scripts/lgw-install.sh` instead.
-Re-signing restores the existing grant.
-
-If you would rather not use the credential store at all:
-
-    [providers.xkiro.accounts.acc-1]
-    key = { key_file = "~/.light-ai-gateway/keys/xkiro-acc-1" }   # chmod 600
-
-A 0600 file keeps other users and accidental commits out, but not a backup or a
-disk image -- that is what the credential store adds.
-
-### What this actually protects
-
-- **Protected:** other users on the machine, backups and disk images, accidental
-  commits, and anything that reads files but not the credential store.
-- **NOT protected:** a process already running as you. It can ask the OS for the
-  same secret; macOS unlocks the login keychain for the session.
-
-Encrypting a file with a key compiled into the binary would not cover that second
-case: whoever has the binary has the key. To move credentials between machines,
-export them from the OS store rather than committing a ciphertext.
-
-Set LGW_CREDENTIAL_BACKEND=memory to force an ephemeral store, which is useful
-for tests and dry runs and never touches your real keychain.
-
-## Commands
-
-    lgw serve                          start the proxy and the console
-    lgw status [--refresh]             account board
-    lgw usage --since 7d --group-by provider,model,account
-    lgw prices [--drift-only]          configured price vs the price learned from real spend
-    lgw prices --forget [PROVIDER [MODEL]]
-                                       drop learned prices, go back to the configured card
-    lgw keys add|list|remove|test      provider credentials
-    lgw accounts list|probe|disable    account maintenance
-    lgw accounts enable <id>           put a disabled account back
-    lgw tail                           recent requests
-    lgw doctor                         config, credentials, probe reachability
-    lgw init                           write an example config
-
-## Console
-
-`lgw serve` serves the console at the same address: open
-http://127.0.0.1:8787/.
-
-It is a single operator's tool, reachable from loopback only: a request from
-another host gets 404, and it is not part of the OpenAI-compatible API. There is
-no login, no cookie and no session. Everything the CLI does is here -- the board,
-usage, recent requests, probing and enabling accounts, doctor, stored credentials,
-prices and drift -- plus one thing the CLI does not have: editing
-`config.toml` in a form.
-
-The form uses the width of a wide screen: configuration is split into Server,
-Policy, Providers & accounts, Routing & aliases, Prices, and raw TOML sections with
-a sticky rail. Applying writes the same file back -- comments and keys the form
-does not know are kept -- and applies it to the running process without dropping
-in-flight requests. The few settings that need a restart instead (`listen`, `db_path`,
-`max_body_bytes`) are named in the console rather than silently ignored. The copy
-switches between English and Chinese in the top bar.
-
-The access rules, the full CLI-to-console mapping and the reload contract are in
-[docs/web-ui.md](docs/web-ui.md).
-
-## Reading the output
-
-Every table measures its own columns, so a longer name does not push the rest of the
-row out of line, and numbers are printed at the scale they are read at: token
-counts as `921.4K`, money with one decimal for a total and enough decimals for a
-per-request cost.
-
-Headings are bold cyan. Cyan carries no meaning, so a heading cannot be misread as a
-state: green is working, yellow is weakening, red is wrong. Dimmed lines are
-legends and advice, not readings.
-
-Colour marks only the readings that need attention -- a state that is not ACTIVE, a
-reading that is STALE or only estimated, a price that has drifted, a request that
-spent metered money -- and nothing else. It carries no information of its own, and
-it is off when the output is not a terminal, so pipes, redirects and logs get the
-bytes they always did:
-
-    lgw --color always status     # colour a capture or an editor's run panel
-    lgw --color never status      # never colour, whatever the terminal says
-
-`NO_COLOR=1` turns it off and `CLICOLOR_FORCE=1` turns it on, for terminals that
-cannot be detected (`docker run -t`, a CI that captures the stream).
-
-## Account recovery
-
-Two different things take an account out of the pool, and they need different
-answers.
-
-**A failure disables it** -- a 401, 403 or 402. The pool stops using it until a
-probe shows it is both reachable and funded:
-
-    lgw keys add <provider> <account>    # first, if the credential was the problem
-    lgw accounts probe <id>
-
-A probe with headroom puts the account back. One that succeeds but still shows
-nothing left does not: it would otherwise re-enter rotation every poll and fail
-every time.
-
-**An operator disables it** -- `lgw accounts disable <id>`. That is a decision,
-and a probe will not undo it: a probe proves the credential works, not that you
-changed your mind. The way back is explicit:
-
-    lgw accounts enable <id>
-
-That sets the account to UNKNOWN rather than ACTIVE, so a probe has to confirm it
-before it takes traffic -- the same rule a restart follows.
-
-Both are per account: `accounts disable X` writes X's row alone and leaves every
-other account's quota readings and reset times untouched.
-
-## Prices
-
-The gateway must know what a request costs before it sends it: that estimate is
-what the hard gate compares against the remaining allowance. Two numbers feed it.
-
-**Configured** is what you say a model costs, per provider, named the way a
-pricing page names it and in USD per million tokens:
-
-    [prices.xkiro."z-ai/glm-5.3-flash"]
-    input = 0.30
-    output = 1.20
-    "cache read" = 0.03     # optional; defaults to input / 10
-
-`cache read` is a price, not a ratio, so it reads like the other two. Leaving it
-out assumes a tenth of input rather than zero.
-
-**Learned** is what the spend difference between two quota probes says it
-actually costs. Providers apply per-model multipliers, promotions and credit
-rates, so observation is the more trustworthy figure, and it takes over for
-billing as soon as there is one. The configured value is kept unchanged.
-
-Two conditions have to hold before that difference means anything, and both fail
-easily in practice:
-
-- **The account must be used only through this gateway.** The provider reports
-  spend per account, not per client. Use the same account from an editor and its
-  spend lands in the interval and gets charged to the gateway's own tokens.
-- **The interval must carry a real token volume.** A spend figure divided by a
-  handful of tokens is a fixed per-request charge wearing a rate's clothes. Rates
-  above 1000 USD per million are rejected rather than stored, and so is any such
-  row read back from an older ledger.
-
-When either condition is doubtful, write the price down instead of waiting for it
-to be learned. A configured price is never overwritten by a bad interval, and one
-plausible number is worth more than a table that quietly wedges the hard gate.
-
-    lgw prices
-
-    PROVIDER  MODEL               SOURCE   MIX       EXPECTED  ACTUAL  DRIFT      SAMPLES
-    xkiro     z-ai/glm-5.3-flash  learned  79/1/20%  $0.2554   $0.9    +252.3% !       12
-
-Both money columns are **USD per million tokens over the same observed mix**:
-EXPECTED is your configured prices applied to that mix, ACTUAL is what the
-observed spend works out to. Read together they say "I expected $0.26 per
-million and I am paying $0.9".
-
-The same prices cost very different amounts per million on different mixes
-($0.2166/M input-heavy against $0.9/M output-heavy), so never compare a
-per-million figure across mixes. DRIFT is the exception: it is zero whenever
-prices match, whatever the mix.
-
-A learned rate is one blended figure: input and output cannot be separated unless
-your usage mix varies, so the split is trusted only where you configured it.
-
-If the two agree, nothing has changed. If they diverge by 20% or more the row is
-flagged. A warning is logged from a lower line, `policy.drift_threshold`
-(default 0.05), so a repricing is named in the log before the board marks it.
-`--drift-only` prints just the marked rows.
-
-A model with no configured price and no observation yet is priced at a
-deliberately conservative default, so an unpriced model can never look free.
-
-Learned prices are persisted, so a restart does not fall back to that default.
-
-A learned rate is the mean over the whole history, so a row polluted by outside
-usage stays too high forever. Forget it and the configured price is in effect
-again:
-
-    lgw prices --forget                          # every learned row
-    lgw prices --forget xkiro                    # one provider
-    lgw prices --forget xkiro z-ai/glm-5.3-flash # one model
-
-    PROVIDER  MODEL               TIER  RATE     CACHE READ  SAMPLES
-    xkiro     z-ai/glm-5.3-flash     0  $0.4071  $0.0081          44
-
-A running `lgw serve` keeps its own copy of the table and writes it back on the next
-probe, so restart it for the change to stick. Forgetting a model that has no
-configured price drops it to the conservative default -- write the price down
-first, or leave the row alone.
-
-Spend that moves between probes while the gateway has no tokens to charge it to is
-logged as unattributable and not learned: the account is being used somewhere else,
-which is exactly when a learned rate stops meaning anything.
-
-## The two pots of money
-
-Every quota check is one of two kinds, and the gateway never conflates them:
+There are two kinds of money, kept deliberately separate:
 
 | Class | Examples | Behaviour |
 |---|---|---|
-| **Covered** | xKiro 5h/7d spend windows, Command Code monthly credits | Prepaid by a subscription. Forfeited when the window resets. Preferred. |
-| **Metered** | xKiro wallet, Command Code purchased credits, DeepSeek balance, HaoAI balance | Real money. Permanent once spent. Refused unless the operator opts in. |
+| **Covered** | subscription spend windows, monthly plan credits | Prepaid and forfeited when the window resets. Preferred. |
+| **Metered** | wallet balance, purchased credits, API balance | Real money, permanent once spent. Refused unless the operator opts in. |
 
-A third kind sits outside this table: xKiro's daily **free-token allowance**. It is
-read and stored, but counted in tokens rather than money, so it plays no part in
-routing, the hard gate or the board. It reaches the client as the provider's own
-429.
+The opt-in is `[policy] allow_metered` for everyone, with `[providers.<name>] allow_metered` overriding it per provider.
 
-The distinction matters. Command Code does not return an error when a 5-hour window
-is exhausted; it silently bills your purchased credits, so the request succeeds
-while your balance drops. That is what the hard gate guards against.
+Account selection, in one breath:
 
-The opt-in is answered per provider. `[policy] allow_metered` decides for
-everyone, and `[providers.<name>] allow_metered` overrides it for one provider,
-in either direction -- which is what lets a wallet-only provider such as DeepSeek
-or HaoAI serve without also unlocking Command Code's overflow.
+1. **Hard gate.** Only accounts whose covered headroom covers the estimated cost plus a reserve are candidates.
+2. **Sticky first.** Keep the session on its current account when it is still a candidate; moving it destroys the provider's prompt cache.
+3. **Consume-first.** Below the soft threshold, use the most-used account so switches are rare.
+4. **Soft threshold is a preference, not a wall.** If every account is above 80%, the least-used one still serves while headroom remains.
 
-## How an account is chosen
+When the pool is empty, the gateway answers 429 with a real Retry-After from the earliest reset. It never silently falls through to another provider or spends metered balance. The full rules, including failure handling, are in [routing](docs/routing.md) and [operations](docs/operations.md).
 
-For each request:
+## Configuration
 
-1. **Hard gate.** Only accounts whose covered headroom covers the estimated cost
-   plus a reserve are candidates. The reserve is the larger of the p95 of recent
-   request costs and what that account already has committed in flight, plus a
-   configured margin.
-2. **Sticky first.** If the session is already bound to a candidate, keep it.
-   Moving a conversation discards the provider's prompt cache and re-bills the
-   whole history at full input price. The session key is the first non-empty of
-   `x-session-id`, `x-session-key`, `x-conversation-id`, or the `user` field
-   of the JSON body.
-3. **Consume-first.** Among candidates below the soft threshold, take the most
-   used. Draining one account before moving on minimises switches, and every
-   switch costs a cache miss.
-4. **Soft threshold is a preference, not a wall.** If every account is above 80%
-   the least-used one is still used. A threshold you configured must not become
-   an outage while headroom genuinely remains.
-5. **All accounts unavailable.** HTTP 429 with a real Retry-After, taken from the
-   earliest window reset. It does not silently fall through to another provider,
-   and it does not silently spend metered balance.
+Resolution order: `--config PATH`, then `$LGW_CONFIG`, then `./lgw.toml`, then `~/.light-ai-gateway/config.toml`. `lgw doctor` prints which file it used.
 
-## Failure handling
+```
+~/.light-ai-gateway/config.toml       configuration
+~/.light-ai-gateway/gateway.db        usage ledger (SQLite)
+~/.light-ai-gateway/lgwl/             launcher pid/log state
+the OS credential store               provider API keys
+```
 
-A 429 means several different things and each needs a different response:
+Keys are never stored in the file by default: `lgw keys add` puts them in the OS store, and the config refers to them by provider/account name. A local token protects the listener when it is reachable beyond loopback; set `server.local_key` to require it from clients. Details in [credentials](docs/credentials.md).
 
-| Signal | Meaning | Action |
-|---|---|---|
-| 429 with a short Retry-After | pacing | retry, preferring an account this request has not used; the same one only when nothing else is eligible |
-| 429 with a long Retry-After, or a quota-shaped code | window exhausted | park the account, move on |
-| 402 / insufficient_quota | out of money | disable the account, alert, and never send it another request; this request is replanned elsewhere if an account is eligible |
-| 401 / 403 | bad credentials | disable the account |
-| 529 / 5xx | upstream trouble | bounded retry on a **different** account |
-| 400 / 404 | bad request | never retried |
+The console's form applies changes to the running process without dropping in-flight requests. Settings that only take effect on restart (`listen`, `db_path`, `max_body_bytes`) are shown as restart-only rather than silently ignored. The console never rewrites comments or keys it does not understand. The full access and reload contract is in [the console docs](docs/web-ui.md).
 
-An account switch is only possible **before the first byte reaches the client**.
-Once a response has started streaming it is relayed as-is; a streamed failure is
-reported rather than retried, because a retried stream can be billed twice.
+## Console and operations
 
-## Metrics
+The console is served by the same process and listener as the proxy:
 
-TTFT is measured to the first **content** token, skipping role-only and preamble
-chunks. TPS excludes TTFT from its denominator. Every upstream attempt is stored
-separately, so retries and account switches do not pollute the timings.
+- Board: accounts, covered allowance, metered balance, resets, inventory and price drift.
+- Usage: totals by provider/model/account, daily chart, TTFT and cache hit rate.
+- Requests: recent attempts, retries, filters and coverage.
+- Prices, Keys, Doctor and Config: the CLI's operator actions plus the config form.
+- Loopback only, no login, no cookie, no session. Mutating requests also need a JSON body and a same-origin header.
 
-Cache hit rate (cached divided by prompt tokens) is the cost metric to watch: it
-is what account switching destroys.
+Common commands:
 
-## When it does not work
-
-Start with `lgw doctor`. It parses the config, resolves every credential, probes
-every provider, checks the two things a model name can silently disagree about --
-a price entry no route can reach, and a route the provider's own `/v1/models` does
-not publish (naming the closest id it does publish) -- flags a port other machines
-can reach, and exits non-zero with a count of what is wrong.
-
-A route key is the model id sent upstream, so a wrong vendor prefix is both a
-request the provider refuses and an orphaned price entry that leaves the route
-gated at the conservative default of 15 in / 75 out per million.
-
-| Symptom | Where to look |
+| Command | What it does |
 |---|---|
-| `no eligible account` on every request | `lgw status` -- every account may be parked, disabled, or under the hard gate. The 429 body names the account with the most room, how much it has left, and the estimate that did not fit |
-| An account stays DISABLED after you fixed the key | a probe only restores an account that also shows headroom, and an operator disable is never undone by one -- see [Account recovery](#account-recovery) |
-| A password prompt on every run (macOS) | the grant is bound to the code signature, and an ad-hoc one changes on every rebuild: run `scripts/lgw-install.sh` |
-| A price looks wrong | `lgw prices --drift-only`. A learned rate is an observation, not the truth, and a configured price is never overwritten by one |
-| A learned price reads far above the card | the account was used outside the gateway, so that spend was charged to these tokens: `lgw prices --forget <provider> <model>`, then restart `lgw serve` |
-| Every request is 429 with a Retry-After of weeks | a covered window is spent and the earliest reset is that far away. `lgw status` shows a countdown per gate |
-| The board is empty after moving the database | the ledger path is `server.db_path` in the config. An empty board means "not probed yet", never "no accounts" |
+| `lgw serve` | Run the proxy and console in the foreground |
+| `lgwl launch` / `lgwl exit` | Run it in the background / stop it |
+| `lgw status` | Account board with reset countdowns |
+| `lgw doctor` | Config, credentials, probe reachability and common misconfigurations |
+| `lgw keys add/list/remove/test` | Manage provider credentials |
+| `lgw accounts list/probe/disable/enable` | Inspect and recover accounts |
+| `lgw usage --since 7d --group-by provider,model` | Usage report |
+| `lgw prices [--drift-only]` | Configured versus learned prices |
+| `lgw tail` | Recent requests |
 
-## Non-goals
+`lgw doctor` is the first thing to run when something is wrong. The launcher, logging and process lifecycle are documented in [docs/launcher.md](docs/launcher.md); day-to-day recovery and output reading are in [docs/operations.md](docs/operations.md).
 
-Cross-provider fallback, cross-model downgrade, protocol translation, semantic
-caching and multi-user RBAC are all deliberately out of scope. A model maps to
-exactly one provider; changing that is a product decision. The console is a
-single operator's loopback-only tool, not a multi-user admin panel and not a
-second API: it has no login of its own.
+## Troubleshooting
+
+| Symptom | First look |
+|---|---|
+| `no eligible account` on every request | `lgw status`: accounts may be parked, disabled or under the hard gate. The 429 body names the account with the most room. |
+| An account stays DISABLED after a fixed key | A probe restores only an account with headroom; an operator disable needs `lgw accounts enable`. |
+| A password prompt on every run (macOS) | The grant is bound to the code signature and `cargo install` creates an ad-hoc one; run `scripts/lgw-install.sh`. |
+| A price looks wrong | `lgw prices --drift-only`. A learned rate is an observation; a configured price is never overwritten by one. |
+| Every request is 429 with a long Retry-After | A covered window is spent; `lgw status` shows the reset countdown. |
+
+More symptoms and fixes: [operations](docs/operations.md).
+
+## Docs
+
+- [The console contract](docs/web-ui.md)
+- [The background launcher](docs/launcher.md)
+- [HTTP API](docs/api.md)
+- [Credentials and the macOS keychain](docs/credentials.md)
+- [Prices, learned rates and drift](docs/prices.md)
+- [Routing and the two kinds of quota](docs/routing.md)
+- [Operations and troubleshooting](docs/operations.md)
+- [GET /v1/usage contract](docs/usage-endpoint.md)
+- [Architecture decision records](docs/adr/)
 
 ## Development
 
-    cargo test                              # the whole suite, a couple of seconds
-    cargo clippy --all-targets -- -D warnings
-    cargo fmt --check
+```
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
 
-There is no CI workflow: those three plus a release build are what to run before
-a change leaves this machine. There is no tests/ directory either -- the suite
-lives beside the code it covers, in each module, and the tests are named as the
-behaviour they assert.
+There is no CI workflow: those three plus a release build are the pre-change check. Unit tests live beside the code they cover; the CLI lifecycle test is in `tests/lgwl_cli.rs`.
 
-Provider quota adapters live in src/quota. Adding a provider means implementing
-one trait and declaring its base URL, credentials and error vocabulary.
-`adapter = "none"` is deliberately not supported: an account is admitted to the
-pool only after a successful probe, so a provider with no quota source can never
-be selected. Use xkiro, command-code, deepseek or haoai.
+Provider quota adapters live in `src/quota`. Adding a provider means implementing one trait and declaring its base URL, credentials and error vocabulary. `adapter = "none"` cannot serve traffic: an account joins the pool only after a successful quota probe, so use `xkiro`, `command-code`, `deepseek` or `haoai`.
+
+## Safety
+
+- Binds to loopback by default. A non-loopback listener requires a local key; the config is refused without one rather than left to a warning.
+- Provider keys live in the OS credential store, are never logged, and are redacted on every debug/display path.
+- Probe hosts are pinned in config and redirects are refused, so a request cannot redirect a credential elsewhere.
+- A failed quota probe keeps the previous reading as stale; it never resets it to zero.
+- Prompt and response bodies are not stored.
+- Console mutations need JSON plus a same-origin header and are checked against `Host` and `Origin`.
+- Config writes are validated as a whole and replaced atomically; a file edited underneath the console is never overwritten.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Use it, modify it, ship it, sell it -- it comes with
-no warranty, and it spends real money when you configure it to.
-
-## Safety notes
-
-- Binds to loopback by default and holds paid credentials. Anything that is not
-  loopback needs a local key: the configuration is refused without one, rather
-  than left to a warning in the log.
-- Keys come from the environment or a dedicated file, are never logged, and are
-  redacted in every debug or display path.
-- Probe hosts are pinned in configuration, and redirects are refused outright, so
-  a credential cannot be sent to an address supplied with a request or named in a
-  Location header.
-- A failed quota probe keeps the previous reading and marks it stale; it never
-  resets a reading to zero.
-- Prompt and response bodies are never stored.
-- The console is served on loopback only and has no login or cookie. Mutating
-  requests need JSON and a custom header and are checked against `Host` and
-  `Origin`, so a page in another browser tab cannot drive it.
-- Configuration writes are validated as a whole and replaced atomically; a write
-  that fails changes nothing, and a file edited underneath the console is never
-  overwritten.
-- The console never displays a credential. Keys are write-only and live in the
-  operating system's credential store.
+MIT. See [LICENSE](LICENSE). Use it, modify it, ship it, sell it. It comes with no warranty, and it spends real money when you configure it to.
