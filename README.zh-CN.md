@@ -3,7 +3,7 @@
 [English](README.md) | **简体中文**
 
 一个很小的 OpenAI 兼容网关。它把同一家 provider 的多个账号汇成池子，配额窗口用尽时自动
-绕开，省得你手工切 API key。
+换号，省得你手工切 API key。
 
 把任何 OpenAI 客户端指过来即可，模型名照旧。它替每个请求挑账号，窗口满了就切，并把每笔
 花费都记下来。
@@ -49,7 +49,7 @@ cargo install --path . --locked
 lgw --version
 ```
 
-它把 `lgw` 和 `lgwl` 的 release 二进制装进 `~/.cargo/bin`。
+它会以 release 模式编译 `lgw` 和 `lgwl`，并把它们装进 `~/.cargo/bin`。
 
 **macOS 上请改用这个包装脚本：**
 
@@ -58,8 +58,8 @@ scripts/lgw-identity.sh      # 一次：创建签名证书
 scripts/lgw-install.sh       # cargo install，然后给两个二进制签名
 ```
 
-普通的 `cargo install` 会用 ad-hoc 签名覆盖已签名的二进制，钥匙串又开始问你要密码。不
-介意这些弹窗才跳过包装脚本。
+普通的 `cargo install` 会用 ad-hoc 签名覆盖已签名的二进制，钥匙串又开始问你要密码。
+不介意这些弹窗才跳过包装脚本。
 
 拿到二进制的其它办法：`cargo build --release` 后复制 `target/release/lgw`，或者
 `cargo install --git <repo-url> --locked`。用 `cargo uninstall light-ai-gateway` 可以把
@@ -142,7 +142,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 3. **先用尽优先。** 软阈值以下，用已用量最大的账号，让切换尽量少。
 4. **软阈值是偏好，不是墙。** 所有账号都超过 80% 时，只要还有余量，用量最少的那个照常服务。
 
-池子空了，网关就回答 429，附带一个真实的 Retry-After，取自最早的重置时间。它绝不悄悄跌到
+池子空了，网关就返回 429，附带一个真实的 Retry-After，取自最早的重置时间。它绝不悄悄跌到
 另一家 provider，也不会花 metered 余额。完整规则（含失败处理）见
 [路由](docs/routing.zh-CN.md)和[运维](docs/operations.zh-CN.md)。
 
@@ -155,7 +155,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ~/.light-ai-gateway/config.toml       配置
 ~/.light-ai-gateway/gateway.db        用量账本（SQLite）
 ~/.light-ai-gateway/lgwl/             启动器 pid/日志状态
-操作系统的凭据库                      provider API key
+操作系统的凭据库                      provider API keys
 ```
 
 密钥默认绝不写进文件：`lgw keys add` 把它放进系统凭据库，配置按 provider/account 名字
@@ -236,8 +236,8 @@ cargo fmt --check
 
 ## 安全
 
-- 默认只绑 loopback。监听地址不是 loopback 就必须有本地 key；缺了配置会被直接拒绝，而
-  不是只留一条警告。
+- 默认只绑 loopback。监听地址不是 loopback 就必须有本地 key；没有它，配置会被直接拒绝，
+  而不是只留一条警告。
 - Provider 密钥存在操作系统的凭据库里，从不进日志，在所有调试和展示路径里都会被脱敏。
 - 探测主机写死在配置里，重定向一律拒绝，所以请求无法把凭据重定向到别处。
 - 配额探测失败时保留上一次读数并标记为 stale；绝不把读数清零。
