@@ -1318,3 +1318,198 @@ async fn a_published_snapshot_does_not_reprice_an_in_flight_request() {
         "a request admitted after the publish uses the new price"
     );
 }
+
+// ------------------------------------------------------------- console
+
+/// A console-enabled router on an ephemeral port. The listener binds first so
+/// the console's Host allowlist pins the port the kernel actually gave us,
+/// and the service carries peer addresses the guard can read.
+async fn spawn_console_router(backend: Arc<dyn ProxyBackend>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let console = super::console::ConsoleContext::new(
+        &addr.to_string(),
+        addr.port(),
+        "/tmp/lgw-test-config.toml",
+    );
+    let app = build_router_with_console(backend, console);
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn the_console_is_served_to_the_loopback_operator() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let client = reqwest::Client::new();
+
+    let page = client.get(format!("{addr}/")).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
+    assert!(
+        page.headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("default-src 'self'")
+    );
+    let html = page.text().await.unwrap();
+    assert!(html.contains("data-theme-toggle"));
+    assert!(html.contains("data-poll"));
+    assert!(html.contains("console/partials/board"));
+    assert!(html.contains("accounts"), "the board table renders");
+}
+
+#[tokio::test]
+async fn a_foreign_host_does_not_see_the_console() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{addr}/"))
+        .header(reqwest::header::HOST, "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+}
+
+#[tokio::test]
+async fn the_console_assets_are_embedded_and_typed() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let client = reqwest::Client::new();
+
+    let css = client
+        .get(format!("{addr}/console/assets/console.css"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(css.status(), 200);
+    assert!(
+        css.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    assert!(css.text().await.unwrap().contains("--bg"));
+
+    let missing = client
+        .get(format!("{addr}/console/assets/not-a-file.js"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn the_console_speaks_both_languages_and_polls_one_renderer() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let client = reqwest::Client::new();
+
+    let chinese = client
+        .get(format!("{addr}/?lang=zh"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(chinese.contains(r#"lang="zh""#));
+    assert!(chinese.contains("账号与额度"));
+
+    let partial = client
+        .get(format!("{addr}/console/partials/board"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(partial.status(), 200);
+    let body = partial.text().await.unwrap();
+    assert!(!body.contains("<html"), "the partial is not a whole page");
+    assert!(body.contains("accounts"));
+}
+
+#[tokio::test]
+async fn console_writes_need_json_and_the_console_header() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let client = reqwest::Client::new();
+
+    let no_json = client.post(format!("{addr}/")).send().await.unwrap();
+    assert_eq!(no_json.status(), 415);
+
+    let no_header = client
+        .post(format!("{addr}/"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_header.status(), 403);
+
+    let foreign_origin = client
+        .post(format!("{addr}/"))
+        .header("content-type", "application/json")
+        .header("x-lgw-console", "1")
+        .header("origin", "http://evil.example")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_origin.status(), 403);
+
+    let method = client
+        .post(format!("{addr}/"))
+        .header("content-type", "application/json")
+        .header("x-lgw-console", "1")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(method.status(), 405);
+}
+
+#[tokio::test]
+async fn the_console_is_not_behind_the_local_key() {
+    let mut config = test_config("http://127.0.0.1:1");
+    config.server.local_key = Some(SecretRef::Literal("sk-local".into()));
+    let backend = fake_backend_with_config(config);
+    let addr = spawn_console_router(backend).await;
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        client
+            .get(format!("{addr}/"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .get(format!("{addr}/v1/usage"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{addr}/v1/usage"))
+            .bearer_auth("sk-local")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+}

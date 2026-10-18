@@ -7,6 +7,7 @@
 
 pub(crate) mod catalog;
 mod chat;
+pub(crate) mod console;
 mod models;
 mod usage;
 
@@ -284,20 +285,35 @@ impl ProxyBackend for GatewayBackend {
     }
 }
 
-/// Run the gateway until shutdown.
-pub async fn serve(config: Config) -> Result<()> {
+/// Run the proxy and the console until shutdown.
+pub async fn serve(config: Config, config_path: &std::path::Path) -> Result<()> {
     let listen = config.server.listen.clone();
     let addr: std::net::SocketAddr = listen
         .parse()
         .with_context(|| format!("invalid server.listen address {listen}"))?;
+    let config_path = config_path.display().to_string();
     let gateway = Gateway::new(config).await?;
     gateway.spawn_poller();
-    let app = build_router(gateway);
+    // Bind before building the router: the console's Host allowlist has to pin
+    // the port the kernel actually gave us, not the one in the file (which may
+    // be 0 for a test).
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    tracing::info!(%addr, "light-ai-gateway listening");
-    axum::serve(listener, app).await.context("serving HTTP")?;
+    let local = listener.local_addr().context("reading the bound address")?;
+    let console = console::ConsoleContext::new(&local.to_string(), local.port(), &config_path);
+    let app = build_router_with_console(Arc::new(GatewayBackend::new(gateway)), console);
+    tracing::info!(
+        listen = %local,
+        console = %format!("http://{local}/"),
+        "light-ai-gateway listening"
+    );
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("serving HTTP")?;
     Ok(())
 }
 
@@ -308,6 +324,15 @@ pub fn build_router(gateway: Arc<Gateway>) -> axum::Router {
 
 /// Build the router against any backend. Exposed for integration tests.
 pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
+    build_router_with_console(backend, console::ConsoleContext::for_tests())
+}
+
+/// Build the router with the listener context the console needs. Production
+/// passes the bound address; tests pass an ephemeral one.
+pub(crate) fn build_router_with_console(
+    backend: Arc<dyn ProxyBackend>,
+    console: console::ConsoleContext,
+) -> axum::Router {
     // Authentication and the body limit are startup decisions: they follow the
     // snapshot installed when the listener was assembled, not a later publish.
     let runtime = backend.runtime();
@@ -341,15 +366,37 @@ pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
             }
         },
     };
-    let state = Arc::new(AppState { backend, auth });
-    Router::new()
+    let state = Arc::new(AppState {
+        backend,
+        auth,
+        console,
+    });
+
+    let api = Router::new()
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/models", get(models::list_models))
         .route("/v1/usage", get(usage::usage))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_local_key,
+        ));
+
+    // The console is a separate surface with its own guard: the local key
+    // protects paid quota from clients, and the loopback rule protects the
+    // configuration from the network. A request never passes through both.
+    let operator = Router::new()
+        .route("/", get(console::board_page))
+        .route("/console/partials/board", get(console::board_partial))
+        .route("/console/assets/{*path}", get(console::asset))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            console::guard_console,
         ))
+        .layer(middleware::from_fn(console::security_headers));
+
+    Router::new()
+        .merge(api)
+        .merge(operator)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
@@ -357,6 +404,7 @@ pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
 struct AppState {
     backend: Arc<dyn ProxyBackend>,
     auth: LocalAuth,
+    console: console::ConsoleContext,
 }
 
 /// Local bearer authentication state.
