@@ -12,7 +12,7 @@ use crate::config_doc::{self, ConfigDocument, DraftAction, DraftChange, KeySpec}
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
 use crate::console::{
-    assets, board, config_page, copy::Lang, layout, layout::Nav, requests, usage,
+    assets, board, config_page, copy::Lang, layout, layout::Nav, prices, requests, usage,
 };
 use axum::Json;
 use axum::body::Body;
@@ -622,6 +622,63 @@ pub(super) async fn requests_page(
             .request_history(filters.limit, filters.errors_only, filters.coverage);
     let body = requests::render(history.as_deref(), filters, lang);
     page(&state, lang, Nav::Requests, body)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PricesQuery {
+    lang: Option<String>,
+}
+
+/// The Prices page: configured rates against learned rates. Read-only.
+pub(super) async fn prices_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PricesQuery>,
+) -> Response {
+    let lang = Lang::from_param(query.lang.as_deref());
+    let table = state.backend.price_table();
+    let body = prices::render(table.as_ref(), lang);
+    page(&state, lang, Nav::Prices, body)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ForgetRequest {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+/// Forget learned prices in one scope. A guarded mutation: the console guard has
+/// already required JSON, the custom header and a same-origin request; the
+/// write is the same ledger write the CLI command performs, and the live table
+/// is republished so the configured card takes over immediately.
+pub(super) async fn prices_forget(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ForgetRequest>,
+) -> Response {
+    let provider = request.provider.filter(|value| !value.trim().is_empty());
+    let model = request.model.filter(|value| !value.trim().is_empty());
+    if model.is_some() && provider.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "a model scope needs its provider" })),
+        )
+            .into_response();
+    }
+    let _serialized = state.console.apply_lock.lock().await;
+    match state
+        .backend
+        .forget_prices(provider.as_deref(), model.as_deref())
+    {
+        Ok(forgotten) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "forgotten": forgotten })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the

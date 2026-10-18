@@ -11,6 +11,7 @@ pub mod config_page;
 pub mod copy;
 pub mod guard;
 pub mod layout;
+pub mod prices;
 pub mod requests;
 pub mod usage;
 pub mod violations;

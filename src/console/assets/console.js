@@ -497,6 +497,46 @@
     })(draftForms[df]);
   }
 
+  /* --------------------------------------------------- forgetting prices */
+
+  // A scoped forget is a guarded mutation: JSON plus the console header, which
+  // headers() already supplies. The page reloads on success so the configured
+  // price is visibly back in force.
+  var forgetButtons = document.querySelectorAll("[data-forget]");
+  for (var fb = 0; fb < forgetButtons.length; fb++) {
+    (function (button) {
+      button.addEventListener("click", async function () {
+        var question = button.getAttribute("data-confirm");
+        if (question && !window.confirm(question)) { return; }
+        var payload = {};
+        var provider = button.getAttribute("data-provider");
+        var model = button.getAttribute("data-model");
+        if (provider) { payload.provider = provider; }
+        if (model) { payload.model = model; }
+        button.disabled = true;
+        try {
+          var response = await fetch("/console/api/prices/forget", {
+            method: "POST",
+            headers: headers(),
+            credentials: "same-origin",
+            body: JSON.stringify(payload)
+          });
+          if (response.ok) {
+            window.location.reload();
+            return;
+          }
+          var result = document.querySelector("[data-price-result]");
+          if (result) { result.textContent = await response.text(); }
+        } catch (error) {
+          var failed = document.querySelector("[data-price-result]");
+          if (failed) { failed.textContent = String(error); }
+        } finally {
+          button.disabled = false;
+        }
+      });
+    })(forgetButtons[fb]);
+  }
+
   /* flash messages vanish on their own; a close chip can remove them early */
   var flashes = document.querySelectorAll(".flash .close");
   for (var s = 0; s < flashes.length; s++) {

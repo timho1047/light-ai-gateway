@@ -12,6 +12,7 @@ pub mod error;
 pub mod http;
 pub mod interval;
 pub mod meter;
+pub mod prices;
 pub mod quota;
 pub mod quota_report;
 pub mod reload;

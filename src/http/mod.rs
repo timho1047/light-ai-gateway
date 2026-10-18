@@ -145,6 +145,21 @@ pub trait ProxyBackend: Send + Sync + 'static {
         None
     }
 
+    /// The configured-plus-learned price table the page reports on, read-only.
+    fn price_table(&self) -> Option<crate::meter::PriceTable> {
+        None
+    }
+
+    /// Forget learned prices in the given scope, write the ledger, and republish
+    /// the live table so the configured card is back in force.
+    fn forget_prices(
+        &self,
+        _provider: Option<&str>,
+        _model: Option<&str>,
+    ) -> std::result::Result<usize, ApplyError> {
+        Err(ApplyError("this backend cannot forget prices".to_string()))
+    }
+
     /// Recent requests with their attempt-level detail, read-only.
     fn request_history(
         &self,
@@ -313,6 +328,47 @@ impl ProxyBackend for GatewayBackend {
 
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         self.gateway.runtime().prices().drifted()
+    }
+
+    fn price_table(&self) -> Option<crate::meter::PriceTable> {
+        Some(crate::prices::load(self.gateway.runtime().config()))
+    }
+
+    fn forget_prices(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> std::result::Result<usize, ApplyError> {
+        let current = self.gateway.runtime();
+        let table = current.prices();
+        let in_scope = |row: &crate::meter::PersistedPrice| {
+            provider.is_none_or(|provider| row.provider == provider)
+                && model.is_none_or(|model| row.model == model)
+        };
+        let learned = table.learned_rows();
+        let forgotten = learned.iter().filter(|row| in_scope(row)).count();
+        if forgotten == 0 {
+            return Ok(0);
+        }
+
+        // Same ledger write as the CLI, then wait for it so the page reads the
+        // new state immediately.
+        self.gateway.store.forget_prices(provider, model);
+        self.gateway
+            .store
+            .flush_blocking()
+            .map_err(|error| ApplyError(error.to_string()))?;
+
+        // Rebuild without the forgotten rates: residual learned entries plus the
+        // configured card, and no second trip through the ledger.
+        let keep: Vec<crate::meter::PersistedPrice> =
+            learned.into_iter().filter(|row| !in_scope(row)).collect();
+        let mut next = crate::meter::PriceTable::new();
+        next.load_learned(keep);
+        next.seed_from_config(&current.config().prices);
+        self.gateway
+            .install_runtime(current.with_prices(Arc::new(next)));
+        Ok(forgotten)
     }
 
     fn request_history(
@@ -569,6 +625,8 @@ pub(crate) fn build_router_with_console(
         .route("/", get(console::board_page))
         .route("/usage", get(console::usage_page))
         .route("/requests", get(console::requests_page))
+        .route("/prices", get(console::prices_page))
+        .route("/console/api/prices/forget", post(console::prices_forget))
         .route("/config", get(console::config_page_handler))
         .route(
             "/console/api/config/validate",

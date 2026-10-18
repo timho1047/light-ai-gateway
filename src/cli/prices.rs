@@ -3,24 +3,15 @@
 use super::PricesArgs;
 use crate::ansi::Palette;
 use crate::config::Config;
-use crate::store::{self, Ledger};
+use crate::prices::PriceRow;
+use crate::store;
 use anyhow::{Result, bail};
 use rust_decimal::Decimal;
 
 /// Rebuild the price table from the config file plus whatever the ledger has
-/// learned. Used by every command that reports on prices, so they cannot drift
-/// apart.
+/// learned. The shared assembly owns the definition.
 pub(super) fn load_price_table(config: &Config) -> crate::meter::PriceTable {
-    let mut table = crate::meter::PriceTable::new();
-    table.seed_from_config(&config.prices);
-    let db = config.db_path();
-    if store::db_exists(&db)
-        && let Ok(ledger) = Ledger::open(&db)
-        && let Ok(rows) = ledger.prices()
-    {
-        table.load_learned(rows);
-    }
-    table
+    crate::prices::load(config)
 }
 
 /// The drift table, shared by the usage and prices commands.
@@ -286,85 +277,14 @@ pub(super) fn print_price_panel(config: &Config, table: &crate::meter::PriceTabl
     );
 }
 
-/// One line of the price report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PriceRow {
-    provider: String,
-    model: String,
-    /// The window's own name, or "default" for the model's plain price. The name
-    /// travels with the price, so a report never has to look the position up.
-    tier: String,
-    source: String,
-    /// Input / output / cache-read share of the tokens actually used.
-    mix: String,
-    /// Configured prices applied to that mix, per million tokens.
-    expected_per_million: String,
-    /// Observed spend over that same mix, per million tokens.
-    actual_per_million: String,
-    /// Cost drift against the configured price, or a dash when not comparable.
-    drift: String,
-    significant: bool,
-    samples: u64,
-}
-
 fn f64_of(d: Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
     d.to_f64().unwrap_or(0.0)
 }
 
-/// Build the price report. Pure, so it can be tested without a terminal.
+/// Build the price report. The shared assembly owns the ordering and wording.
 pub(super) fn price_rows(table: &crate::meter::PriceTable) -> Vec<PriceRow> {
-    let mut rows: Vec<PriceRow> = table
-        .entries()
-        .filter_map(|(provider, model, tier, entry)| {
-            let source = entry.source()?.label().to_string();
-
-            // The mix is what makes a per-million figure mean anything: the same
-            // prices produce very different per-million costs on different mixes.
-            let mix = match entry.mix_percentages() {
-                Some((i, o, c)) => format!("{i:.0}/{o:.0}/{c:.0}%"),
-                None => "-".to_string(),
-            };
-            // The two per-million figures are the same comparison as the ratio,
-            // expressed in money over the SAME observed mix, which is what makes
-            // them readable: I expected this much per million, I am paying that.
-            let drift = table.drift(provider, model, tier);
-            // Formatted straight from the Decimal: the f64 detour this used to
-            // take could not represent the value it was printing.
-            let expected_per_million = drift
-                .as_ref()
-                .map(|d| format!("${}", crate::table::money(d.expected_per_million)))
-                .unwrap_or_else(|| "-".to_string());
-            let actual_per_million = table
-                .actual_per_million(provider, model, tier)
-                .map(|(v, _)| format!("${}", crate::table::money(v)))
-                .unwrap_or_else(|| "-".to_string());
-
-            let samples = entry.learned.map(|p| p.samples).unwrap_or(0);
-            Some(PriceRow {
-                provider: provider.to_string(),
-                model: model.to_string(),
-                tier: tier.label().to_string(),
-                source,
-                mix,
-                expected_per_million,
-                actual_per_million,
-                drift: match drift {
-                    Some(d) => format!("{:+.1}%", d.ratio * 100.0),
-                    None => "-".to_string(),
-                },
-                significant: drift.is_some_and(|d| d.significant),
-                samples,
-            })
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.significant
-            .cmp(&a.significant)
-            .then_with(|| a.provider.cmp(&b.provider))
-            .then_with(|| a.model.cmp(&b.model))
-    });
-    rows
+    crate::prices::rows(table)
 }
 
 /// Forget learned prices and say what takes their place.
@@ -615,6 +535,11 @@ mod tests {
             drift: drift.to_string(),
             significant,
             samples: 24,
+            configured_in: "-".into(),
+            configured_out: "-".into(),
+            configured_cache: "-".into(),
+            learned_rate: "-".into(),
+            learned_cache: "-".into(),
         };
         let rows = vec![row("+110.5%", true), row("-", false)];
         let out = render_price_rows(&rows, &Palette::on());

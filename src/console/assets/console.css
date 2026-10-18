@@ -1834,3 +1834,77 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
 .requests-note {
   margin: 14px 0 0;
 }
+
+.prices-actions {
+  display: flex;
+  gap: 12px;
+  margin: 4px 0 14px;
+}
+
+.prices-result {
+  margin: 8px 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.prices-note {
+  margin: 8px 0 20px;
+}
+
+.prices-group {
+  margin-bottom: 30px;
+}
+
+.prices-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 10px 0 6px;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.prices-heading.model {
+  border-bottom: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.prices-heading h3,
+.prices-heading h4 {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+}
+
+.prices-table {
+  margin: 6px 0 8px;
+}
+
+.prices-table td,
+.prices-table th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.price-source {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.price-source.is-learned {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.price-drift.is-significant {
+  color: var(--warn);
+  font-weight: 500;
+}

@@ -414,6 +414,31 @@ impl ProxyBackend for FakeBackend {
         });
     }
 
+    fn price_table(&self) -> Option<crate::meter::PriceTable> {
+        Some(self.runtime().prices().clone())
+    }
+
+    fn forget_prices(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> std::result::Result<usize, crate::http::ApplyError> {
+        let current = self.runtime();
+        let learned = current.prices().learned_rows();
+        let in_scope = |row: &crate::meter::PersistedPrice| {
+            provider.is_none_or(|provider| row.provider == provider)
+                && model.is_none_or(|model| row.model == model)
+        };
+        let forgotten = learned.iter().filter(|row| in_scope(row)).count();
+        let keep: Vec<crate::meter::PersistedPrice> =
+            learned.into_iter().filter(|row| !in_scope(row)).collect();
+        let mut next = crate::meter::PriceTable::new();
+        next.load_learned(keep);
+        next.seed_from_config(&current.config().prices);
+        self.install_runtime(current.with_prices(std::sync::Arc::new(next)));
+        Ok(forgotten)
+    }
+
     fn request_history(
         &self,
         _limit: u32,
@@ -3004,4 +3029,125 @@ async fn the_requests_page_explains_an_empty_ledger() {
         .unwrap();
     assert!(html.contains("No ledger yet"));
     assert!(!html.contains("<table"));
+}
+
+fn fake_with_learned_price() -> Arc<FakeBackend> {
+    let config = Config::from_toml_str(APPLY_TOML).expect("config");
+    let fake = fake_backend_with_config(config.clone());
+    let mut table = (*fake.runtime().prices()).clone();
+    table.set(
+        "mock",
+        "mock/model",
+        &TierKey::Default,
+        crate::meter::ModelPrice {
+            input_per_token: "0.0000009".parse().unwrap(),
+            output_per_token: "0.0000009".parse().unwrap(),
+            cache_read_per_token: "0.00000009".parse().unwrap(),
+            samples: 4,
+        },
+    );
+    fake.install_runtime(Arc::new(
+        Runtime::new(Arc::new(config), Arc::new(table)).unwrap(),
+    ));
+    fake
+}
+
+#[tokio::test]
+async fn the_prices_page_shows_both_rates_and_forgets_them() {
+    let fake = fake_with_learned_price();
+    let addr = spawn_console_router(fake.clone()).await;
+
+    let page = reqwest::get(format!("{addr}/prices?lang=en"))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let page = page.text().await.unwrap();
+    assert!(page.contains("learned"));
+    assert!(page.contains("configured"));
+    assert!(page.contains("Forget model"));
+    assert!(page.contains("data-forget"));
+    assert!(page.contains("mock/model"));
+
+    let chinese = reqwest::get(format!("{addr}/prices?lang=zh"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(chinese.contains("价格"));
+    assert!(chinese.contains("mock/model"));
+
+    let response = reqwest::Client::new()
+        .post(format!("{addr}/console/api/prices/forget"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock", "model": "mock/model" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["forgotten"], 1);
+
+    let runtime = fake.runtime();
+    let after = runtime
+        .prices()
+        .entry("mock", "mock/model", &TierKey::Default)
+        .expect("entry");
+    assert!(after.learned.is_none(), "the learned rate is forgotten");
+    assert!(after.configured.is_some(), "the configured card is back");
+
+    let page = reqwest::get(format!("{addr}/prices?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("configured"));
+    assert!(!page.contains("Forget model"), "nothing is learned now");
+}
+
+#[tokio::test]
+async fn forgetting_prices_needs_the_console_guards() {
+    let fake = fake_with_learned_price();
+    let addr = spawn_console_router(fake.clone()).await;
+    // No custom header: the mutation guard refuses it before it reaches the
+    // backend, so the learned rate is untouched.
+    let response = reqwest::Client::new()
+        .post(format!("{addr}/console/api/prices/forget"))
+        .json(&serde_json::json!({ "provider": "mock" }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status(), 200);
+    let runtime = fake.runtime();
+    let entry = runtime
+        .prices()
+        .entry("mock", "mock/model", &TierKey::Default)
+        .expect("entry");
+    assert!(entry.learned.is_some(), "nothing was forgotten");
+}
+
+#[tokio::test]
+async fn a_model_scope_without_a_provider_is_refused() {
+    let addr = spawn_console_router(fake_with_learned_price()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{addr}/console/api/prices/forget"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "model": "mock/model" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 422);
+}
+
+#[tokio::test]
+async fn a_page_with_no_prices_says_so() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let html = reqwest::get(format!("{addr}/prices?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("No configured or learned prices yet") || html.contains("No ledger yet"));
 }
