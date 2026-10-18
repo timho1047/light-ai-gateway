@@ -489,7 +489,10 @@ fn percent(used: Decimal, cap: Decimal) -> String {
     let Ok(ratio) = ratio.to_string().parse::<f64>() else {
         return "—".to_string();
     };
-    let rounded = (ratio * 1000.0).round() / 10.0;
+    // Providers sometimes report more spend than the cap they gave us. The
+    // dashboard clamps at 100, exactly like the /v1/usage projection; a bar
+    // past its own end is not a more complete reading.
+    let rounded = ((ratio * 100.0).clamp(0.0, 100.0) * 10.0).round() / 10.0;
     if (rounded - rounded.round()).abs() < f64::EPSILON {
         format!("{rounded:.0}%")
     } else {
@@ -760,5 +763,13 @@ mod tests {
         let html = board(&[account], ts(1_000_000), Lang::En);
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img"));
+    }
+
+    #[test]
+    fn blended_inventory_is_clamped_and_named_as_a_blend() {
+        assert_eq!(percent(Decimal::from(30), Decimal::from(20)), "100%");
+        assert!(percent(Decimal::from(20), Decimal::from(20)).contains("100%"));
+        let html = board(&[covered_account()], ts(1_000_000), Lang::En);
+        assert!(html.contains("all windows"));
     }
 }
