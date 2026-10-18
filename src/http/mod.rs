@@ -145,6 +145,16 @@ pub trait ProxyBackend: Send + Sync + 'static {
         None
     }
 
+    /// Recent requests with their attempt-level detail, read-only.
+    fn request_history(
+        &self,
+        _limit: u32,
+        _errors_only: bool,
+        _coverage: Option<crate::domain::GateClass>,
+    ) -> Option<Vec<crate::store::RequestHistory>> {
+        None
+    }
+
     /// Build the next snapshot, persist the file through `write`, then publish.
     ///
     /// Order is the guarantee: a build failure happens before the write, and a
@@ -303,6 +313,19 @@ impl ProxyBackend for GatewayBackend {
 
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         self.gateway.runtime().prices().drifted()
+    }
+
+    fn request_history(
+        &self,
+        limit: u32,
+        errors_only: bool,
+        coverage: Option<crate::domain::GateClass>,
+    ) -> Option<Vec<crate::store::RequestHistory>> {
+        let path = self.gateway.runtime().config().db_path();
+        crate::store::Ledger::open(&path)
+            .ok()?
+            .request_history(limit, errors_only, coverage)
+            .ok()
     }
 
     fn usage_report(
@@ -545,6 +568,7 @@ pub(crate) fn build_router_with_console(
     let operator = Router::new()
         .route("/", get(console::board_page))
         .route("/usage", get(console::usage_page))
+        .route("/requests", get(console::requests_page))
         .route("/config", get(console::config_page_handler))
         .route(
             "/console/api/config/validate",

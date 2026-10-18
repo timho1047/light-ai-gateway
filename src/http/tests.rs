@@ -258,6 +258,8 @@ struct FakeBackend {
     applied_count: std::sync::atomic::AtomicUsize,
     /// A report the usage tests put here instead of opening a real ledger.
     usage: Mutex<Option<crate::store::UsageReport>>,
+    /// Requests the page tests put here instead of opening a real ledger.
+    history: Mutex<Option<Vec<crate::store::RequestHistory>>>,
 }
 
 impl FakeBackend {
@@ -270,6 +272,7 @@ impl FakeBackend {
             applied: Mutex::new(None),
             applied_count: std::sync::atomic::AtomicUsize::new(0),
             usage: Mutex::new(None),
+            history: Mutex::new(None),
         }
     }
 
@@ -409,6 +412,15 @@ impl ProxyBackend for FakeBackend {
             class,
             attempt,
         });
+    }
+
+    fn request_history(
+        &self,
+        _limit: u32,
+        _errors_only: bool,
+        _coverage: Option<crate::domain::GateClass>,
+    ) -> Option<Vec<crate::store::RequestHistory>> {
+        self.history.lock().unwrap().clone()
     }
 
     fn usage_report(
@@ -2894,4 +2906,102 @@ async fn the_usage_page_says_when_there_is_no_ledger() {
         .unwrap();
     assert!(html.contains("No ledger yet"));
     assert!(!html.contains("Covered spend"));
+}
+
+fn requests_fixture() -> Vec<crate::store::RequestHistory> {
+    use crate::domain::{GateClass, RequestStatus, RequestSummary};
+    use crate::store::{AttemptDetail, RequestHistory};
+    let at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    let money = |text: &str| text.parse::<Decimal>().expect("decimal");
+    let request =
+        |id: &str, coverage: GateClass, status: RequestStatus, retries: u32, cost: &str| {
+            RequestSummary {
+                ts: at,
+                request_id: id.to_string(),
+                provider: "xkiro".to_string(),
+                account_id: "acc-1".to_string(),
+                model: "z-ai/glm-5.3-flash".to_string(),
+                input_tokens: 1_200,
+                output_tokens: 300,
+                cached_tokens: 1_024,
+                ttft_ms: Some(240),
+                tps: Some(45.2),
+                coverage,
+                status,
+                cost: money(cost),
+                currency: "USD".to_string(),
+                retries,
+            }
+        };
+    let attempt = |no: u32, code: Option<u16>, class: Option<&str>| AttemptDetail {
+        attempt_no: no,
+        account_id: "acc-1".to_string(),
+        provider: "xkiro".to_string(),
+        started_at: at + time::Duration::seconds(i64::from(no)),
+        ttft_ms: if class.is_some() { None } else { Some(240) },
+        status_code: code,
+        error_class: class.map(str::to_string),
+        retry_after_ms: None,
+        billed: class.is_none(),
+    };
+    vec![
+        RequestHistory {
+            request: request("r1", GateClass::Covered, RequestStatus::Ok, 1, "0.25"),
+            attempts: vec![
+                attempt(1, Some(429), Some("quota_exhausted")),
+                attempt(2, Some(200), None),
+            ],
+        },
+        RequestHistory {
+            request: request("r2", GateClass::Metered, RequestStatus::Error, 0, "0.5"),
+            attempts: vec![attempt(1, Some(402), Some("quota_exhausted"))],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn the_requests_page_shows_attempts_and_filters() {
+    let fake = fake_backend("http://127.0.0.1:1");
+    *fake.history.lock().unwrap() = Some(requests_fixture());
+    let addr = spawn_console_router(fake.clone()).await;
+
+    let english = reqwest::get(format!("{addr}/requests?lang=en&limit=50"))
+        .await
+        .unwrap();
+    assert_eq!(english.status(), 200);
+    let english = english.text().await.unwrap();
+    assert!(english.contains("quota_exhausted"));
+    assert!(english.contains("2 / 2"));
+    assert!(english.contains("retried"));
+    assert!(english.contains("0.25 USD"));
+    assert!(english.contains("0.5 USD"));
+    assert!(english.contains("metered"));
+    assert!(english.contains("errors only"));
+    assert!(english.contains("coverage=metered"), "filters are links");
+
+    let chinese = reqwest::get(format!(
+        "{addr}/requests?errors=1&coverage=metered&limit=25&lang=zh"
+    ))
+    .await
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    for number in ["0.25 USD", "0.5 USD", "1.2K / 300"] {
+        assert!(chinese.contains(number), "ZH missing {number}");
+    }
+    assert!(chinese.contains("请求"));
+}
+
+#[tokio::test]
+async fn the_requests_page_explains_an_empty_ledger() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let html = reqwest::get(format!("{addr}/requests?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("No ledger yet"));
+    assert!(!html.contains("<table"));
 }

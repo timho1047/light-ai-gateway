@@ -1175,6 +1175,17 @@ impl Ledger {
         recent_requests(&self.conn, limit)
     }
 
+    /// Recent requests with attempt-level detail, for the console page. Reads
+    /// the same request assembly as tail and adds the attempts it needs.
+    pub fn request_history(
+        &self,
+        limit: u32,
+        errors_only: bool,
+        coverage: Option<GateClass>,
+    ) -> Result<Vec<RequestHistory>> {
+        request_history(&self.conn, limit, errors_only, coverage)
+    }
+
     /// The Board's live-ish vitals, read from the request history.
     pub fn board_vitals(&self, now: OffsetDateTime) -> Result<BoardVitals> {
         board_vitals(&self.conn, now)
@@ -1514,12 +1525,33 @@ fn usage_rows(
 /// ts only has one-second resolution, so ties are broken by insertion order
 /// (rowid) to keep the tail stable across calls.
 fn recent_requests(conn: &Connection, limit: u32) -> Result<Vec<RequestSummary>> {
-    let mut stmt = conn.prepare(
+    recent_requests_filtered(conn, limit, false, None)
+}
+
+/// The same rows as the tail, optionally narrowed to failures or one coverage
+/// class. The console page and the terminal tail share this assembly; the
+/// terminal renderer simply ignores the fields it does not print.
+fn recent_requests_filtered(
+    conn: &Connection,
+    limit: u32,
+    errors_only: bool,
+    coverage: Option<GateClass>,
+) -> Result<Vec<RequestSummary>> {
+    let condition = match (errors_only, coverage.is_some()) {
+        (false, false) => "1 = 1",
+        (true, false) => "status != 'ok'",
+        (false, true) => "coverage = ?2",
+        (true, true) => "status != 'ok' AND coverage = ?2",
+    };
+    let sql = format!(
         "SELECT ts, id, provider, account_id, model, prompt_tokens, completion_tokens,
-                cached_tokens, ttft_ms, tps, coverage, status
-         FROM requests ORDER BY ts DESC, rowid DESC LIMIT ?1",
-    )?;
-    let mapped = stmt.query_map(params![i64::from(limit)], |row| {
+                cached_tokens, ttft_ms, tps, coverage, status, cost, currency, retries
+         FROM requests WHERE {condition} ORDER BY ts DESC, rowid DESC LIMIT ?1"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("preparing the request history")?;
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<RequestSummary> {
         Ok(RequestSummary {
             ts: i2t(row.get::<_, i64>(0)?),
             request_id: row.get(1)?,
@@ -1541,9 +1573,87 @@ fn recent_requests(conn: &Connection, limit: u32) -> Result<Vec<RequestSummary>>
                 .as_deref()
                 .and_then(parse_status)
                 .unwrap_or(RequestStatus::Error),
+            cost: row
+                .get::<_, Option<String>>(12)?
+                .as_deref()
+                .and_then(crate::domain::parse_money)
+                .unwrap_or(Decimal::ZERO),
+            currency: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+            retries: i2u(row.get::<_, i64>(14)?) as u32,
         })
-    })?;
+    };
+    let mapped = match coverage {
+        Some(coverage) => stmt.query_map(
+            rusqlite::params![i64::from(limit), coverage_str(coverage)],
+            map,
+        )?,
+        None => stmt.query_map(rusqlite::params![i64::from(limit)], map)?,
+    };
     Ok(mapped.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// One attempt belonging to a request: its own account, start time and timing.
+#[derive(Debug, Clone)]
+pub struct AttemptDetail {
+    pub attempt_no: u32,
+    pub account_id: crate::domain::AccountId,
+    pub provider: crate::domain::ProviderId,
+    pub started_at: OffsetDateTime,
+    pub ttft_ms: Option<u64>,
+    pub status_code: Option<u16>,
+    pub error_class: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub billed: bool,
+}
+
+/// A request plus the attempts that produced it.
+#[derive(Debug, Clone)]
+pub struct RequestHistory {
+    pub request: RequestSummary,
+    pub attempts: Vec<AttemptDetail>,
+}
+
+impl RequestHistory {
+    /// How many attempts the request's own retry counter says it made. A
+    /// request restored without its attempt rows still labels its one row.
+    pub fn attempts_total(&self) -> u32 {
+        self.request.retries.saturating_add(1)
+    }
+}
+
+/// The Requests page's assembly: recent requests (filtered) with their
+/// attempt-level detail. Read-only, like every Ledger method.
+pub fn request_history(
+    conn: &Connection,
+    limit: u32,
+    errors_only: bool,
+    coverage: Option<GateClass>,
+) -> Result<Vec<RequestHistory>> {
+    let requests = recent_requests_filtered(conn, limit, errors_only, coverage)?;
+    let mut attempts = conn.prepare(
+        "SELECT attempt_no, account_id, provider, started_at, ttft_ms, status_code,
+                error_class, retry_after_ms, billed
+         FROM attempts WHERE request_id = ?1 ORDER BY attempt_no",
+    )?;
+    let mut out = Vec::with_capacity(requests.len());
+    for request in requests {
+        let rows = attempts.query_map(rusqlite::params![request.request_id], |row| {
+            Ok(AttemptDetail {
+                attempt_no: i2u(row.get::<_, i64>(0)?) as u32,
+                account_id: row.get(1)?,
+                provider: row.get(2)?,
+                started_at: i2t(row.get::<_, i64>(3)?),
+                ttft_ms: row.get::<_, Option<i64>>(4)?.map(i2u),
+                status_code: row.get::<_, Option<i64>>(5)?.map(|code| code as u16),
+                error_class: row.get(6)?,
+                retry_after_ms: row.get::<_, Option<i64>>(7)?.map(i2u),
+                billed: row.get::<_, i64>(8)? != 0,
+            })
+        })?;
+        let attempts = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        out.push(RequestHistory { request, attempts });
+    }
+    Ok(out)
 }
 
 /// True when the database file exists and is non-empty.
@@ -2692,6 +2802,90 @@ mod tests {
         assert_eq!(row.6, 4096);
 
         drop(handle);
+    }
+
+    #[test]
+    fn request_history_joins_attempts_and_honours_filters() {
+        let tmp = TempDb::new("history");
+        let handle = StoreHandle::spawn(&tmp.path).expect("spawn");
+
+        let mut retried = request("req-1", DAY1, "xkiro", "a1", "m1", "0.25");
+        retried.retries = 1;
+        handle.record_request(retried);
+        for (no, status, class) in [
+            (1, Some(429), Some(UpstreamErrorClass::QuotaExhausted)),
+            (2, Some(200), None),
+        ] {
+            handle.record_attempt(AttemptRecord {
+                request_id: "req-1".to_string(),
+                attempt_no: no,
+                account_id: "a1".to_string(),
+                provider: "xkiro".to_string(),
+                started_at: ts(DAY1 + i64::from(no)),
+                ttft_ms: Some(120 * u64::from(no)),
+                status_code: status,
+                error_class: class,
+                error_code: None,
+                retry_after_ms: None,
+                billed: class.is_none(),
+                bytes_sent: 0,
+            });
+        }
+
+        let mut metered = request("req-2", DAY2, "deepseek", "d1", "m2", "0.5");
+        metered.coverage = GateClass::Metered;
+        metered.status = RequestStatus::Error;
+        handle.record_request(metered);
+        handle.record_attempt(AttemptRecord {
+            request_id: "req-2".to_string(),
+            attempt_no: 1,
+            account_id: "d1".to_string(),
+            provider: "deepseek".to_string(),
+            started_at: ts(DAY2),
+            ttft_ms: None,
+            status_code: Some(402),
+            error_class: Some(UpstreamErrorClass::QuotaExhausted),
+            error_code: None,
+            retry_after_ms: None,
+            billed: false,
+            bytes_sent: 0,
+        });
+        handle.flush_blocking().expect("flush");
+        drop(handle);
+
+        let conn = open_readonly(&tmp.path).expect("readonly");
+
+        let all = request_history(&conn, 10, false, None).expect("all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].request.request_id, "req-2", "newest first");
+        assert_eq!(all[0].attempts.len(), 1);
+        assert_eq!(all[0].attempts[0].status_code, Some(402));
+        assert_eq!(all[0].request.cost, dec("0.5"));
+        assert_eq!(all[0].request.currency, "USD");
+        assert_eq!(all[1].request.request_id, "req-1");
+        assert_eq!(all[1].attempts_total(), 2);
+        assert_eq!(all[1].attempts.len(), 2);
+        assert_eq!(
+            all[1].attempts[0].error_class.as_deref(),
+            Some("quota_exhausted")
+        );
+        assert_eq!(all[1].attempts[1].error_class, None);
+        assert_eq!(all[1].attempts[1].ttft_ms, Some(240));
+
+        let errors = request_history(&conn, 10, true, None).expect("errors");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].request.request_id, "req-2");
+
+        let covered = request_history(&conn, 10, false, Some(GateClass::Covered)).expect("covered");
+        assert_eq!(covered.len(), 1);
+        assert_eq!(covered[0].request.request_id, "req-1");
+        let metered = request_history(&conn, 10, false, Some(GateClass::Metered)).expect("metered");
+        assert_eq!(metered.len(), 1);
+        assert_eq!(metered[0].request.request_id, "req-2");
+
+        let limited = request_history(&conn, 1, false, None).expect("limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].request.request_id, "req-2");
     }
 
     #[test]

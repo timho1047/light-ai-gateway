@@ -475,6 +475,12 @@ pub struct RequestSummary {
     pub tps: Option<f64>,
     pub coverage: GateClass,
     pub status: RequestStatus,
+    /// What the whole request cost, and in which currency. Request-level: the
+    /// cost is not per attempt.
+    pub cost: Decimal,
+    pub currency: String,
+    /// How many attempts this request needed (retries + the first try).
+    pub retries: u32,
 }
 
 /// Account plus gates, as restored from disk for the CLI.

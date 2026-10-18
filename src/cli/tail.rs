@@ -134,6 +134,9 @@ mod tests {
             tps: Some(45.25),
             coverage,
             status,
+            cost: rust_decimal::Decimal::ZERO,
+            currency: "USD".into(),
+            retries: 0,
         };
         let bad = render_tail(
             &[summary(RequestStatus::Error, GateClass::Metered)],
@@ -165,6 +168,9 @@ mod tests {
             tps: Some(45.25),
             coverage: GateClass::Covered,
             status: RequestStatus::Ok,
+            cost: rust_decimal::Decimal::ZERO,
+            currency: "USD".into(),
+            retries: 0,
         }];
         let text = render_tail(&rows, &Palette::off());
         assert!(text.contains("TIME"));

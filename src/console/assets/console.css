@@ -1790,3 +1790,47 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
     grid-template-columns: 1fr;
   }
 }
+
+.requests-table td,
+.requests-table th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.requests-table td {
+  vertical-align: top;
+}
+
+.request-status {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.request-status.is-bad {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.request-coverage.is-metered {
+  color: var(--warn);
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.requests-note {
+  margin: 14px 0 0;
+}

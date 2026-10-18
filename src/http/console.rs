@@ -11,7 +11,9 @@ use crate::config::Config;
 use crate::config_doc::{self, ConfigDocument, DraftAction, DraftChange, KeySpec};
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
-use crate::console::{assets, board, config_page, copy::Lang, layout, layout::Nav, usage};
+use crate::console::{
+    assets, board, config_page, copy::Lang, layout, layout::Nav, requests, usage,
+};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -590,6 +592,36 @@ pub(super) async fn usage_page(
         .usage_report(now, range.since(now), &[group.group_by()]);
     let body = usage::render(report.as_ref(), range, group, lang);
     page(&state, lang, Nav::Usage, body)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RequestsQuery {
+    limit: Option<u32>,
+    errors: Option<String>,
+    coverage: Option<String>,
+    lang: Option<String>,
+}
+
+/// The Requests page. Read-only: both the request rows and their attempts come
+/// from the ledger assembly the terminal tail also uses.
+pub(super) async fn requests_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RequestsQuery>,
+) -> Response {
+    let lang = Lang::from_param(query.lang.as_deref());
+    let coverage = match query.coverage.as_deref() {
+        Some("covered") => Some(crate::domain::GateClass::Covered),
+        Some("metered") => Some(crate::domain::GateClass::Metered),
+        _ => None,
+    };
+    let filters =
+        requests::Filters::sanitise(query.limit, query.errors.as_deref() == Some("1"), coverage);
+    let history =
+        state
+            .backend
+            .request_history(filters.limit, filters.errors_only, filters.coverage);
+    let body = requests::render(history.as_deref(), filters, lang);
+    page(&state, lang, Nav::Requests, body)
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the
