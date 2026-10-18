@@ -42,19 +42,31 @@ pub fn render(view: &ConfigView) -> String {
     out.push_str(&panel("server", s.section_server, |body| {
         // Listener settings are read-only here: they take effect on the next
         // start, and an editable input would imply an Apply can move them.
-        field(body, "server.listen", &view.config.server.listen, false, s);
-        field(
+        readonly_field(
             body,
+            &["server", "listen"],
+            "server.listen",
+            &view.config.server.listen,
+            s,
+        );
+        readonly_field(
+            body,
+            &["server", "db_path"],
             "server.db_path",
             &view.config.server.db_path,
-            false,
             s,
         );
         let local_key = match &view.config.server.local_key {
             Some(secret) => secret.describe(),
             None => s.config_none.to_string(),
         };
-        field(body, "server.local_key", &local_key, false, s);
+        readonly_field(
+            body,
+            &["server", "local_key"],
+            "server.local_key",
+            &local_key,
+            s,
+        );
     }));
 
     out.push_str(&panel("policy", s.section_policy, |body| {
@@ -155,11 +167,11 @@ pub fn render(view: &ConfigView) -> String {
             true,
             s,
         );
-        field(
+        readonly_field(
             body,
+            &["policy", "max_body_bytes"],
             "policy.max_body_bytes",
             &p.max_body_bytes.to_string(),
-            false,
             s,
         );
     }));
@@ -213,13 +225,13 @@ pub fn render(view: &ConfigView) -> String {
                 true,
                 s,
             );
-            field(
+            readonly_field(
                 body,
+                &[provider_path[0], provider_path[1], "allow_metered"],
                 "allow_metered",
                 &cfg.allow_metered
                     .map(flag)
                     .unwrap_or_else(|| s.follows_policy.to_string()),
-                true,
                 s,
             );
             for (id, account) in &cfg.accounts {
@@ -576,11 +588,15 @@ fn data_path(path: &[&str]) -> String {
     format!("[{}]", segments.join(","))
 }
 
-fn marker(live: bool, s: &Strings) -> String {
-    let (class, text) = if live {
-        ("live", s.config_live)
-    } else {
-        ("restart", s.config_restart)
+fn marker_for_path(path: &[&str], s: &Strings) -> String {
+    let owned: Vec<String> = path.iter().map(|segment| segment.to_string()).collect();
+    let class = crate::editable::field(&owned)
+        .map(|policy| policy.class)
+        .unwrap_or(crate::editable::FieldClass::ReadOnly);
+    let (class, text) = match class {
+        crate::editable::FieldClass::Live => ("live", s.config_live),
+        crate::editable::FieldClass::RestartOnly => ("restart", s.config_restart),
+        crate::editable::FieldClass::ReadOnly => ("readonly", s.config_readonly),
     };
     format!("<span class=\"tag {}\">{}</span>", class, esc(text))
 }
@@ -590,7 +606,7 @@ fn editable_text(
     path: &[&str],
     label: &str,
     value: &str,
-    live: bool,
+    _live: bool,
     s: &Strings,
 ) {
     let _ = write!(
@@ -600,7 +616,7 @@ fn editable_text(
         esc(value),
         esc(&data_path(path)),
         esc(value),
-        marker(live, s),
+        marker_for_path(path, s),
     );
 }
 
@@ -609,7 +625,7 @@ fn editable_bool(
     path: &[&str],
     label: &str,
     value: bool,
-    live: bool,
+    _live: bool,
     s: &Strings,
 ) {
     let true_selected = if value { " selected" } else { "" };
@@ -620,7 +636,7 @@ fn editable_bool(
         esc(label),
         esc(&data_path(path)),
         if value { "true" } else { "false" },
-        marker(live, s),
+        marker_for_path(path, s),
     );
 }
 
@@ -842,19 +858,14 @@ fn subhead(out: &mut String, label: &str) {
     let _ = write!(out, "<h3 class=\"section-sub mono\">{}</h3>", esc(label));
 }
 
-fn field(out: &mut String, label: &str, value: &str, applies_live: bool, s: &Strings) {
-    let (class, marker) = if applies_live {
-        ("live", s.config_live)
-    } else {
-        ("restart", s.config_restart)
-    };
+fn readonly_field(out: &mut String, path: &[&str], label: &str, value: &str, s: &Strings) {
+    let marker = marker_for_path(path, s);
     let _ = write!(
         out,
-        r#"<div class="field"><span class="field-label mono">{}</span><span class="mono">{}</span><span class="hint"><span class="tag {}">{}</span></span></div>"#,
+        r#"<div class="field"><span class="field-label mono">{}</span><span class="mono">{}</span><span class="hint">{}</span></div>"#,
         esc(label),
         esc(value),
-        class,
-        esc(marker),
+        marker,
     );
 }
 
@@ -900,7 +911,20 @@ fn account_fields(
         true,
         s,
     );
-    field(out, "key source", &source, true, s);
+    readonly_field(
+        out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "key",
+            "source",
+        ],
+        "key source",
+        &source,
+        s,
+    );
     editable_text(
         out,
         &[
@@ -963,14 +987,20 @@ fn account_fields(
         true,
         s,
     );
-    field(
+    readonly_field(
         out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "allow_metered",
+        ],
         "allow_metered",
         &account
             .allow_metered
             .map(flag)
             .unwrap_or_else(|| s.follows_provider.to_string()),
-        true,
         s,
     );
 }
@@ -1125,6 +1155,10 @@ mod tests {
             "listen and db_path need a restart"
         );
         assert!(html.contains("applies live"));
+        assert!(
+            html.contains("read-only"),
+            "secrets and allow_metered carry a read-only marker"
+        );
     }
 
     #[test]

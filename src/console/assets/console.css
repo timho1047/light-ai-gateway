@@ -2298,3 +2298,5 @@ html[data-theme="dark"] .theme-light-label {
 .config-panel:focus {
   outline: none;
 }
+
+.tag.readonly { color: var(--faint); }
