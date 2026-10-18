@@ -251,6 +251,8 @@ struct FakeBackend {
     pool: Pool,
     successes: Mutex<Vec<RecordedSuccess>>,
     failures: Mutex<Vec<RecordedFailure>>,
+    /// The last configuration published through the apply seam, if any.
+    applied: Mutex<Option<Config>>,
 }
 
 impl FakeBackend {
@@ -260,6 +262,7 @@ impl FakeBackend {
             pool,
             successes: Mutex::new(Vec::new()),
             failures: Mutex::new(Vec::new()),
+            applied: Mutex::new(None),
         }
     }
 
@@ -400,6 +403,19 @@ impl ProxyBackend for FakeBackend {
             attempt,
         });
     }
+
+    fn apply_config(
+        &self,
+        config: Config,
+        write: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::result::Result<(), crate::http::ApplyError> {
+        let runtime = runtime_for(&config);
+        write().map_err(|error| crate::http::ApplyError(error.to_string()))?;
+        self.pool.retune(&config.policy);
+        self.install_runtime(runtime);
+        *self.applied.lock().unwrap() = Some(config);
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------ helpers
@@ -444,8 +460,8 @@ fn activate(pool: &Pool, qualified_id: &str, used: i64) {
 
 /// A config whose mock provider publishes a per-million price, so settlement can
 /// be attributed to the snapshot a request admitted under.
-fn priced_config(base_url: &str, input: f64, output: f64) -> Config {
-    let toml = format!(
+fn priced_toml(base_url: &str, input: f64, output: f64) -> String {
+    format!(
         r#"
 [server]
 listen = "127.0.0.1:0"
@@ -470,8 +486,11 @@ output = {output}
 [routes]
 "mock/model" = "mock"
 "#
-    );
-    Config::from_toml_str(&toml).unwrap()
+    )
+}
+
+fn priced_config(base_url: &str, input: f64, output: f64) -> Config {
+    Config::from_toml_str(&priced_toml(base_url, input, output)).unwrap()
 }
 
 fn table_for(config: &Config) -> PriceTable {
@@ -1632,13 +1651,17 @@ async fn validate_router() -> (String, std::path::PathBuf, std::path::PathBuf) {
     activate(&pool, "mock/a1", 0);
     let fake = Arc::new(FakeBackend::new(config, pool));
 
+    // The timestamp alone collides when parallel tests call this in the same
+    // clock tick, and then one test's cleanup deletes another's file.
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = format!(
-        "lgw-validate-{}-{}",
+        "lgw-validate-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let dir = std::env::temp_dir().join(unique);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1746,5 +1769,314 @@ async fn a_draft_from_an_older_file_asks_for_a_reload() {
         .unwrap();
     assert_eq!(unknown.status(), 422);
     assert!(unknown.text().await.unwrap().contains("policy.made_up"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const APPLY_TOML: &str = r#"[server]
+listen = "127.0.0.1:8787"
+
+[policy]
+soft_threshold = 0.8
+max_retries = 2
+
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-apply-a1"
+
+[providers.mock.accounts.a2]
+key = "sk-apply-a2"
+
+[routes]
+"mock/model" = "mock"
+
+[prices.mock."mock/model"]
+input = 0.15
+output = 0.60
+"#;
+
+/// A console router over a real configuration file, with a backend built from
+/// the same file. Returns the base URL, the backend (so the test can see what
+/// was published) and the file paths.
+async fn apply_router() -> (
+    String,
+    Arc<FakeBackend>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let config = Config::from_toml_str(APPLY_TOML).expect("valid config");
+    let fake = fake_backend_with_config(config);
+    let unique = format!(
+        "lgw-apply-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, APPLY_TOML).unwrap();
+    let addr = spawn_console_router_with(fake.clone(), path.to_str().unwrap()).await;
+    (addr, fake, path, dir)
+}
+
+fn apply_body(path: &[&str], value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(APPLY_TOML),
+        "draft": [{"path": path, "value": value}]
+    })
+}
+
+async fn post_apply(addr: &str, body: &serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{addr}/console/api/config/apply?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_apply_writes_the_file_atomically_and_publishes_the_new_policy() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let response = post_apply(&addr, &apply_body(&["policy", "soft_threshold"], "0.75")).await;
+    assert_eq!(response.status(), 200);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("Applied."));
+    assert!(html.contains("+soft_threshold = 0.75"));
+    assert!(html.contains("data-applied"));
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("soft_threshold = 0.75"));
+    assert!(!on_disk.contains("soft_threshold = 0.8"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an applied configuration is private");
+    }
+    let published = fake
+        .applied
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("a snapshot was published");
+    assert_eq!(published.policy.soft_threshold, 0.75);
+    assert_eq!(fake.runtime().config().policy.soft_threshold, 0.75);
+
+    let page = reqwest::get(format!("{addr}/config?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("value=\"0.75\""),
+        "the page describes the applied file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_restart_only_apply_is_refused_by_name_and_writes_nothing() {
+    let (addr, _fake, path, dir) = apply_router().await;
+    let before = std::fs::read(&path).unwrap();
+    let response = post_apply(&addr, &apply_body(&["policy", "max_body_bytes"], "1048576")).await;
+    assert_eq!(response.status(), 422);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("policy.max_body_bytes"));
+    assert!(html.contains("need a restart"));
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_apply_of_a_section_without_a_live_path_is_refused_and_writes_nothing() {
+    let (addr, _fake, path, dir) = apply_router().await;
+    let before = std::fs::read(&path).unwrap();
+    let response = post_apply(
+        &addr,
+        &apply_body(
+            &["providers", "mock", "base_url"],
+            "https://elsewhere.example/v1",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), 422);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("providers.mock.base_url"));
+    assert!(html.contains("cannot be applied"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_stale_apply_leaves_the_newer_file_untouched() {
+    let (addr, _fake, path, dir) = apply_router().await;
+    let newer = format!("{APPLY_TOML}\n# written by another editor\n");
+    std::fs::write(&path, &newer).unwrap();
+    let response = post_apply(&addr, &apply_body(&["policy", "soft_threshold"], "0.75")).await;
+    assert_eq!(response.status(), 409);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("changed after this page loaded")
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn two_applies_at_once_end_in_one_consistent_configuration() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let left_body = apply_body(&["policy", "soft_threshold"], "0.7");
+    let right_body = apply_body(&["policy", "soft_threshold"], "0.6");
+    let (left, right) = tokio::join!(
+        post_apply(&addr, &left_body),
+        post_apply(&addr, &right_body),
+    );
+    let mut statuses = [left.status().as_u16(), right.status().as_u16()];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [200, 409],
+        "one apply wins and one is refused as stale"
+    );
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let published = fake.applied.lock().unwrap().clone().expect("one snapshot");
+    assert_eq!(
+        published.policy.soft_threshold,
+        if on_disk.contains("soft_threshold = 0.7") {
+            0.7
+        } else {
+            0.6
+        },
+        "the file and the running snapshot agree"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_apply_during_a_stream_keeps_the_in_flight_request_on_its_snapshot() {
+    let (upstream_url, _mock, started, release) = spawn_held_mock().await;
+    let toml = priced_toml(&upstream_url, 1.0, 2.0);
+    let config = Config::from_toml_str(&toml).unwrap();
+    let fake = fake_backend_with_config(config.clone());
+
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "lgw-apply-stream-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, &toml).unwrap();
+    let addr = spawn_console_router_with(fake.clone(), path.to_str().unwrap()).await;
+
+    let client = reqwest::Client::new();
+    let first = {
+        let client = client.clone();
+        let url = format!("{addr}/v1/chat/completions");
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .json(&chat_body(true))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        })
+    };
+    started.await.unwrap();
+    assert!(fake.successes.lock().unwrap().is_empty(), "still in flight");
+
+    let response = reqwest::Client::new()
+        .post(format!("{addr}/console/api/config/apply?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({
+            "fingerprint": crate::config_doc::fingerprint(&toml),
+            "draft": [{"path": ["policy", "max_retries"], "value": "5"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        fake.runtime().config().policy.max_retries,
+        5,
+        "the new snapshot is live while the stream is still open"
+    );
+
+    release.send(()).unwrap();
+    let relayed = first.await.unwrap();
+    assert!(
+        relayed.contains("[DONE]"),
+        "the held stream completes: {relayed}"
+    );
+    wait_for_successes(&fake, 1).await;
+    let old_prices = table_for(&config);
+    let usage = fake.successes.lock().unwrap()[0].usage.clone();
+    let at_admission = old_prices
+        .estimate(
+            "mock",
+            "mock/model",
+            &TierKey::Default,
+            &usage,
+            Decimal::ONE,
+        )
+        .expect("the admitting snapshot prices this model");
+    assert_eq!(
+        fake.successes.lock().unwrap()[0].cost,
+        at_admission,
+        "the in-flight request settles on the snapshot that admitted it"
+    );
+
+    let later = client
+        .post(format!("{addr}/v1/chat/completions"))
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(later.status(), 200);
+    let _ = later.text().await.unwrap();
+    wait_for_successes(&fake, 2).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_invalid_apply_changes_neither_the_file_nor_the_snapshot() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let before = std::fs::read(&path).unwrap();
+    let response = post_apply(&addr, &apply_body(&["policy", "soft_threshold"], "1.5")).await;
+    assert_eq!(response.status(), 422);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("policy.soft_threshold"));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the file is untouched"
+    );
+    assert!(
+        fake.applied.lock().unwrap().is_none(),
+        "no snapshot was published"
+    );
+    assert_eq!(fake.runtime().config().policy.soft_threshold, 0.8);
     let _ = std::fs::remove_dir_all(&dir);
 }

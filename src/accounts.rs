@@ -41,7 +41,7 @@ use crate::error::UpstreamErrorClass;
 use crate::tier::TierKey;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
@@ -349,11 +349,30 @@ struct PoolInner {
 #[derive(Clone)]
 pub struct Pool {
     inner: Arc<Mutex<PoolInner>>,
+    /// The policy knobs an apply is allowed to retune on a running pool. Behind
+    /// one lock so a request never reads half of an apply's new policy.
+    policy: Arc<RwLock<PoolPolicy>>,
+    /// Last time a request was served, used to pick the polling cadence.
+    last_activity: Arc<Mutex<Instant>>,
+}
+
+/// The three policy values admission reads. Copied under one lock so an apply
+/// cannot expose a half-changed policy to a request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PoolPolicy {
     soft_threshold: f64,
     allow_metered: bool,
     hard_margin: Decimal,
-    /// Last time a request was served, used to pick the polling cadence.
-    last_activity: Arc<Mutex<Instant>>,
+}
+
+impl From<&PolicyConfig> for PoolPolicy {
+    fn from(policy: &PolicyConfig) -> PoolPolicy {
+        PoolPolicy {
+            soft_threshold: policy.soft_threshold,
+            allow_metered: policy.allow_metered,
+            hard_margin: Decimal::try_from(policy.hard_margin).unwrap_or(Decimal::ZERO),
+        }
+    }
 }
 
 impl Pool {
@@ -367,19 +386,39 @@ impl Pool {
                 recent_costs: std::collections::VecDeque::new(),
                 rpm_window: HashMap::new(),
             })),
-            soft_threshold: policy.soft_threshold,
-            allow_metered: policy.allow_metered,
-            hard_margin: Decimal::try_from(policy.hard_margin).unwrap_or(Decimal::ZERO),
+            policy: Arc::new(RwLock::new(PoolPolicy::from(policy))),
             last_activity: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
     pub fn allow_metered(&self) -> bool {
-        self.allow_metered
+        self.policy().allow_metered
     }
 
     pub fn soft_threshold(&self) -> f64 {
-        self.soft_threshold
+        self.policy().soft_threshold
+    }
+
+    fn hard_margin(&self) -> Decimal {
+        self.policy().hard_margin
+    }
+
+    fn policy(&self) -> PoolPolicy {
+        match self.policy.read() {
+            Ok(policy) => *policy,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Accept a new policy on the running pool. Accounts, sticky sessions and
+    /// in-flight reservations stay exactly as they are: only the three values
+    /// the next admission reads move.
+    pub fn retune(&self, policy: &PolicyConfig) {
+        let next = PoolPolicy::from(policy);
+        match self.policy.write() {
+            Ok(mut current) => *current = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
     }
 
     pub fn note_activity(&self) {
@@ -448,7 +487,7 @@ impl Pool {
             .get(qualified)
             .map(|e| e.committed)
             .unwrap_or(Decimal::ZERO);
-        p95.max(inflight) + self.hard_margin
+        p95.max(inflight) + self.hard_margin()
     }
 
     /// p95 of recently completed request costs.
@@ -518,7 +557,7 @@ impl Pool {
         let needed = est_cost + reserve;
         // Spending real money is a per-account question: the provider's own
         // answer outranks the policy, in both directions.
-        let allow_metered = acct.allow_metered.unwrap_or(self.allow_metered);
+        let allow_metered = acct.allow_metered.unwrap_or_else(|| self.allow_metered());
 
         if acct.has_covered() {
             match self.covered_headroom(acct) {
@@ -702,7 +741,7 @@ impl Pool {
         let mut best: Option<(String, Decimal, RejectReason)> = None;
         // The largest reserve any account was asked to keep clear, so a refusal
         // can carry the arithmetic that produced it.
-        let mut gate_reserve = self.hard_margin;
+        let mut gate_reserve = self.hard_margin();
 
         for acct in inner.accounts.iter() {
             if acct.provider != provider {
@@ -876,7 +915,7 @@ impl Pool {
         let below: Vec<&Cand> = eligible
             .iter()
             .copied()
-            .filter(|c| !c.draining && c.util < self.soft_threshold)
+            .filter(|c| !c.draining && c.util < self.soft_threshold())
             .collect();
 
         let chosen: &Cand = if below.is_empty() {
@@ -1040,7 +1079,7 @@ impl Pool {
 
         // Crossing the soft threshold retires the account from NEW sessions.
         // Sticky sessions are deliberately left bound so they keep their cache.
-        let soft = self.soft_threshold;
+        let soft = self.soft_threshold();
         if let Some(acct) = find_mut(&mut inner.accounts, &qualified)
             && acct.state == AccountState::Active
             && let Some(u) = acct.peak_covered_utilization()
@@ -1130,8 +1169,8 @@ impl Pool {
     /// Apply fresh gate readings from a quota probe.
     pub fn apply_probe(&self, qualified_id: &str, gates: Vec<Gate>, at: OffsetDateTime) {
         let mut inner = self.inner.lock().unwrap();
-        let policy_metered = self.allow_metered;
-        let soft = self.soft_threshold;
+        let policy_metered = self.allow_metered();
+        let soft = self.soft_threshold();
         let Some(acct) = find_mut(&mut inner.accounts, qualified_id) else {
             return;
         };
@@ -1388,6 +1427,22 @@ mod tests {
 
     fn policy() -> PolicyConfig {
         PolicyConfig::default()
+    }
+
+    #[test]
+    fn retuning_changes_the_values_the_next_admission_reads() {
+        let mut next = policy();
+        next.soft_threshold = 0.42;
+        next.allow_metered = true;
+        let pool = Pool::new(Vec::new(), &next);
+        assert_eq!(pool.soft_threshold(), 0.42);
+        assert!(pool.allow_metered());
+
+        next.soft_threshold = 0.31;
+        next.allow_metered = false;
+        pool.retune(&next);
+        assert_eq!(pool.soft_threshold(), 0.31);
+        assert!(!pool.allow_metered());
     }
 
     /// A free-token allowance is not covered money.

@@ -36,6 +36,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 
+/// Why a validated configuration could not be made live. The file and the
+/// running snapshot are both unchanged when this is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyError(pub String);
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ApplyError {}
+
 /// The slice of gateway behaviour the HTTP layer needs.
 ///
 /// This seam exists so the router can be driven end-to-end in tests without a
@@ -102,6 +115,21 @@ pub trait ProxyBackend: Send + Sync + 'static {
     /// Learned prices that have drifted materially from the configured rate.
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         Vec::new()
+    }
+
+    /// Build the next snapshot, persist the file through `write`, then publish.
+    ///
+    /// Order is the guarantee: a build failure happens before the write, and a
+    /// write failure before the publish, so a failed apply leaves both the file
+    /// and the running snapshot exactly as they were.
+    fn apply_config(
+        &self,
+        _config: Config,
+        _write: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::result::Result<(), ApplyError> {
+        Err(ApplyError(
+            "this backend cannot apply configuration".to_string(),
+        ))
     }
 
     /// Refresh an account's quota reading immediately before switching to it.
@@ -247,6 +275,20 @@ impl ProxyBackend for GatewayBackend {
 
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         self.gateway.runtime().prices().drifted()
+    }
+
+    fn apply_config(
+        &self,
+        config: Config,
+        write: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::result::Result<(), ApplyError> {
+        let prices = self.gateway.runtime().prices_arc();
+        let runtime = Runtime::new(Arc::new(config.clone()), prices)
+            .map_err(|error| ApplyError(error.to_string()))?;
+        write().map_err(|error| ApplyError(format!("writing the configuration: {error}")))?;
+        self.gateway.pool.retune(&config.policy);
+        self.gateway.install_runtime(Arc::new(runtime));
+        Ok(())
     }
 
     fn ensure_fresh<'a>(
@@ -423,6 +465,7 @@ pub(crate) fn build_router_with_console(
             "/console/api/config/validate",
             post(console::config_validate),
         )
+        .route("/console/api/config/apply", post(console::config_apply))
         .route("/console/partials/board", get(console::board_partial))
         .route("/console/assets/{*path}", get(console::asset))
         .layer(middleware::from_fn_with_state(

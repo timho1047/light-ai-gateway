@@ -135,6 +135,19 @@ impl<'de> Deserialize<'de> for SecretRef {
 }
 
 impl SecretRef {
+    /// Whether two references would resolve to the same place. Used to tell a
+    /// live edit from one that only takes effect on restart. Literal values are
+    /// compared without being printed.
+    pub fn same_source(&self, other: &SecretRef) -> bool {
+        match (self, other) {
+            (SecretRef::Env { env: a }, SecretRef::Env { env: b }) => a == b,
+            (SecretRef::File { key_file: a }, SecretRef::File { key_file: b }) => a == b,
+            (SecretRef::Keychain, SecretRef::Keychain) => true,
+            (SecretRef::Literal(a), SecretRef::Literal(b)) => a == b,
+            _ => false,
+        }
+    }
+
     /// Where this reference reads from, for display. Never includes the secret.
     pub fn describe(&self) -> String {
         match self {

@@ -323,7 +323,8 @@
   var draftForms = document.querySelectorAll("form[data-config-draft]");
   for (var df = 0; df < draftForms.length; df++) {
     (function (form) {
-      var button = form.querySelector("[data-config-validate]");
+      var validateButton = form.querySelector("[data-config-validate]");
+      var applyButton = form.querySelector("[data-config-apply]");
       var result = document.querySelector("[data-config-result]");
       var fields = form.querySelectorAll("[data-path]");
 
@@ -342,12 +343,24 @@
         return entries;
       }
 
-      async function validate() {
+      function remember(field) {
+        field.setAttribute("data-initial", field.value);
+        var row = field.closest(".field");
+        if (row) { row.classList.remove("changed"); }
+      }
+
+      async function send(button) {
         if (!button || !result) { return; }
-        button.disabled = true;
+        var buttons = [validateButton, applyButton];
+        for (var b = 0; b < buttons.length; b++) {
+          if (buttons[b]) { buttons[b].disabled = true; }
+        }
         result.setAttribute("aria-busy", "true");
         try {
-          var response = await fetch(button.getAttribute("data-validate-url"), {
+          var url = button.hasAttribute("data-validate-url")
+            ? button.getAttribute("data-validate-url")
+            : button.getAttribute("data-apply-url");
+          var response = await fetch(url, {
             method: "POST",
             headers: headers(),
             credentials: "same-origin",
@@ -358,21 +371,35 @@
           });
           result.innerHTML = await response.text();
           result.classList.toggle("is-error", !response.ok);
+          var applied = result.querySelector("[data-applied]");
+          if (applied) {
+            form.setAttribute("data-fingerprint", applied.getAttribute("data-fingerprint"));
+            for (var f = 0; f < fields.length; f++) { remember(fields[f]); }
+          }
         } catch (error) {
           result.textContent = String(error);
           result.classList.add("is-error");
         } finally {
-          button.disabled = false;
+          for (var b2 = 0; b2 < buttons.length; b2++) {
+            if (buttons[b2]) { buttons[b2].disabled = false; }
+          }
           result.removeAttribute("aria-busy");
         }
       }
 
-      if (button) {
-        button.addEventListener("click", validate);
+      if (validateButton) {
+        validateButton.addEventListener("click", function () { send(validateButton); });
+      }
+      if (applyButton) {
+        applyButton.addEventListener("click", function () {
+          var question = applyButton.getAttribute("data-confirm");
+          if (question && !window.confirm(question)) { return; }
+          send(applyButton);
+        });
       }
       form.addEventListener("submit", function (event) {
         event.preventDefault();
-        validate();
+        send(validateButton);
       });
 
       for (var f = 0; f < fields.length; f++) {

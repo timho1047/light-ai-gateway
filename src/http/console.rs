@@ -34,6 +34,9 @@ pub struct ConsoleContext {
     /// configuration page reports it as the last applied time until a real
     /// apply engine exists.
     pub started_at: time::OffsetDateTime,
+    /// One apply at a time: read, fingerprint check, write and publish are one
+    /// critical section, so two concurrent applies cannot interleave.
+    pub apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ConsoleContext {
@@ -43,6 +46,7 @@ impl ConsoleContext {
             port,
             config_path: config_path.to_string(),
             started_at: crate::domain::now(),
+            apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -230,6 +234,151 @@ pub(super) async fn config_validate(
 
     let diff = config_doc::diff(&original, &edited);
     fragment(StatusCode::OK, config_page::validated(&diff, lang))
+}
+
+/// Persist a validated draft and publish it to the running gateway.
+///
+/// Everything that can fail happens before anything changes: the file is read,
+/// the draft is applied to a copy, the result is validated, the restart-only
+/// fields are compared and the next snapshot is built. Only then does the
+/// atomic write happen, and only after the write succeeds does the snapshot go
+/// live. The apply lock makes the read-write-publish sequence one unit.
+pub(super) async fn config_apply(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LangQuery>,
+    Json(request): Json<ValidateRequest>,
+) -> Response {
+    let lang = query.lang();
+    let _serialized = state.console.apply_lock.lock().await;
+    let path = state.console.config_path.clone();
+
+    let original = match ConfigDocument::read(std::path::Path::new(&path)) {
+        Ok(document) => document,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::failed(&path, &error.to_string(), lang),
+            );
+        }
+    };
+    if original.fingerprint() != request.fingerprint {
+        return fragment(StatusCode::CONFLICT, config_page::stale(lang));
+    }
+
+    let changes: Vec<DraftChange> = request
+        .draft
+        .into_iter()
+        .map(|entry| DraftChange {
+            path: entry.path,
+            value: entry.value,
+        })
+        .collect();
+    let not_live = live_scope_refusals(&changes);
+    if !not_live.is_empty() {
+        return fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::not_live(&not_live, lang),
+        );
+    }
+
+    let edited = match original.with_draft(&changes) {
+        Ok(document) => document,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::rejected(&error.field, None, &error.message, lang),
+            );
+        }
+    };
+    let next: Config = match toml::from_str(edited.raw()) {
+        Ok(config) => config,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::rejected("config", None, &error.to_string(), lang),
+            );
+        }
+    };
+    if let Some(violation) = next.violation() {
+        return fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::rejected(
+                &violation.field,
+                Some(violation.code),
+                &violation.message,
+                lang,
+            ),
+        );
+    }
+
+    let restart = restart_only_changes(state.backend.runtime().config(), &next);
+    if !restart.is_empty() {
+        return fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::restart_only(&restart, lang),
+        );
+    }
+
+    let diff = config_doc::diff(&original, &edited);
+    let fingerprint = edited.fingerprint();
+    let raw = edited.raw().to_string();
+    let write_path = path.clone();
+    let mut write = move || {
+        crate::config_doc::write_atomic(std::path::Path::new(&write_path), &raw)
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    };
+    match state.backend.apply_config(next, &mut write) {
+        Ok(()) => fragment(
+            StatusCode::OK,
+            config_page::applied(&diff, &fingerprint, lang),
+        ),
+        Err(error) => fragment(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            config_page::failed(&path, &error.to_string(), lang),
+        ),
+    }
+}
+
+/// Fields that only take effect on restart. Compared against the running
+/// configuration, so a file that already differed from it is not mistaken for a
+/// new edit.
+fn restart_only_changes(old: &Config, new: &Config) -> Vec<String> {
+    let mut fields = Vec::new();
+    if old.server.listen != new.server.listen {
+        fields.push("server.listen".to_string());
+    }
+    if old.server.db_path != new.server.db_path {
+        fields.push("server.db_path".to_string());
+    }
+    let key_changed = match (&old.server.local_key, &new.server.local_key) {
+        (None, None) => false,
+        (Some(a), Some(b)) => !a.same_source(b),
+        _ => true,
+    };
+    if key_changed {
+        fields.push("server.local_key".to_string());
+    }
+    if old.policy.max_body_bytes != new.policy.max_body_bytes {
+        fields.push("policy.max_body_bytes".to_string());
+    }
+    fields
+}
+
+/// The sections whose live apply has not landed yet. The form only edits
+/// policy, so this is the guard for a crafted request: refusing loudly is
+/// better than writing a file the running gateway would ignore.
+fn live_scope_refusals(changes: &[DraftChange]) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    for change in changes {
+        let section = change.path.first().map(String::as_str).unwrap_or("");
+        if section != "policy" {
+            let field = change.path.join(".");
+            if !fields.contains(&field) {
+                fields.push(field);
+            }
+        }
+    }
+    fields
 }
 
 fn fragment(status: StatusCode, html: String) -> Response {

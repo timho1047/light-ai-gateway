@@ -125,6 +125,70 @@ fn redact_item(item: &mut Item) {
     *item = Item::Value(redacted);
 }
 
+/// Replace a file in one step, with mode 0600 from the moment it exists.
+///
+/// The bytes go to a sibling temp file first, are flushed to disk, and only then
+/// are renamed over the target. A reader (including this process after a
+/// restart) sees either the whole old file or the whole new one. The writer is
+/// shared by the console's apply and by `lgw init`; a partial configuration is
+/// never a state either of them can leave behind.
+pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temporary = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let written = (|| -> Result<()> {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .with_context(|| format!("creating {}", temporary.display()))?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing {}", temporary.display()))?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("replacing {}", path.display()))?;
+        #[cfg(unix)]
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    written
+}
+
 /// One field the configuration form wants to change: a path from the document
 /// root (a key per segment) and the text the operator typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +452,58 @@ key = "sk-account-SECRET"   # why this comment exists
 [providers.xkiro.accounts.acc-2]
 key = { env = "XKIRO_KEY_2" }
 "#;
+
+    #[test]
+    fn the_atomic_writer_replaces_in_one_step_with_a_private_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "lgw-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        write_atomic(&path, "listen = \"127.0.0.1:8787\"\n").expect("first write");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "listen = \"127.0.0.1:8787\"\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        write_atomic(&path, "listen = \"127.0.0.1:8788\"\n").expect("second write");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "listen = \"127.0.0.1:8788\"\n"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a completed write leaves no temp file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_neither_a_target_nor_a_temp_file() {
+        let missing = std::env::temp_dir()
+            .join("lgw-no-such-dir")
+            .join("config.toml");
+        assert!(write_atomic(&missing, "listen = \"x\"\n").is_err());
+        assert!(!missing.exists());
+    }
 
     #[test]
     fn a_literal_secret_is_redacted_and_the_line_shape_survives() {

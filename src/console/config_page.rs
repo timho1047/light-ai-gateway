@@ -336,40 +336,87 @@ fn editable_bool(
 }
 
 fn config_actions(view: &ConfigView, s: &Strings) -> String {
-    let url = format!("/console/api/config/validate?lang={}", view.lang.code());
+    let segment = format!("lang={}", view.lang.code());
+    let validate_url = format!("/console/api/config/validate?{segment}");
+    let apply_url = format!("/console/api/config/apply?{segment}");
     format!(
         r#"<div class="config-actions">
-  <button class="btn btn-primary" type="button" data-config-validate data-validate-url="{}">{}</button>
-  <span class="hint">{}</span>
+  <button class="btn" type="button" data-config-validate data-validate-url="{}">{}</button>
+  <button class="btn btn-primary" type="button" data-config-apply data-apply-url="{}" data-confirm="{}">{}</button>
+  <span class="hint">{} {}</span>
 </div>
 <div class="config-result" data-config-result aria-live="polite"></div>"#,
-        esc(&url),
+        esc(&validate_url),
         esc(s.config_validate),
+        esc(&apply_url),
+        esc(s.config_apply_confirm),
+        esc(s.config_apply),
         esc(s.config_validate_note),
+        esc(s.config_apply_note),
     )
 }
 
 const CHANGED_ONLY: [DiffKind; 2] = [DiffKind::Removed, DiffKind::Added];
 
 /// The panel after a valid draft: the exact lines that would move, and nothing
-/// else. The page still writes nothing; the apply path is a later task.
+/// else. The page still writes nothing; this is the validate half of apply.
 pub fn validated(diff: &[DiffLine], lang: Lang) -> String {
     let s = lang.strings();
     let mut body = format!(
         "<div class=\"banner ok\"><b>{}</b></div>",
         esc(s.config_draft_ok)
     );
+    body.push_str(&diff_block(diff, s.config_diff_title, s.config_no_changes));
+    body
+}
+
+/// The panel after an apply: the change is live, and the form's fingerprint
+/// moves with the file so the next validate is not refused as stale.
+pub fn applied(diff: &[DiffLine], fingerprint: &str, lang: Lang) -> String {
+    let s = lang.strings();
+    let mut body = format!(
+        "<div data-applied=\"true\" data-fingerprint=\"{}\"><div class=\"banner ok\"><b>{}</b></div>",
+        esc(fingerprint),
+        esc(s.config_applied),
+    );
+    body.push_str(&diff_block(diff, s.config_diff_title, s.config_no_changes));
+    body.push_str("</div>");
+    body
+}
+
+/// A field that cannot change without a restart, named rather than applied.
+pub fn restart_only(fields: &[String], lang: Lang) -> String {
+    let s = lang.strings();
+    refused(s.config_apply_failed, s.config_restart_only, fields)
+}
+
+/// A section whose apply path has not landed yet. Refused loudly instead of
+/// being silently written and ignored.
+pub fn not_live(fields: &[String], lang: Lang) -> String {
+    let s = lang.strings();
+    refused(s.config_apply_failed, s.config_not_live, fields)
+}
+
+fn refused(banner: &str, heading: &str, fields: &[String]) -> String {
+    let mut items = String::new();
+    for field in fields {
+        let _ = write!(items, "<li><span class=\"mono\">{}</span></li>", esc(field));
+    }
+    format!(
+        r#"<div class="banner error"><b>{}</b></div><p class="field-label mono">{}</p><ul class="error-list">{}</ul>"#,
+        esc(banner),
+        esc(heading),
+        items,
+    )
+}
+
+fn diff_block(diff: &[DiffLine], title: &str, empty: &str) -> String {
     let changed: Vec<&DiffLine> = diff
         .iter()
         .filter(|line| CHANGED_ONLY.contains(&line.kind))
         .collect();
     if changed.is_empty() {
-        let _ = write!(
-            body,
-            "<div class=\"empty\">{}</div>",
-            esc(s.config_no_changes)
-        );
-        return body;
+        return format!("<div class=\"empty\">{}</div>", esc(empty));
     }
     let mut pre = String::new();
     for line in changed {
@@ -384,13 +431,11 @@ pub fn validated(diff: &[DiffLine], lang: Lang) -> String {
             esc(&line.text)
         );
     }
-    let _ = write!(
-        body,
+    format!(
         r#"<div class="diff"><div class="diff-head">{}</div><pre>{}</pre></div>"#,
-        esc(s.config_diff_title),
+        esc(title),
         pre.trim_end(),
-    );
-    body
+    )
 }
 
 /// The panel after a rejected draft: the field, a page-language headline from
@@ -651,6 +696,35 @@ mod tests {
 
         let same = validated(&config_doc::diff(&document, &document), Lang::En);
         assert!(same.contains("No line would change."));
+    }
+
+    #[test]
+    fn an_applied_fragment_carries_the_new_fingerprint() {
+        let document = ConfigDocument::parse("[policy]\nsoft_threshold = 0.8\n").expect("doc");
+        let edited = document
+            .with_draft(&[DraftChange {
+                path: vec!["policy".to_string(), "soft_threshold".to_string()],
+                value: "0.75".to_string(),
+            }])
+            .expect("draft");
+        let html = applied(&config_doc::diff(&document, &edited), "abc123", Lang::En);
+        assert!(html.contains("data-applied"));
+        assert!(html.contains("data-fingerprint=\"abc123\""));
+        assert!(html.contains("+soft_threshold = 0.75"));
+    }
+
+    #[test]
+    fn a_restart_only_field_is_named_rather_than_written() {
+        let html = restart_only(&["policy.max_body_bytes".to_string()], Lang::Zh);
+        assert!(html.contains("policy.max_body_bytes"));
+        assert!(html.contains("需要重启"));
+    }
+
+    #[test]
+    fn a_section_without_a_live_path_is_refused_by_name() {
+        let html = not_live(&["providers.mock.base_url".to_string()], Lang::En);
+        assert!(html.contains("providers.mock.base_url"));
+        assert!(html.contains("cannot be applied"));
     }
 
     #[test]
