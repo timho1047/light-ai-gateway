@@ -52,6 +52,17 @@ enum Command {
     Status,
 }
 
+fn print_urls(launcher: &Launcher, wait: Duration, fallback: bool) {
+    match console_url(&launcher.paths().log, wait) {
+        Some(base) => {
+            println!("api:     {base}/v1");
+            println!("console: {base}/");
+        }
+        None if fallback => println!("api:     not reported yet; see lgwl log"),
+        None => {}
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let launcher = Launcher::discover()?;
@@ -61,16 +72,12 @@ fn main() -> Result<()> {
             match launcher.launch(&LaunchOptions::new(config, cwd))? {
                 LaunchOutcome::Started(state) => {
                     println!("started lgw (pid {})", state.pid);
-                    if let Some(base) = console_url(&launcher.paths().log, Duration::from_secs(5)) {
-                        println!("api:     {base}/v1");
-                        println!("console: {base}/");
-                    } else {
-                        println!("api:     not reported yet; see lgwl log");
-                    }
+                    print_urls(&launcher, Duration::from_secs(5), true);
                     println!("log: {}", launcher.paths().log.display());
                     println!("follow it with: lgwl log");
                 }
                 LaunchOutcome::AlreadyRunning(state) => {
+                    print_urls(&launcher, Duration::from_secs(1), false);
                     bail!("lgw is already running (pid {})", state.pid);
                 }
             }
@@ -102,10 +109,7 @@ fn main() -> Result<()> {
             println!("updated from {}", outcome.repo.display());
             if outcome.restarted {
                 println!("lgw was restarted with its previous arguments");
-                if let Some(base) = console_url(&launcher.paths().log, Duration::from_secs(5)) {
-                    println!("api:     {base}/v1");
-                    println!("console: {base}/");
-                }
+                print_urls(&launcher, Duration::from_secs(5), false);
             } else if outcome.was_running {
                 println!("lgw was stopped for the update; start it with: lgwl launch");
             } else {
@@ -126,6 +130,7 @@ fn main() -> Result<()> {
                         })
                         .unwrap_or_else(|| format!("unix {}", state.started_at))
                 );
+                print_urls(&launcher, Duration::from_secs(1), false);
                 println!("args: {:?}", state.args);
                 println!("cwd: {}", state.cwd.display());
                 println!("log: {}", launcher.paths().log.display());
