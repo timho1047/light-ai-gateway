@@ -2214,3 +2214,96 @@ async fn client_apply(addr: &str, body: &serde_json::Value) -> reqwest::Response
         .await
         .unwrap()
 }
+
+#[tokio::test]
+async fn an_account_can_be_added_through_apply_and_is_unknown_until_probed() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let key_file = dir.join("new-account.key");
+    std::fs::write(&key_file, "sk-added-account\n").unwrap();
+
+    let body = serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(APPLY_TOML),
+        "draft": [{
+            "action": "add_account",
+            "provider": "mock",
+            "id": "a3",
+            "label": "third",
+            "key_source": "file",
+            "key_value": key_file.display().to_string()
+        }]
+    });
+    let response = client_apply(&addr, &body).await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("a3"));
+    assert!(on_disk.contains("key_file = "));
+    assert!(on_disk.contains("label = \"third\""));
+
+    let added = fake
+        .pool
+        .snapshot()
+        .into_iter()
+        .find(|a| a.id == "a3")
+        .expect("the account is in the pool");
+    assert_eq!(added.state, crate::domain::AccountState::Unknown);
+    assert!(added.gates.is_empty());
+    assert_eq!(added.label, "third");
+    let published = fake.applied.lock().unwrap().clone().expect("published");
+    assert!(published.providers["mock"].accounts.contains_key("a3"));
+
+    let chosen = fake
+        .pool
+        .select("mock", "", None, Decimal::ONE, "r", 0, &[])
+        .expect("existing accounts still serve");
+    assert_ne!(
+        chosen.plan().account_id,
+        "a3",
+        "an unknown account is not selected"
+    );
+    chosen.settle(Decimal::ZERO, false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_account_can_be_removed_through_apply() {
+    let (addr, fake, path, dir) = apply_router().await;
+    assert!(
+        fake.pool.snapshot().iter().any(|a| a.id == "a2"),
+        "a2 starts in the pool"
+    );
+    let body = serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(APPLY_TOML),
+        "draft": [{
+            "action": "remove",
+            "path": ["providers", "mock", "accounts", "a2"]
+        }]
+    });
+    let response = client_apply(&addr, &body).await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!on_disk.contains("sk-apply-a2"));
+    assert!(!on_disk.contains("a2"));
+    assert!(
+        fake.pool.snapshot().iter().all(|a| a.id != "a2"),
+        "a settled account is out of the running pool"
+    );
+    let published = fake.applied.lock().unwrap().clone().expect("published");
+    assert!(!published.providers["mock"].accounts.contains_key("a2"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_configuration_page_offers_account_add_and_remove() {
+    let (addr, _fake, _path, dir) = apply_router().await;
+    let html = reqwest::get(format!("{addr}/config?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("data-add-account"));
+    assert!(html.contains("data-account-remove"));
+    assert!(html.contains("Add an account"));
+    assert!(html.contains("Remove account"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -326,18 +326,50 @@
       var validateButton = form.querySelector("[data-config-validate]");
       var applyButton = form.querySelector("[data-config-apply]");
       var result = document.querySelector("[data-config-result]");
-      var fields = form.querySelectorAll("[data-path]");
+      // Only real controls: the remove buttons also carry a data-path, and
+      // including them here sent the account table itself as a leaf write.
+      var fields = form.querySelectorAll("input[data-path], select[data-path]");
 
       function draft() {
         var entries = [];
+
+        // Changed leaves only: an untouched default that the file omits must
+        // not be sent as a write.
         for (var i = 0; i < fields.length; i++) {
           var field = fields[i];
           if (field.value === field.getAttribute("data-initial")) {
             continue;
           }
           entries.push({
+            action: "set",
             path: JSON.parse(field.getAttribute("data-path")),
             value: field.value
+          });
+        }
+
+        // Whole-account edits: a removals list and, per provider, an add form
+        // that only participates once its id is filled in.
+        var removers = form.querySelectorAll("[data-account-remove].is-armed");
+        for (var r = 0; r < removers.length; r++) {
+          entries.push({
+            action: "remove",
+            path: JSON.parse(removers[r].getAttribute("data-path"))
+          });
+        }
+        var addForms = form.querySelectorAll("[data-add-account]");
+        for (var a = 0; a < addForms.length; a++) {
+          var details = addForms[a];
+          var idInput = details.querySelector('[data-add-field="id"]');
+          var id = idInput ? idInput.value.trim() : "";
+          if (!id) { continue; }
+          var value = details.querySelector('[data-add-field="source_value"]');
+          entries.push({
+            action: "add_account",
+            provider: details.getAttribute("data-provider"),
+            id: id,
+            label: details.querySelector('[data-add-field="label"]').value.trim(),
+            key_source: details.querySelector('[data-add-field="source"]').value,
+            key_value: value ? value.value.trim() : ""
           });
         }
         return entries;
@@ -375,6 +407,11 @@
           if (applied) {
             form.setAttribute("data-fingerprint", applied.getAttribute("data-fingerprint"));
             for (var f = 0; f < fields.length; f++) { remember(fields[f]); }
+            if (applied.hasAttribute("data-reload")) {
+              // A structural apply changes the rows themselves; the page has to
+              // be rebuilt from the new file rather than patched in place.
+              window.setTimeout(function () { window.location.reload(); }, 700);
+            }
           }
         } catch (error) {
           result.textContent = String(error);
@@ -397,6 +434,18 @@
           send(applyButton);
         });
       }
+      var removers = form.querySelectorAll("[data-account-remove]");
+      for (var r = 0; r < removers.length; r++) {
+        (function (button) {
+          button.addEventListener("click", function () {
+            var armed = button.classList.toggle("is-armed");
+            button.textContent = armed
+              ? button.getAttribute("data-undo-label")
+              : button.getAttribute("data-remove-label");
+          });
+        })(removers[r]);
+      }
+
       form.addEventListener("submit", function (event) {
         event.preventDefault();
         send(validateButton);

@@ -8,7 +8,7 @@
 
 use super::AppState;
 use crate::config::Config;
-use crate::config_doc::{self, ConfigDocument, DraftChange};
+use crate::config_doc::{self, ConfigDocument, DraftAction, DraftChange, KeySpec};
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
 use crate::console::{assets, board, config_page, copy::Lang, layout, layout::Nav};
@@ -162,10 +162,78 @@ pub(super) struct ValidateRequest {
     draft: Vec<DraftEntry>,
 }
 
+/// One edit from the form. A plain value edit omits `action`; the same body
+/// also carries whole-account additions and removals so one Apply can express
+/// everything the page shows.
 #[derive(Debug, Deserialize)]
 struct DraftEntry {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
     path: Vec<String>,
-    value: String,
+    #[serde(default)]
+    value: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    /// "keychain", "env" or "file".
+    #[serde(default)]
+    key_source: Option<String>,
+    /// The environment variable name or the key file path.
+    #[serde(default)]
+    key_value: Option<String>,
+}
+
+/// Turn the wire form into document actions, refusing a half-specified one
+/// before it can touch the document.
+fn draft_actions(entries: Vec<DraftEntry>) -> std::result::Result<Vec<DraftAction>, String> {
+    let mut actions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match entry.action.as_deref().unwrap_or("set") {
+            "set" => actions.push(DraftAction::Set(DraftChange {
+                path: entry.path,
+                value: entry.value.unwrap_or_default(),
+            })),
+            "remove" => actions.push(DraftAction::Remove { path: entry.path }),
+            "add_account" => {
+                let provider = entry
+                    .provider
+                    .filter(|provider| !provider.trim().is_empty())
+                    .ok_or_else(|| "add_account needs a provider".to_string())?;
+                let id = entry
+                    .id
+                    .filter(|id| !id.trim().is_empty())
+                    .ok_or_else(|| "add_account needs an account id".to_string())?;
+                let key = match entry.key_source.as_deref().unwrap_or("keychain") {
+                    "keychain" => KeySpec::Keychain,
+                    "env" => KeySpec::Env(
+                        entry
+                            .key_value
+                            .filter(|name| !name.trim().is_empty())
+                            .ok_or_else(|| "an env key source needs a variable name".to_string())?,
+                    ),
+                    "file" => KeySpec::File(
+                        entry
+                            .key_value
+                            .filter(|path| !path.trim().is_empty())
+                            .ok_or_else(|| "a file key source needs a path".to_string())?,
+                    ),
+                    other => return Err(format!("unknown key source {other}")),
+                };
+                actions.push(DraftAction::AddAccount {
+                    provider,
+                    id,
+                    label: entry.label,
+                    key,
+                });
+            }
+            other => return Err(format!("unknown draft action {other}")),
+        }
+    }
+    Ok(actions)
 }
 
 /// Check a draft without writing it: apply the changes to a copy of the file,
@@ -193,15 +261,16 @@ pub(super) async fn config_validate(
         return fragment(StatusCode::CONFLICT, config_page::stale(lang));
     }
 
-    let changes: Vec<DraftChange> = request
-        .draft
-        .into_iter()
-        .map(|entry| DraftChange {
-            path: entry.path,
-            value: entry.value,
-        })
-        .collect();
-    let edited = match original.with_draft(&changes) {
+    let actions = match draft_actions(request.draft) {
+        Ok(actions) => actions,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::failed("draft", &error, lang),
+            );
+        }
+    };
+    let edited = match original.apply_actions(&actions) {
         Ok(document) => document,
         Err(error) => {
             return fragment(
@@ -265,15 +334,16 @@ pub(super) async fn config_apply(
         return fragment(StatusCode::CONFLICT, config_page::stale(lang));
     }
 
-    let changes: Vec<DraftChange> = request
-        .draft
-        .into_iter()
-        .map(|entry| DraftChange {
-            path: entry.path,
-            value: entry.value,
-        })
-        .collect();
-    let not_live = live_scope_refusals(&changes);
+    let actions = match draft_actions(request.draft) {
+        Ok(actions) => actions,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::failed("draft", &error, lang),
+            );
+        }
+    };
+    let not_live = live_scope_refusals(&actions);
     if !not_live.is_empty() {
         return fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -281,7 +351,7 @@ pub(super) async fn config_apply(
         );
     }
 
-    let edited = match original.with_draft(&changes) {
+    let edited = match original.apply_actions(&actions) {
         Ok(document) => document,
         Err(error) => {
             return fragment(
@@ -327,10 +397,15 @@ pub(super) async fn config_apply(
         crate::config_doc::write_atomic(std::path::Path::new(&write_path), &raw)
             .map_err(|error| std::io::Error::other(error.to_string()))
     };
+    // Adding or removing an account changes the page's rows; a plain value
+    // edit does not, and keeping the diff on screen is the better confirmation.
+    let structural = actions
+        .iter()
+        .any(|action| !matches!(action, DraftAction::Set(_)));
     match state.backend.apply_config(next, &mut write) {
         Ok(()) => fragment(
             StatusCode::OK,
-            config_page::applied(&diff, &fingerprint, lang),
+            config_page::applied(&diff, &fingerprint, structural, lang),
         ),
         Err(error) => fragment(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -364,17 +439,35 @@ fn restart_only_changes(old: &Config, new: &Config) -> Vec<String> {
     fields
 }
 
-/// The sections whose live apply has not landed yet. The form only edits
-/// policy, so this is the guard for a crafted request: refusing loudly is
-/// better than writing a file the running gateway would ignore.
-fn live_scope_refusals(changes: &[DraftChange]) -> Vec<String> {
+/// The sections whose live apply has not landed yet. Routes and prices arrive in
+/// the next slice, so a crafted request that names them is refused loudly rather
+/// than written to a file the running gateway would ignore.
+fn live_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
     let mut fields: Vec<String> = Vec::new();
-    for change in changes {
-        let section = change.path.first().map(String::as_str).unwrap_or("");
-        if section != "policy" && section != "providers" {
-            let field = change.path.join(".");
-            if !fields.contains(&field) {
-                fields.push(field);
+    let mut refuse = |field: String| {
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    };
+    for action in actions {
+        match action {
+            DraftAction::Set(change) => {
+                let section = change.path.first().map(String::as_str).unwrap_or("");
+                if section != "policy" && section != "providers" {
+                    refuse(change.path.join("."));
+                }
+            }
+            DraftAction::Remove { path } => {
+                let is_account = path.first().map(String::as_str) == Some("providers")
+                    && path.get(2).map(String::as_str) == Some("accounts");
+                if !is_account {
+                    refuse(path.join("."));
+                }
+            }
+            DraftAction::AddAccount { provider, id, .. } => {
+                if provider.trim().is_empty() || id.trim().is_empty() {
+                    refuse("providers".to_string());
+                }
             }
         }
     }

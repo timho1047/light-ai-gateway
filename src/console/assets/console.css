@@ -1530,3 +1530,66 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
   line-height: 1.55;
   color: var(--muted);
 }
+
+.account-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: -4px 0 10px;
+}
+
+.account-actions .btn.is-armed {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--paper);
+}
+
+.add-account {
+  margin: 18px 0 8px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 2px;
+  padding: 10px 14px;
+}
+
+.add-account summary {
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.add-account[open] summary {
+  margin-bottom: 12px;
+}
+
+.add-account-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 24px;
+}
+
+.add-account-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.add-account-grid input,
+.add-account-grid select {
+  width: 100%;
+}
+
+.add-account .hint {
+  margin: 10px 0 2px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+@media (max-width: 720px) {
+  .add-account-grid {
+    grid-template-columns: 1fr;
+  }
+}

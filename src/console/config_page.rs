@@ -226,6 +226,7 @@ pub fn render(view: &ConfigView) -> String {
                 subhead(body, &format!("providers.{provider}.accounts.{id}"));
                 account_fields(body, provider, id, account, &cfg.currency, s);
             }
+            body.push_str(&add_account_form(provider, s));
         }
     }));
 
@@ -299,6 +300,31 @@ pub fn render(view: &ConfigView) -> String {
         out.push_str(&raw_section(raw, s));
     }
     out
+}
+
+fn add_account_form(provider: &str, s: &Strings) -> String {
+    format!(
+        r#"<details class="add-account" data-add-account data-provider="{}">
+  <summary>{}</summary>
+  <div class="add-account-grid">
+    <label><span class="field-label mono">{}</span><input type="text" data-add-field="id" autocomplete="off" spellcheck="false"></label>
+    <label><span class="field-label mono">{}</span><input type="text" data-add-field="label" autocomplete="off"></label>
+    <label><span class="field-label mono">{}</span><select data-add-field="source"><option value="keychain">{}</option><option value="env">{}</option><option value="file">{}</option></select></label>
+    <label><span class="field-label mono">{}</span><input type="text" data-add-field="source_value" autocomplete="off" spellcheck="false"></label>
+  </div>
+  <p class="hint">{}</p>
+</details>"#,
+        esc(provider),
+        esc(s.config_add_account),
+        esc(s.config_account_id),
+        esc(s.config_account_label),
+        esc(s.config_key_source),
+        esc(s.config_keychain),
+        esc(s.config_key_env),
+        esc(s.config_key_file),
+        esc(s.config_key_value),
+        esc(s.config_add_note),
+    )
 }
 
 /// What the form sends: one entry per changed leaf, the path split into TOML
@@ -396,11 +422,13 @@ pub fn validated(diff: &[DiffLine], lang: Lang) -> String {
 
 /// The panel after an apply: the change is live, and the form's fingerprint
 /// moves with the file so the next validate is not refused as stale.
-pub fn applied(diff: &[DiffLine], fingerprint: &str, lang: Lang) -> String {
+pub fn applied(diff: &[DiffLine], fingerprint: &str, reload: bool, lang: Lang) -> String {
     let s = lang.strings();
+    let reload_attr = if reload { " data-reload=\"true\"" } else { "" };
     let mut body = format!(
-        "<div data-applied=\"true\" data-fingerprint=\"{}\"><div class=\"banner ok\"><b>{}</b></div>",
+        "<div data-applied=\"true\" data-fingerprint=\"{}\"{}><div class=\"banner ok\"><b>{}</b></div>",
         esc(fingerprint),
+        reload_attr,
         esc(s.config_applied),
     );
     body.push_str(&diff_block(diff, s.config_diff_title, s.config_no_changes));
@@ -592,6 +620,15 @@ fn account_fields(
         .clone()
         .unwrap_or_else(|| provider_currency.to_string());
     let account_path: [&str; 4] = ["providers", provider, "accounts", id];
+    let remove_json = data_path(&account_path);
+    let _ = write!(
+        out,
+        r#"<div class="account-actions"><button class="btn btn-small danger" type="button" data-account-remove data-path="{}" data-remove-label="{}" data-undo-label="{}">{}</button></div>"#,
+        esc(&remove_json),
+        esc(s.config_remove_account),
+        esc(s.config_remove_undo),
+        esc(s.config_remove_account),
+    );
     editable_text(
         out,
         &[
@@ -783,7 +820,12 @@ mod tests {
                 value: "0.75".to_string(),
             }])
             .expect("draft");
-        let html = applied(&config_doc::diff(&document, &edited), "abc123", Lang::En);
+        let html = applied(
+            &config_doc::diff(&document, &edited),
+            "abc123",
+            false,
+            Lang::En,
+        );
         assert!(html.contains("data-applied"));
         assert!(html.contains("data-fingerprint=\"abc123\""));
         assert!(html.contains("+soft_threshold = 0.75"));

@@ -189,6 +189,164 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     written
 }
 
+/// Where a newly added account's key comes from. The console never accepts a
+/// literal secret: the file names a source, and the credential stays out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySpec {
+    Env(String),
+    File(String),
+    Keychain,
+}
+
+/// One edit to the configuration document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DraftAction {
+    Set(DraftChange),
+    /// Remove a whole account table. Only accounts can be removed this way; a
+    /// provider, route or price needs its own operation in a later task.
+    Remove {
+        path: Vec<String>,
+    },
+    AddAccount {
+        provider: String,
+        id: String,
+        label: Option<String>,
+        key: KeySpec,
+    },
+}
+
+impl ConfigDocument {
+    /// Apply a mixed list of edits to a copy and parse the result back. The
+    /// parse is the guarantee: a document the gateway cannot load is a refused
+    /// draft, never a broken file.
+    pub fn apply_actions(&self, actions: &[DraftAction]) -> Result<ConfigDocument, DraftError> {
+        let mut document = self.document.clone();
+        for action in actions {
+            match action {
+                DraftAction::Set(change) => apply_change(&mut document, change)?,
+                DraftAction::Remove { path } => remove_path(&mut document, path)?,
+                DraftAction::AddAccount {
+                    provider,
+                    id,
+                    label,
+                    key,
+                } => add_account(&mut document, provider, id, label.as_deref(), key)?,
+            }
+        }
+        let raw = document.to_string();
+        ConfigDocument::parse(&raw).map_err(|error| DraftError {
+            field: "config".to_string(),
+            message: error.to_string(),
+        })
+    }
+}
+
+fn remove_path(document: &mut DocumentMut, path: &[String]) -> Result<(), DraftError> {
+    let field = path.join(".");
+    let [providers, provider, accounts, id] = path else {
+        return Err(DraftError {
+            field,
+            message: "only a whole account can be removed here".to_string(),
+        });
+    };
+    if providers != "providers" || accounts != "accounts" {
+        return Err(DraftError {
+            field,
+            message: "only a whole account can be removed here".to_string(),
+        });
+    }
+    let provider_table = document
+        .get_mut("providers")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(provider))
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field: field.clone(),
+            message: format!("no provider {provider}"),
+        })?;
+    let accounts_table = provider_table
+        .get_mut("accounts")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field: field.clone(),
+            message: "this provider has no accounts table".to_string(),
+        })?;
+    if accounts_table.remove(id).is_none() {
+        return Err(DraftError {
+            field,
+            message: format!("no account {id}"),
+        });
+    }
+    if accounts_table.is_empty() {
+        provider_table.remove("accounts");
+    }
+    Ok(())
+}
+
+fn add_account(
+    document: &mut DocumentMut,
+    provider: &str,
+    id: &str,
+    label: Option<&str>,
+    key: &KeySpec,
+) -> Result<(), DraftError> {
+    let field = format!("providers.{provider}.accounts.{id}");
+    if id.trim().is_empty() || id.contains('/') {
+        return Err(DraftError {
+            field: "providers".to_string(),
+            message: "an account id must be non-empty and must not contain a slash".to_string(),
+        });
+    }
+    let provider_table = document
+        .get_mut("providers")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(provider))
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field: "providers".to_string(),
+            message: format!("no provider {provider}"),
+        })?;
+    if provider_table.get("accounts").is_none() {
+        provider_table.insert("accounts", Item::Table(toml_edit::Table::new()));
+    }
+    let accounts = provider_table
+        .get_mut("accounts")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field: field.clone(),
+            message: "accounts is not a table".to_string(),
+        })?;
+    if accounts.get(id).is_some() {
+        return Err(DraftError {
+            field,
+            message: "an account with that id already exists".to_string(),
+        });
+    }
+    let mut account = toml_edit::Table::new();
+    account.insert("key", Item::Value(key_value(key)));
+    if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
+        account.insert("label", Item::Value(Value::from(label)));
+    }
+    accounts.insert(id, Item::Table(account));
+    Ok(())
+}
+
+fn key_value(key: &KeySpec) -> Value {
+    let mut table = toml_edit::InlineTable::new();
+    match key {
+        KeySpec::Env(name) => {
+            table.insert("env", Value::from(name.as_str()));
+        }
+        KeySpec::File(path) => {
+            table.insert("key_file", Value::from(path.as_str()));
+        }
+        KeySpec::Keychain => {
+            table.insert("keychain", Value::from(true));
+        }
+    }
+    Value::InlineTable(table)
+}
+
 /// One field the configuration form wants to change: a path from the document
 /// root (a key per segment) and the text the operator typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +671,111 @@ key = { env = "XKIRO_KEY_2" }
             .join("config.toml");
         assert!(write_atomic(&missing, "listen = \"x\"\n").is_err());
         assert!(!missing.exists());
+    }
+
+    const ACCOUNTS_DOC: &str = r#"
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-a1"
+label = "first"
+
+[providers.mock.accounts.a2]
+key = { env = "MOCK_KEY_2" }
+"#;
+
+    #[test]
+    fn an_account_can_be_added_with_a_named_key_source() {
+        let document = ConfigDocument::parse(ACCOUNTS_DOC).expect("parse");
+        let edited = document
+            .apply_actions(&[DraftAction::AddAccount {
+                provider: "mock".to_string(),
+                id: "a3".to_string(),
+                label: Some("third".to_string()),
+                key: KeySpec::Env("MOCK_KEY_3".to_string()),
+            }])
+            .expect("add an account");
+        let raw = edited.raw();
+        assert!(raw.contains("a3"), "the new account table is written");
+        assert!(raw.contains("env = \"MOCK_KEY_3\""));
+        assert!(raw.contains("label = \"third\""));
+        assert!(raw.contains("sk-a1"), "existing accounts are untouched");
+        crate::config::Config::from_toml_str(raw).expect("the result is a valid configuration");
+    }
+
+    #[test]
+    fn an_account_can_be_added_to_a_provider_without_an_accounts_table() {
+        let document = ConfigDocument::parse(
+            "[providers.mock]\nadapter = \"none\"\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+        )
+        .expect("parse");
+        let edited = document
+            .apply_actions(&[DraftAction::AddAccount {
+                provider: "mock".to_string(),
+                id: "first".to_string(),
+                label: None,
+                key: KeySpec::Keychain,
+            }])
+            .expect("add an account");
+        assert!(edited.raw().contains("key = { keychain = true }"));
+        crate::config::Config::from_toml_str(edited.raw()).expect("valid configuration");
+    }
+
+    #[test]
+    fn removing_an_account_keeps_the_others_and_refuses_a_typo() {
+        let document = ConfigDocument::parse(ACCOUNTS_DOC).expect("parse");
+        let edited = document
+            .apply_actions(&[DraftAction::Remove {
+                path: vec![
+                    "providers".to_string(),
+                    "mock".to_string(),
+                    "accounts".to_string(),
+                    "a1".to_string(),
+                ],
+            }])
+            .expect("remove an account");
+        assert!(!edited.raw().contains("sk-a1"));
+        assert!(edited.raw().contains("MOCK_KEY_2"));
+        assert!(!edited.raw().contains("a1"));
+
+        let missing = document
+            .apply_actions(&[DraftAction::Remove {
+                path: vec![
+                    "providers".to_string(),
+                    "mock".to_string(),
+                    "accounts".to_string(),
+                    "nope".to_string(),
+                ],
+            }])
+            .expect_err("no such account");
+        assert_eq!(missing.field, "providers.mock.accounts.nope");
+
+        let not_an_account = document
+            .apply_actions(&[DraftAction::Remove {
+                path: vec![
+                    "providers".to_string(),
+                    "mock".to_string(),
+                    "base_url".to_string(),
+                ],
+            }])
+            .expect_err("only accounts are removable here");
+        assert_eq!(not_an_account.field, "providers.mock.base_url");
+    }
+
+    #[test]
+    fn a_duplicate_account_id_is_refused() {
+        let document = ConfigDocument::parse(ACCOUNTS_DOC).expect("parse");
+        let error = document
+            .apply_actions(&[DraftAction::AddAccount {
+                provider: "mock".to_string(),
+                id: "a1".to_string(),
+                label: None,
+                key: KeySpec::Keychain,
+            }])
+            .expect_err("duplicate");
+        assert!(error.message.contains("already exists"));
     }
 
     #[test]
