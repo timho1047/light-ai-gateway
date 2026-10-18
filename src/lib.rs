@@ -9,6 +9,7 @@ pub mod config_doc;
 pub mod console;
 pub mod doctor;
 pub mod domain;
+pub mod editable;
 pub mod error;
 pub mod http;
 pub mod interval;

@@ -437,7 +437,7 @@ pub(super) async fn config_apply(
             );
         }
     };
-    let not_live = live_scope_refusals(&actions);
+    let not_live = write_scope_refusals(&actions);
     if !not_live.is_empty() {
         return fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -518,7 +518,12 @@ pub(super) async fn config_apply(
 /// The sections whose live apply has not landed yet. Routes and prices arrive in
 /// the next slice, so a crafted request that names them is refused loudly rather
 /// than written to a file the running gateway would ignore.
-fn live_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
+/// Refuse paths the editable-field policy does not know, or marks read-only.
+///
+/// Secrets are deliberately not refused here: the document editor owns that
+/// refusal and returns a field-specific message, so the operator learns why a
+/// key cannot be set through a draft rather than a generic scope error.
+fn write_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
     let mut fields: Vec<String> = Vec::new();
     let mut refuse = |field: String| {
         if !fields.contains(&field) {
@@ -527,16 +532,15 @@ fn live_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
     };
     for action in actions {
         match action {
-            DraftAction::Set(change) => {
-                let section = change.path.first().map(String::as_str).unwrap_or("");
-                let live = matches!(
-                    section,
-                    "policy" | "providers" | "routes" | "prices" | "provider_prefix_aliases"
-                );
-                if !live {
+            DraftAction::Set(change) => match crate::editable::field(&change.path) {
+                None => refuse(change.path.join(".")),
+                Some(policy)
+                    if policy.class == crate::editable::FieldClass::ReadOnly && !policy.secret =>
+                {
                     refuse(change.path.join("."));
                 }
-            }
+                Some(_) => {}
+            },
             DraftAction::Remove { path } => {
                 let is_account = path.first().map(String::as_str) == Some("providers")
                     && path.get(2).map(String::as_str) == Some("accounts");

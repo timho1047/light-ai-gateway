@@ -2104,6 +2104,31 @@ async fn an_apply_of_a_section_without_a_live_path_is_refused_and_writes_nothing
 }
 
 #[tokio::test]
+async fn a_draft_cannot_write_a_secret_into_the_configuration() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let before = std::fs::read(&path).unwrap();
+    let response = post_apply(
+        &addr,
+        &apply_body(
+            &["providers", "mock", "accounts", "a1", "key"],
+            "sk-written-through-a-draft",
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), 422);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("secret"), "got {html}");
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+    assert_eq!(
+        fake.applied_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "nothing was published"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn a_stale_apply_leaves_the_newer_file_untouched() {
     let (addr, _fake, path, dir) = apply_router().await;
     let newer = format!("{APPLY_TOML}\n# written by another editor\n");

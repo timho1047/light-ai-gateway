@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use toml_edit::{DocumentMut, Item, Value};
 
+use crate::editable::{FieldClass, ValueKind};
+
 /// One read of the configuration file, kept as bytes-shaped TOML.
 #[derive(Debug)]
 pub struct ConfigDocument {
@@ -738,61 +740,10 @@ fn schedule_table(entry: &ScheduleEntry) -> toml_edit::Table {
     table
 }
 
-/// The kinds of leaf the console's forms can write. Only these fields may be
-/// created when the file omits them; an existing leaf of any type can still be
-/// edited, but a path nobody whitelisted can never be invented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueKind {
-    String,
-    Integer,
-    Float,
-    Boolean,
-}
-
-/// The fields the configuration form may add when the TOML file does not spell
-/// them out (they exist in the process as defaults). Keep this in step with the
-/// inputs the page renders.
-pub fn editable_kind(path: &[String]) -> Option<ValueKind> {
-    let path: Vec<&str> = path.iter().map(String::as_str).collect();
-    match path.as_slice() {
-        ["server", "listen"] | ["server", "db_path"] => Some(ValueKind::String),
-        ["providers", _, "adapter"]
-        | ["providers", _, "base_url"]
-        | ["providers", _, "probe_base_url"]
-        | ["providers", _, "currency"]
-        | ["providers", _, "accounts", _, "label"]
-        | ["providers", _, "accounts", _, "currency"] => Some(ValueKind::String),
-        ["providers", _, "credit_multiplier"]
-        | ["providers", _, "accounts", _, "credit_multiplier"] => Some(ValueKind::Float),
-        ["providers", _, "accounts", _, "concurrency_limit"]
-        | ["providers", _, "accounts", _, "rpm_limit"] => Some(ValueKind::Integer),
-        ["routes", _] | ["provider_prefix_aliases", _] => Some(ValueKind::String),
-        ["prices", _, _, "input"] | ["prices", _, _, "output"] | ["prices", _, _, "cache_read"] => {
-            Some(ValueKind::Float)
-        }
-        ["prices", _, _, "schedules", _, "name"]
-        | ["prices", _, _, "schedules", _, "days"]
-        | ["prices", _, _, "schedules", _, "hours"]
-        | ["prices", _, _, "schedules", _, "tz"] => Some(ValueKind::String),
-        ["prices", _, _, "schedules", _, "input"]
-        | ["prices", _, _, "schedules", _, "output"]
-        | ["prices", _, _, "schedules", _, "cache_read"] => Some(ValueKind::Float),
-        ["policy", "soft_threshold"]
-        | ["policy", "drift_threshold"]
-        | ["policy", "hard_margin"] => Some(ValueKind::Float),
-        ["policy", "allow_metered"] | ["policy", "probe_before_switch"] => Some(ValueKind::Boolean),
-        ["policy", "poll_interval_secs"]
-        | ["policy", "poll_interval_active_secs"]
-        | ["policy", "poll_interval_idle_secs"]
-        | ["policy", "max_retries"]
-        | ["policy", "connect_timeout_secs"]
-        | ["policy", "ttft_timeout_secs"]
-        | ["policy", "idle_timeout_secs"]
-        | ["policy", "max_body_bytes"] => Some(ValueKind::Integer),
-        _ => None,
-    }
-}
-
+/// Apply one draft leaf after asking the editable-field policy whether the
+/// Console may write it at all. The policy, not the renderer, owns secrecy and
+/// read-only fields: a crafted request must not be able to write a literal key
+/// that the page happens not to render.
 fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), DraftError> {
     let field = change.path.join(".");
     if change.path.is_empty() {
@@ -801,7 +752,26 @@ fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), 
             message: "a change needs a field path".to_string(),
         });
     }
-    let kind = editable_kind(&change.path);
+    let Some(policy) = crate::editable::field(&change.path) else {
+        return Err(DraftError {
+            field: field.clone(),
+            message: "unknown field".to_string(),
+        });
+    };
+    if policy.secret {
+        return Err(DraftError {
+            field: field.clone(),
+            message: "this field is a secret; store it with lgw keys add instead of writing it                       into the configuration file"
+                .to_string(),
+        });
+    }
+    if policy.class == FieldClass::ReadOnly {
+        return Err(DraftError {
+            field: field.clone(),
+            message: "this field is read-only in the console".to_string(),
+        });
+    }
+    let kind = Some(policy.kind);
     let (parents, leaf) = change.path.split_at(change.path.len() - 1);
     let table = parent_table(document, parents, kind, &field)?;
     if let Some(item) = table.get_mut(leaf[0].as_str()) {
@@ -1466,5 +1436,63 @@ output = 1.20
         let missing = Path::new("/definitely/not/a/config.toml");
         assert!(ConfigDocument::read(missing).is_err());
         assert!(ConfigDocument::parse("[server").is_err());
+    }
+}
+
+#[cfg(test)]
+mod editable_policy_tests {
+    use super::*;
+
+    const CONFIG: &str = r#"
+[server]
+listen = "127.0.0.1:8787"
+
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-original"
+"#;
+
+    fn change(path: &[&str], value: &str) -> DraftChange {
+        DraftChange {
+            path: path.iter().map(|segment| segment.to_string()).collect(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_draft_cannot_write_a_literal_secret() {
+        let document = ConfigDocument::parse(CONFIG).expect("parse");
+        let error = document
+            .with_draft(&[change(
+                &["providers", "mock", "accounts", "a1", "key"],
+                "sk-written-through-a-draft",
+            )])
+            .expect_err("a key path is not editable");
+        assert_eq!(error.field, "providers.mock.accounts.a1.key");
+        assert!(error.message.contains("secret"), "got {}", error.message);
+        assert!(document.raw().contains("sk-original"));
+        assert!(!document.raw().contains("sk-written-through-a-draft"));
+    }
+
+    #[test]
+    fn a_read_only_field_is_refused_rather_than_written() {
+        let document = ConfigDocument::parse(CONFIG).expect("parse");
+        let error = document
+            .with_draft(&[change(&["providers", "mock", "allow_metered"], "true")])
+            .expect_err("read-only");
+        assert_eq!(error.field, "providers.mock.allow_metered");
+        assert!(error.message.contains("read-only"), "got {}", error.message);
+    }
+
+    #[test]
+    fn an_unknown_leaf_is_still_refused() {
+        let document = ConfigDocument::parse(CONFIG).expect("parse");
+        let error = document
+            .with_draft(&[change(&["unknown", "leaf"], "x")])
+            .expect_err("unknown");
+        assert!(error.message.contains("unknown field"));
     }
 }
