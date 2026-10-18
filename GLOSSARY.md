@@ -1,5 +1,7 @@
 # light-ai-gateway
 
+**English** | [简体中文](GLOSSARY.zh-CN.md)
+
 An OpenAI-compatible gateway that holds several provider accounts and routes each
 request to an account whose prepaid allowance can pay for it. Because some
 providers bill silently when an allowance runs out, the distinction between money
@@ -202,5 +204,51 @@ The table of Accounts and their Readings, Covered and Metered, as the operator
 reads it.
 
 **Usage report**:
-The offline document describing the pool's quota and history, served for a
-dashboard.
+The offline document describing the pool's quota and history, served for the
+Console's usage view and for external widgets.
+
+### The console and its changes
+
+**Console**:
+The operator's browser surface served by the Gateway, which shows the Board and
+the Usage report and edits the configuration. It is an operator tool, not a
+second API for clients.
+_Avoid_: web UI, dashboard, admin panel
+
+**Draft configuration**:
+The configuration the Console has edited but not yet applied.
+_Avoid_: pending config, unsaved form
+
+**Apply**:
+Validate a configuration, write it to the config file and reconfigure the
+running Gateway in one all-or-nothing step.
+_Avoid_: save, submit
+
+**Reload**:
+An Apply caused by the config file changing outside the Console. The Console
+writes the same file; there is one path, not two.
+_Avoid_: refresh, reread
+
+**Runtime snapshot**:
+The immutable view of one applied configuration that a request or probe uses
+from admission to settlement. An Apply publishes a new snapshot; work already
+running keeps the old one.
+_Avoid_: config copy, live config
+
+**Restart-only setting**:
+A setting an Apply refuses to change because it would rewire the process; it
+names the restart instead. Today: the listening address, the ledger path and the
+request body limit.
+_Avoid_: cold setting, static config
+
+**Retired account**:
+An Account removed from configuration while attempts are still unsettled. It
+accepts no new work and disappears when its last attempt settles; its Ledger rows
+remain.
+_Avoid_: deleted account, removed account
+
+**Credential source**:
+Where an Account's key comes from: the operating-system credential store, an
+environment variable, a file, or the config file itself. The Console writes keys
+only to the credential store and never reads one back.
+_Avoid_: key field, secret ref

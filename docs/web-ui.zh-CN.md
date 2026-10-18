@@ -1,0 +1,149 @@
+# 控制台
+
+**状态：** 控制台的契约，由 `src/http/console.rs`、`src/console/` 和 `src/runtime.rs`
+来守：谁能到达它、它能改什么、改动何时生效。它不是 `/v1` 的契约；那份不动。
+
+[English](web-ui.md) | **简体中文**
+
+## 它是什么
+
+控制台是 `lgw serve` 提供的运维界面：看板、用量报告、最近的请求、CLI 的每一个动作，
+以及 `config.toml` 的编辑器。它由与代理相同的进程、相同的监听器在 `/` 上提供。
+
+它是单个运维的工具，不是客户端 API，也不是多用户管理面板。没有登录、没有账号、没有
+cookie、没有会话。能到达它的只有运行网关的这台机器。
+
+## 访问
+
+| 界面 | 路径 | 谁能到达 |
+|---|---|---|
+| 控制台页面 | `GET /` | 只有 loopback 对端 |
+| 内嵌资源 | `GET /console/assets/*` | 只有 loopback 对端 |
+| 控制台 API | `/console/api/*` | 只有 loopback 对端 |
+| OpenAI 兼容 API | `/v1/*` | 不变：`local_key` bearer 规则 |
+
+对端地址不是 loopback 的请求，从每一条控制台路径都拿到 404，配没配 `local_key` 都一样。
+监听地址不是 loopback 时，控制台仍然能从 `127.0.0.1` 进来；它不会被暴露到网络上。
+
+控制台不使用 `server.local_key`，也从不接受上游账号 key。它不在 `/v1` 的 bearer 中间件
+后面。
+
+### 同源防护
+
+- 会改状态的控制台请求必须是 `application/json`，并带上 `X-LGW-Console: 1`。
+- `Host` 必须是 `127.0.0.1:<port>`、`localhost:<port>` 或 `[::1]:<port>`，端口与
+  监听器一致。
+- 带 `Origin` 的请求，`Origin` 必须是 loopback。
+- 控制台从不发 `Access-Control-*` 头，所以跨源预检会失败，别的页面发来的表单 POST 也
+  到不了会改状态的端点。
+- 每个控制台响应都带 `Content-Security-Policy: default-src 'self'`、
+  `X-Frame-Options: DENY`、`X-Content-Type-Options: nosniff` 和
+  `Cache-Control: no-store`。
+- 读没有副作用；任何改动都是 POST。
+
+控制台完全不用 cookie；语言是 URL 参数，不是服务端状态。浏览器不是运维和自己机器之间的
+边界，但运维访问的任何页面都能向 loopback 发请求。把它们挡在外面的是 `Origin`/`Host`/
+自定义头的三重检查；loopback 对端检查则把其它所有主机挡在外面。
+
+## 与 CLI 对等
+
+CLI 能做的每一件事都在控制台上，除了启动自己、以及写一份全新的示例文件。控制台调用的是
+同一批操作；它没有第二份规则实现。
+
+| CLI | 控制台 |
+|---|---|
+| `lgw status [--refresh]` | 看板；刷新会先探测 |
+| `lgw usage --since --group-by` | 用量控件 |
+| `lgw accounts list/probe/disable/enable` | 池子里的账号行和单账号操作 |
+| `lgw tail` | 最近的请求 |
+| `lgw doctor` | 诊断 |
+| `lgw keys add/list/remove/test` | 密钥；列表显示来源，从不显示值 |
+| `lgw prices`、`--drift-only`、`--forget` | 价格 |
+| `lgw init` | 不提供：网关已经有配置 |
+| 手动编辑 `config.toml` | 配置 |
+
+网络动作（探测、诊断、密钥测试）在同一个请求里带进度状态和结果跑完，不是后台任务。
+
+## 配置
+
+`config.toml` 是唯一的事实来源。控制台编辑的就是那个文件，不是副本，也不是数据库：
+
+1. 表单编辑的是一份草稿；在应用之前什么都不写。
+2. 应用时用 `toml_edit` 把草稿重写进现有的 TOML 文档，注释、键顺序和未知字段都能留下。
+3. 整份文档由每个命令都在用的同一段代码解析、校验；第一个错误会点名出错的字段。
+4. 替换用的运行时快照在写任何东西之前就构建好（凭据已解析、探测已准备）。
+5. 应用之前会显示 TOML diff。文件以 0600 权限原子替换（同目录下的临时文件，再
+   rename），快照在这之后才发布。
+
+如果表单加载之后文件在磁盘上变了，应用会返回 409 并要求重新加载；它绝不覆盖在编辑器里
+做过的改动。校验或构建快照失败的改动，什么都不变。
+
+密钥不是可编辑的值。key 字段显示的是它的来源（凭据库、环境变量、文件，或存在内联
+字面量）；新增或轮换 key 只会写进操作系统的凭据库。任何响应、日志或页面都不会带上 key。
+
+## 改动对运行中的网关做了什么
+
+一次应用会发布一份新的不可变运行时快照。请求从开始到结算一直用它启动时那份快照，重试
+也算在内；之后才开始的请求看到的是新的。没有排空，也没有任何等待。
+
+池子的实时状态会保留下来：闸门、读数、粘性会话绑定、在途占用和限速窗口属于进程，不属于
+快照。
+
+| 立即生效 | 需要重启 |
+|---|---|
+| `[policy]` 的值 | `server.listen` |
+| providers：adapter、base URL、货币、限额、metered 开关 | `server.db_path` |
+| accounts：新增、移除、标签、限额 | `policy.max_body_bytes` |
+| `[routes]` 和 provider 前缀别名 | |
+| `[prices]` 的配置值和档位表 | |
+| `server.local_key` | |
+
+新账号以 `unknown` 进入，探测成功之前不能服务。被移除的账号会退役：它不再接新工作，最后
+几笔在途尝试仍对着它进来时那个池子结算。改一家 provider 的 adapter 或 base URL 会把它
+的账号重置成 `unknown` 并重新探测；来自旧端点的读数绝不保留。
+
+校验失败的应用什么都不变：旧快照继续服务，控制台返回错误。
+
+## 用量数据
+
+看板是实时池子：它读进程内存，从不探测 provider。用量页通过只读连接读账本，从不写入。
+
+- 范围：24 小时、7 天、30 天、90 天、全部。
+- 金额保持账本的 Decimal 精度；控制台从不把它当浮点数重新相加。
+- 尝试级明细在 30 天后被清理，所以延迟数字（TTFT p50/p95、TPS）到 30 天为止；花销、
+  token 和请求数不会。
+- 页面按定时器刷新（看板 10 秒、用量页 30 秒），也可以按需刷新。没有 websocket，也没有
+  流式 tail。
+
+## 语言
+
+文案有英文和简体中文。`?lang=zh` 选择中文，默认是英文；链接会带上这个参数，顶栏的切换
+也能改它。不存进 cookie。
+
+## 禁止
+
+- 控制台任何路径都不回应非 loopback 对端。
+- 没有 cookie、会话或登录。
+- 永远不发 `Access-Control-*` 头。
+- 页面、API 响应或日志里没有凭据值。
+- 不改 `/v1/*` 的形状、顺序或鉴权。
+- 不写没有经过整体校验的 `config.toml`。
+- 读端点不做现场探测。
+- 不出现只让一半新配置生效的应用。
+- CLI 同步跑的动作不变成后台任务。
+
+## 测试
+
+集成测试，按它们断言的行为命名：
+
+- `the_console_is_loopback_only`
+- `a_cross_origin_write_is_refused`
+- `a_host_header_from_another_name_is_refused`
+- `a_stale_form_does_not_overwrite_the_file`
+- `an_invalid_draft_changes_nothing`
+- `comments_and_unknown_keys_survive_a_save`
+- `a_removed_account_drains_and_keeps_its_ledger_rows`
+- `an_in_flight_request_keeps_its_snapshot`
+- `a_restart_only_setting_is_refused_by_name`
+- `no_console_response_contains_a_key`
+- `chinese_and_english_pages_render_the_same_fields`

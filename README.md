@@ -16,6 +16,7 @@ everything cost.
 - [Quick start](#quick-start)
 - [Credentials](#credentials)
 - [Commands](#commands)
+- [Console](#console)
 - [Reading the output](#reading-the-output)
 - [Account recovery](#account-recovery)
 - [Prices](#prices)
@@ -41,6 +42,9 @@ everything cost.
   cache hit rate, per attempt.
 - **Shows you the numbers.** A terminal board of covered allowance against
   metered balance, with reset countdowns.
+- **Lets you configure it and read it in a browser.** `lgw serve` also serves a
+  loopback-only console: the board, usage charts, recent requests, every CLI
+  action, and a form editor for the config file.
 
 ## Install
 
@@ -89,7 +93,11 @@ Re-run cargo install after pulling changes; it replaces the binary in place.
     lgw keys list                                 # check everything resolves
 
     lgw doctor                                    # config, credentials, probe reachability
-    lgw serve
+    lgw serve                                     # proxy + console on http://127.0.0.1:8787/
+
+The same address serves the console: open http://127.0.0.1:8787/ for the board,
+usage, recent requests and the configuration editor. It answers loopback
+requests only and needs no login.
 
 Where things live:
 
@@ -110,6 +118,7 @@ Then point your client at it:
 
 ### Endpoints
 
+    GET  /                        the operator console (loopback only)
     POST /v1/chat/completions     the proxy: retries, account switching, the usage ledger
     GET  /v1/models               the models this gateway will serve, described by the provider
     GET  /v1/usage                how much of the pool's allowance is gone, and when it comes back
@@ -238,7 +247,7 @@ for tests and dry runs and never touches your real keychain.
 
 ## Commands
 
-    lgw serve                          start the proxy
+    lgw serve                          start the proxy and the console
     lgw status [--refresh]             account board
     lgw usage --since 7d --group-by provider,model,account
     lgw prices [--drift-only]          configured price vs the price learned from real spend
@@ -250,6 +259,27 @@ for tests and dry runs and never touches your real keychain.
     lgw tail                           recent requests
     lgw doctor                         config, credentials, probe reachability
     lgw init                           write an example config
+
+## Console
+
+`lgw serve` serves the console at the same address: open
+http://127.0.0.1:8787/.
+
+It is a single operator's tool, reachable from loopback only: a request from
+another host gets 404, and it is not part of the OpenAI-compatible API. There is
+no login, no cookie and no session. Everything the CLI does is here -- the board,
+usage, recent requests, probing and enabling accounts, doctor, stored credentials,
+prices and drift -- plus one thing the CLI does not have: editing
+`config.toml` in a form.
+
+Applying writes the same file back -- comments and keys the form does not know are
+kept -- and applies it to the running process without dropping in-flight
+requests. The few settings that need a restart instead (`listen`, `db_path`,
+`max_body_bytes`) are named in the console rather than silently ignored. The copy
+switches between English and Chinese in the top bar.
+
+The access rules, the full CLI-to-console mapping and the reload contract are in
+[docs/web-ui.md](docs/web-ui.md).
 
 ## Reading the output
 
@@ -482,8 +512,10 @@ gated at the conservative default of 15 in / 75 out per million.
 ## Non-goals
 
 Cross-provider fallback, cross-model downgrade, protocol translation, semantic
-caching, multi-user RBAC and a web UI are all deliberately out of scope. A model
-maps to exactly one provider; changing that is a product decision.
+caching and multi-user RBAC are all deliberately out of scope. A model maps to
+exactly one provider; changing that is a product decision. The console is a
+single operator's loopback-only tool, not a multi-user admin panel and not a
+second API: it has no login of its own.
 
 ## Development
 
@@ -520,3 +552,11 @@ no warranty, and it spends real money when you configure it to.
 - A failed quota probe keeps the previous reading and marks it stale; it never
   resets a reading to zero.
 - Prompt and response bodies are never stored.
+- The console is served on loopback only and has no login or cookie. Mutating
+  requests need JSON and a custom header and are checked against `Host` and
+  `Origin`, so a page in another browser tab cannot drive it.
+- Configuration writes are validated as a whole and replaced atomically; a write
+  that fails changes nothing, and a file edited underneath the console is never
+  overwritten.
+- The console never displays a credential. Keys are write-only and live in the
+  operating system's credential store.
