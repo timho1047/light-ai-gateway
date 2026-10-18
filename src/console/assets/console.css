@@ -343,6 +343,7 @@ h2.section-title {
 
 .btn {
   display: inline-flex;
+  line-height: 1;
   align-items: center;
   justify-content: center;
   gap: 7px;

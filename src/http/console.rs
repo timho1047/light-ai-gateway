@@ -88,11 +88,13 @@ pub(super) async fn board_partial(
 /// binary. Only exact names resolve, so a path traversal has nothing to reach.
 pub(super) async fn asset(Path(path): Path<String>) -> Response {
     match assets::get(&path) {
-        Some(asset) => (
-            [(header::CONTENT_TYPE, asset.content_type)],
-            Body::from(asset.body),
-        )
-            .into_response(),
+        Some(asset) => {
+            let body = match asset.body {
+                crate::console::assets::Body::Embedded(bytes) => Body::from(bytes),
+                crate::console::assets::Body::Owned(bytes) => Body::from(bytes),
+            };
+            ([(header::CONTENT_TYPE, asset.content_type)], body).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }

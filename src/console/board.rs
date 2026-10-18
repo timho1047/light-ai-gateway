@@ -85,11 +85,7 @@ fn lede(accounts: &[Account], lang: Lang) -> String {
         .collect::<Vec<_>>()
         .join(" · ");
 
-    let inventory = inventory(accounts);
-    let pct = inventory
-        .first()
-        .map(|(_, used, cap)| percent(*used, *cap))
-        .unwrap_or_else(|| "—".to_string());
+    let pct = pool_percent(accounts);
 
     match lang {
         Lang::En => {
@@ -98,10 +94,20 @@ fn lede(accounts: &[Account], lang: Lang) -> String {
                 accounts.len()
             );
             if stale > 0 {
-                let _ = write!(text, " <b>{stale}</b> reading(s) are stale.");
+                let noun = if stale == 1 {
+                    "reading is"
+                } else {
+                    "readings are"
+                };
+                let _ = write!(text, " <b>{stale}</b> {noun} stale.");
             }
             if disabled > 0 {
-                let _ = write!(text, " <b>{disabled}</b> account(s) disabled.");
+                let noun = if disabled == 1 {
+                    "account is"
+                } else {
+                    "accounts are"
+                };
+                let _ = write!(text, " <b>{disabled}</b> {noun} disabled.");
             }
             if !metered.is_empty() {
                 let _ = write!(
@@ -258,6 +264,19 @@ fn state_class(state: AccountState) -> &'static str {
         AccountState::Disabled => "disabled",
         AccountState::Unknown => "unknown",
     }
+}
+
+/// Covered inventory across the whole pool: sum(used) over sum(cap) for every
+/// covered money window. One spent account beside a fresh one reads 50%, not
+/// the "next account" figure.
+fn pool_percent(accounts: &[Account]) -> String {
+    let mut used = Decimal::ZERO;
+    let mut cap = Decimal::ZERO;
+    for (_, window_used, window_cap) in inventory(accounts) {
+        used += window_used;
+        cap += window_cap;
+    }
+    percent(used, cap)
 }
 
 fn inventory(accounts: &[Account]) -> Vec<(GateKind, Decimal, Decimal)> {
@@ -421,7 +440,37 @@ mod tests {
         assert!(html.contains("10 / 20"));
         assert!(html.contains("3h 12m"));
         assert!(html.contains("$7.40"), "wallet remaining is metered money");
-        assert!(html.contains("50%"), "inventory across the covered windows");
+        assert!(
+            html.contains("30%"),
+            "inventory across every covered window"
+        );
+    }
+
+    #[test]
+    fn pool_inventory_is_inventory_not_the_next_account() {
+        let mut spent = covered_account();
+        spent.id = "spent".to_string();
+        spent.label = "spent".to_string();
+        spent.gates = vec![gate(
+            GateKind::FiveHour,
+            Decimal::from(20),
+            Decimal::from(20),
+            None,
+        )];
+        let mut fresh = covered_account();
+        fresh.id = "fresh".to_string();
+        fresh.label = "fresh".to_string();
+        fresh.gates = vec![gate(
+            GateKind::FiveHour,
+            Decimal::from(20),
+            Decimal::ZERO,
+            None,
+        )];
+        let html = render(&[spent, fresh], ts(1_000_000), Lang::En);
+        assert!(
+            html.contains("50%"),
+            "one spent account beside a fresh one is 50%"
+        );
     }
 
     #[test]
