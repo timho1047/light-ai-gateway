@@ -256,6 +256,8 @@ struct FakeBackend {
     /// How many times a configuration was published, so a test can prove the
     /// watcher did not apply the same bytes twice.
     applied_count: std::sync::atomic::AtomicUsize,
+    /// A report the usage tests put here instead of opening a real ledger.
+    usage: Mutex<Option<crate::store::UsageReport>>,
 }
 
 impl FakeBackend {
@@ -267,6 +269,7 @@ impl FakeBackend {
             failures: Mutex::new(Vec::new()),
             applied: Mutex::new(None),
             applied_count: std::sync::atomic::AtomicUsize::new(0),
+            usage: Mutex::new(None),
         }
     }
 
@@ -406,6 +409,15 @@ impl ProxyBackend for FakeBackend {
             class,
             attempt,
         });
+    }
+
+    fn usage_report(
+        &self,
+        _now: OffsetDateTime,
+        _since: OffsetDateTime,
+        _dims: &[crate::domain::GroupBy],
+    ) -> Option<crate::store::UsageReport> {
+        self.usage.lock().unwrap().clone()
     }
 
     fn apply_config(
@@ -2780,4 +2792,106 @@ async fn a_console_save_is_not_applied_again_by_the_watcher() {
         "the console's own write is not a second apply"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn usage_fixture() -> crate::store::UsageReport {
+    use crate::store::{LatencySummary, UsageFullRow, UsageReport};
+    let money = |text: &str| text.parse::<Decimal>().expect("decimal");
+    let mut usd = UsageFullRow {
+        key: "xkiro".to_string(),
+        currency: "USD".to_string(),
+        requests: 3,
+        failed: 1,
+        covered_requests: 2,
+        metered_requests: 1,
+        input_tokens: 1_200,
+        output_tokens: 300,
+        cached_tokens: 600,
+        covered_cost: money("0.75"),
+        metered_cost: money("0.5"),
+        other_cost: Decimal::ZERO,
+    };
+    let mut cny = UsageFullRow {
+        key: "deepseek".to_string(),
+        currency: "CNY".to_string(),
+        requests: 2,
+        failed: 0,
+        covered_requests: 0,
+        metered_requests: 2,
+        input_tokens: 400,
+        output_tokens: 100,
+        cached_tokens: 0,
+        covered_cost: Decimal::ZERO,
+        metered_cost: money("0.25"),
+        other_cost: Decimal::ZERO,
+    };
+    usd.requests = 3;
+    cny.requests = 2;
+    UsageReport {
+        rows: vec![usd, cny],
+        daily: vec![UsageFullRow {
+            key: "2026-10-18".to_string(),
+            currency: "USD".to_string(),
+            requests: 5,
+            ..UsageFullRow::default()
+        }],
+        latency: LatencySummary {
+            p50_ttft_ms: Some(120),
+            p95_ttft_ms: Some(1_400),
+            samples: 42,
+        },
+        latency_since: None,
+        latency_truncated: true,
+    }
+}
+
+#[tokio::test]
+async fn the_usage_page_shows_the_same_numbers_in_both_languages() {
+    let fake = fake_backend("http://127.0.0.1:1");
+    *fake.usage.lock().unwrap() = Some(usage_fixture());
+    let addr = spawn_console_router(fake.clone()).await;
+
+    let english = reqwest::get(format!("{addr}/usage?range=7d&group=provider&lang=en"))
+        .await
+        .unwrap();
+    assert_eq!(english.status(), 200);
+    let english = english.text().await.unwrap();
+    assert!(english.contains("Covered spend"));
+    assert!(english.contains("Metered spend"));
+    assert!(english.contains("0.75"));
+    assert!(english.contains("0.5"));
+    assert!(english.contains("0.25"));
+    assert!(
+        !english.contains("1.25"),
+        "currencies and coverage never mix"
+    );
+    assert!(english.contains("p95 TTFT"));
+    assert!(english.contains("1.4s"));
+    assert!(english.contains("last 30 days"));
+    assert!(english.contains("range=30d"), "range controls are links");
+
+    let chinese = reqwest::get(format!("{addr}/usage?range=30d&group=model&lang=zh"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(chinese.contains("用量"));
+    for number in ["0.75", "0.5", "0.25", "1.4s", "42"] {
+        assert!(chinese.contains(number), "ZH missing {number}");
+    }
+    assert!(chinese.contains("30 天"));
+}
+
+#[tokio::test]
+async fn the_usage_page_says_when_there_is_no_ledger() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let html = reqwest::get(format!("{addr}/usage?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("No ledger yet"));
+    assert!(!html.contains("Covered spend"));
 }

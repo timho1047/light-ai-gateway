@@ -1189,6 +1189,17 @@ impl Ledger {
     pub fn usage_by(&self, since: OffsetDateTime, dims: &[GroupBy]) -> Result<Vec<UsageRow>> {
         usage_rows_multi(&self.conn, since, dims)
     }
+
+    /// The Usage page's report: the same fold as usage_by, with spend split by
+    /// coverage, failure counts, daily totals and the 30-day timing summary.
+    pub fn usage_report(
+        &self,
+        now: OffsetDateTime,
+        since: OffsetDateTime,
+        dims: &[GroupBy],
+    ) -> Result<UsageReport> {
+        usage_report(&self.conn, now, since, dims)
+    }
 }
 
 /// The numbers the Board's rail shows: how busy the gateway is right now and
@@ -1269,12 +1280,100 @@ fn group_by_sql(d: GroupBy) -> &'static str {
     }
 }
 
+/// One usage row with its spend split by coverage, plus failure and timing
+/// facts the console can show. Money is kept per currency and never added
+/// across currencies.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageFullRow {
+    pub key: String,
+    pub currency: String,
+    pub requests: u64,
+    pub failed: u64,
+    pub covered_requests: u64,
+    pub metered_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub covered_cost: Decimal,
+    pub metered_cost: Decimal,
+    /// Spend under a coverage class that is not money (allowances, pacing).
+    /// Kept separate so the two money columns never absorb it.
+    pub other_cost: Decimal,
+}
+
+impl UsageFullRow {
+    pub fn total_cost(&self) -> Decimal {
+        self.covered_cost + self.metered_cost + self.other_cost
+    }
+
+    pub fn cache_hit(&self) -> Option<f64> {
+        if self.input_tokens == 0 {
+            None
+        } else {
+            Some(self.cached_tokens as f64 / self.input_tokens as f64)
+        }
+    }
+}
+
+impl From<&UsageFullRow> for UsageRow {
+    fn from(row: &UsageFullRow) -> UsageRow {
+        UsageRow {
+            key: row.key.clone(),
+            requests: row.requests,
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_tokens: row.cached_tokens,
+            cost: row.total_cost(),
+            currency: row.currency.clone(),
+        }
+    }
+}
+
+/// Timing history is short by design: the ledger keeps it for 30 days, so a
+/// range longer than that must say what it is actually showing.
+pub const LATENCY_HISTORY_DAYS: i64 = 30;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LatencySummary {
+    pub p50_ttft_ms: Option<u64>,
+    pub p95_ttft_ms: Option<u64>,
+    pub samples: u64,
+}
+
+/// Everything the Usage page renders, aggregated once from the ledger.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UsageReport {
+    /// The requested grouping, ordered by key then currency.
+    pub rows: Vec<UsageFullRow>,
+    /// Requests per UTC day, independent of the requested grouping. This is the
+    /// chart's data.
+    pub daily: Vec<UsageFullRow>,
+    pub latency: LatencySummary,
+    /// The start of the window the latency figures cover.
+    pub latency_since: Option<OffsetDateTime>,
+    /// True when the selected range is longer than the latency history.
+    pub latency_truncated: bool,
+}
+
 /// Aggregated usage rows for a composite grouping key.
 fn usage_rows_multi(
     conn: &Connection,
     since: OffsetDateTime,
     dims: &[GroupBy],
 ) -> Result<Vec<UsageRow>> {
+    Ok(usage_report(conn, crate::domain::now(), since, dims)?
+        .rows
+        .iter()
+        .map(UsageRow::from)
+        .collect())
+}
+
+fn usage_report(
+    conn: &Connection,
+    now: OffsetDateTime,
+    since: OffsetDateTime,
+    dims: &[GroupBy],
+) -> Result<UsageReport> {
     let key_expr = if dims.is_empty() {
         "currency".to_string()
     } else {
@@ -1284,11 +1383,17 @@ fn usage_rows_multi(
             .join(" || '|' || ")
     };
     let sql = format!(
-        "SELECT {key_expr} AS k, currency, prompt_tokens, completion_tokens, cached_tokens, cost \
-         FROM requests WHERE ts >= ?1"
+        "SELECT {key_expr} AS k, currency, prompt_tokens, completion_tokens, cached_tokens, cost,                 coverage, status, ttft_ms, ts          FROM requests WHERE ts >= ?1"
     );
 
-    let mut acc: BTreeMap<(String, String), UsageRow> = BTreeMap::new();
+    let latency_since = {
+        let cap = now - time::Duration::days(LATENCY_HISTORY_DAYS);
+        if since > cap { since } else { cap }
+    };
+    let mut acc: BTreeMap<(String, String), UsageFullRow> = BTreeMap::new();
+    let mut daily: BTreeMap<(String, String), UsageFullRow> = BTreeMap::new();
+    let mut ttfts: Vec<u64> = Vec::new();
+
     let mut stmt = conn.prepare(&sql).context("preparing usage query")?;
     let mut rows = stmt.query(rusqlite::params![since.unix_timestamp()])?;
     while let Some(row) = rows.next()? {
@@ -1302,25 +1407,93 @@ fn usage_rows_multi(
             .as_deref()
             .and_then(crate::domain::parse_money)
             .unwrap_or(Decimal::ZERO);
+        let coverage = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+        let status = row.get::<_, Option<String>>(7)?.unwrap_or_default();
+        let ttft = row.get::<_, Option<i64>>(8)?.map(|ms| ms.max(0) as u64);
+        let at = i2t(row.get::<_, i64>(9)?);
 
         let entry = acc
             .entry((key.clone(), currency.clone()))
-            .or_insert_with(|| UsageRow {
+            .or_insert_with(|| UsageFullRow {
                 key,
-                requests: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                cost: Decimal::ZERO,
-                currency,
+                currency: currency.clone(),
+                ..UsageFullRow::default()
             });
-        entry.requests += 1;
-        entry.input_tokens += prompt;
-        entry.output_tokens += completion;
-        entry.cached_tokens += cached;
-        entry.cost += cost;
+        add_request(entry, prompt, completion, cached, cost, &coverage, &status);
+
+        let day = at.date().to_string();
+        let day_entry = daily
+            .entry((day.clone(), currency.clone()))
+            .or_insert_with(|| UsageFullRow {
+                key: day,
+                currency,
+                ..UsageFullRow::default()
+            });
+        add_request(
+            day_entry, prompt, completion, cached, cost, &coverage, &status,
+        );
+
+        if at >= latency_since
+            && let Some(ms) = ttft
+        {
+            ttfts.push(ms);
+        }
     }
-    Ok(acc.into_values().collect())
+
+    let latency = latency_summary(ttfts);
+    Ok(UsageReport {
+        rows: acc.into_values().collect(),
+        daily: daily.into_values().collect(),
+        latency,
+        latency_since: Some(latency_since),
+        latency_truncated: since < latency_since,
+    })
+}
+
+fn add_request(
+    row: &mut UsageFullRow,
+    prompt: u64,
+    completion: u64,
+    cached: u64,
+    cost: Decimal,
+    coverage: &str,
+    status: &str,
+) {
+    row.requests += 1;
+    row.input_tokens += prompt;
+    row.output_tokens += completion;
+    row.cached_tokens += cached;
+    if status != "ok" {
+        row.failed += 1;
+    }
+    match coverage {
+        "covered" => {
+            row.covered_requests += 1;
+            row.covered_cost += cost;
+        }
+        "metered" => {
+            row.metered_requests += 1;
+            row.metered_cost += cost;
+        }
+        _ => row.other_cost += cost,
+    }
+}
+
+fn latency_summary(mut samples: Vec<u64>) -> LatencySummary {
+    if samples.is_empty() {
+        return LatencySummary::default();
+    }
+    samples.sort_unstable();
+    let count = samples.len();
+    let pick = |share: f64| -> u64 {
+        let rank = ((count as f64) * share).ceil() as usize;
+        samples[rank.saturating_sub(1).min(count - 1)]
+    };
+    LatencySummary {
+        p50_ttft_ms: Some(pick(0.50)),
+        p95_ttft_ms: Some(pick(0.95)),
+        samples: count as u64,
+    }
 }
 
 /// Aggregated usage rows for one dimension, read by the tests.
@@ -2202,6 +2375,70 @@ mod tests {
             )
             .expect("read usage_daily");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn the_usage_report_splits_coverage_and_caps_latency_at_thirty_days() {
+        let mut conn = mem();
+        let now = ts(2_000_000);
+        let recent = now.unix_timestamp();
+
+        let mut covered = request("r1", recent - 3_600, "xkiro", "a1", "m1", "0.75");
+        covered.ttft_ms = Some(100);
+        insert_req(&mut conn, &covered);
+
+        let mut metered = request("r2", recent - 7_200, "xkiro", "a1", "m1", "0.5");
+        metered.coverage = GateClass::Metered;
+        metered.status = RequestStatus::Error;
+        metered.currency = "CNY".to_string();
+        metered.ttft_ms = Some(200);
+        insert_req(&mut conn, &metered);
+
+        // Older than the 30-day timing history but inside the selected range.
+        let mut old = request("r3", recent - 40 * 86_400, "xkiro", "a1", "m1", "0.1");
+        old.ttft_ms = Some(999);
+        insert_req(&mut conn, &old);
+
+        let since = now - time::Duration::days(90);
+        let report = usage_report(&conn, now, since, &[GroupBy::Provider]).expect("report");
+        assert_eq!(report.rows.len(), 2, "one row per currency");
+        let usd = report
+            .rows
+            .iter()
+            .find(|r| r.currency == "USD")
+            .expect("USD row");
+        assert_eq!(usd.requests, 2);
+        assert_eq!(usd.covered_requests, 2);
+        assert_eq!(usd.metered_requests, 0);
+        assert_eq!(usd.covered_cost, dec("0.85"));
+        assert_eq!(usd.metered_cost, Decimal::ZERO);
+        assert_eq!(usd.failed, 0);
+        let cny = report
+            .rows
+            .iter()
+            .find(|r| r.currency == "CNY")
+            .expect("CNY row");
+        assert_eq!(cny.covered_requests, 0);
+        assert_eq!(cny.metered_requests, 1);
+        assert_eq!(cny.metered_cost, dec("0.5"));
+        assert_eq!(cny.failed, 1);
+
+        assert_eq!(
+            report.latency.samples, 2,
+            "the 40-day-old request has no timing history"
+        );
+        assert_eq!(report.latency.p50_ttft_ms, Some(100));
+        assert_eq!(report.latency.p95_ttft_ms, Some(200));
+        assert!(report.latency_truncated);
+        assert_eq!(report.daily.len(), 3, "three UTC days have requests");
+
+        // The CLI's rows still total the same money and counts from the same fold.
+        let rows = usage_rows(&conn, since, GroupBy::Provider).expect("cli rows");
+        let usd = rows.iter().find(|r| r.currency == "USD").expect("USD");
+        assert_eq!(usd.cost, dec("0.85"));
+        assert_eq!(usd.requests, 2);
+        let cny = rows.iter().find(|r| r.currency == "CNY").expect("CNY");
+        assert_eq!(cny.cost, dec("0.5"));
     }
 
     #[test]

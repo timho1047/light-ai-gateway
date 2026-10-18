@@ -134,6 +134,17 @@ pub trait ProxyBackend: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// The Usage page's ledger aggregation, read-only. None when the ledger
+    /// cannot be opened; the page then says so instead of showing zeros.
+    fn usage_report(
+        &self,
+        _now: time::OffsetDateTime,
+        _since: time::OffsetDateTime,
+        _dims: &[crate::domain::GroupBy],
+    ) -> Option<crate::store::UsageReport> {
+        None
+    }
+
     /// Build the next snapshot, persist the file through `write`, then publish.
     ///
     /// Order is the guarantee: a build failure happens before the write, and a
@@ -292,6 +303,19 @@ impl ProxyBackend for GatewayBackend {
 
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         self.gateway.runtime().prices().drifted()
+    }
+
+    fn usage_report(
+        &self,
+        now: time::OffsetDateTime,
+        since: time::OffsetDateTime,
+        dims: &[crate::domain::GroupBy],
+    ) -> Option<crate::store::UsageReport> {
+        let path = self.gateway.runtime().config().db_path();
+        crate::store::Ledger::open(&path)
+            .ok()?
+            .usage_report(now, since, dims)
+            .ok()
     }
 
     fn apply_config(
@@ -520,6 +544,7 @@ pub(crate) fn build_router_with_console(
     // configuration from the network. A request never passes through both.
     let operator = Router::new()
         .route("/", get(console::board_page))
+        .route("/usage", get(console::usage_page))
         .route("/config", get(console::config_page_handler))
         .route(
             "/console/api/config/validate",

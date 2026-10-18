@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::config_doc::{self, ConfigDocument, DraftAction, DraftChange, KeySpec};
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
-use crate::console::{assets, board, config_page, copy::Lang, layout, layout::Nav};
+use crate::console::{assets, board, config_page, copy::Lang, layout, layout::Nav, usage};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -566,6 +566,30 @@ fn fragment(status: StatusCode, html: String) -> Response {
         Body::from(html),
     )
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UsageQuery {
+    range: Option<String>,
+    group: Option<String>,
+    lang: Option<String>,
+}
+
+/// The Usage page. Read-only: the backend's aggregation opens the ledger
+/// read-only and never contacts a provider.
+pub(super) async fn usage_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UsageQuery>,
+) -> Response {
+    let lang = Lang::from_param(query.lang.as_deref());
+    let range = usage::Range::parse(query.range.as_deref());
+    let group = usage::Group::parse(query.group.as_deref());
+    let now = crate::domain::now();
+    let report = state
+        .backend
+        .usage_report(now, range.since(now), &[group.group_by()]);
+    let body = usage::render(report.as_ref(), range, group, lang);
+    page(&state, lang, Nav::Usage, body)
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the
