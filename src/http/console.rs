@@ -681,6 +681,100 @@ pub(super) async fn prices_forget(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct ProbeRequest {
+    provider: Option<String>,
+    account: Option<String>,
+}
+
+/// Probe one account or every account. The network call happens inside this
+/// request with a bounded timeout: a provider that never answers cannot hang the
+/// page, it gets a timeout fragment.
+pub(super) async fn accounts_probe(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ProbeRequest>,
+) -> Response {
+    let provider = request.provider.filter(|value| !value.trim().is_empty());
+    let account = request.account.filter(|value| !value.trim().is_empty());
+    if provider.is_some() != account.is_some() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "a probe needs both a provider and an account, or neither" })),
+        )
+            .into_response();
+    }
+    let probing = state
+        .backend
+        .probe_accounts(provider.as_deref(), account.as_deref());
+    match tokio::time::timeout(std::time::Duration::from_secs(15), probing).await {
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "the provider did not answer within 15 seconds" })),
+        )
+            .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": sanitised(&error.0) })),
+        )
+            .into_response(),
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({ "probed": true }))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AccountStateRequest {
+    provider: Option<String>,
+    account: Option<String>,
+    enabled: bool,
+}
+
+/// Operator disable/enable. A disable is not undone by probes; an enable only
+/// returns the account to Unknown until a probe proves it can pay.
+pub(super) async fn accounts_state(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AccountStateRequest>,
+) -> Response {
+    let provider = request.provider.filter(|value| !value.trim().is_empty());
+    let account = request.account.filter(|value| !value.trim().is_empty());
+    let (Some(provider), Some(account)) = (provider, account) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "a state change needs a provider and an account" })),
+        )
+            .into_response();
+    };
+    match state
+        .backend
+        .set_account_enabled(&provider, &account, request.enabled)
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "enabled": request.enabled })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": sanitised(&error.0) })),
+        )
+            .into_response(),
+    }
+}
+
+/// Provider error text is displayed to an operator, not written to a log: keep
+/// it to one short line and drop control characters.
+pub(super) fn sanitised(message: &str) -> String {
+    let flat: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clean = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() > 300 {
+        clean.chars().take(300).collect()
+    } else {
+        clean
+    }
+}
+
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the
 /// binary. Only exact names resolve, so a path traversal has nothing to reach.
 pub(super) async fn asset(Path(path): Path<String>) -> Response {

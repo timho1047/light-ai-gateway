@@ -52,7 +52,10 @@ pub fn render(input: &BoardInput, at: OffsetDateTime, lang: Lang) -> String {
     table(&mut out, &overviews, at, lang);
     out.push_str("</div>");
     out.push_str(&rail(input, &overviews, lang));
-    out.push_str("</div></section>");
+    out.push_str("</div>");
+    out.push_str(
+        r#"<div class="board-result" data-board-result aria-live="polite"></div></section>"#,
+    );
     out
 }
 
@@ -402,7 +405,33 @@ fn row(out: &mut String, account: &AccountOverview, at: OffsetDateTime, lang: La
         let short = truncate(error, 64);
         let _ = write!(out, "<div class=\"tag danger\">{}</div>", esc(&short));
     }
-    out.push_str("</td></tr>");
+    let _ = write!(
+        out,
+        r#"<div class="row-actions"><button class="btn btn-small" type="button" data-account-probe data-provider="{}" data-account="{}">{}</button>"#,
+        esc(&account.provider),
+        esc(&account.account_id),
+        esc(s.board_probe),
+    );
+    if account.state == AccountState::Disabled {
+        let _ = write!(
+            out,
+            r#"<button class="btn btn-small" type="button" data-account-enable data-provider="{}" data-account="{}" data-confirm="{}">{}</button>"#,
+            esc(&account.provider),
+            esc(&account.account_id),
+            esc(s.board_enable_confirm),
+            esc(s.board_enable),
+        );
+    } else {
+        let _ = write!(
+            out,
+            r#"<button class="btn btn-small danger" type="button" data-account-disable data-provider="{}" data-account="{}" data-confirm="{}">{}</button>"#,
+            esc(&account.provider),
+            esc(&account.account_id),
+            esc(s.board_disable_confirm),
+            esc(s.board_disable),
+        );
+    }
+    out.push_str("</div></td></tr>");
 }
 
 fn state_class(state: AccountState) -> &'static str {

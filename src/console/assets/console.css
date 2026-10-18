@@ -1908,3 +1908,18 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
   color: var(--warn);
   font-weight: 500;
 }
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.board-result {
+  margin: 16px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--warn);
+}

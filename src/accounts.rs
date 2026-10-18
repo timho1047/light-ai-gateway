@@ -575,6 +575,38 @@ impl Pool {
         outcome
     }
 
+    /// Take an account out of rotation for the operator, or put it back.
+    ///
+    /// Disabling is explicit and survives probes; enabling only lifts the
+    /// operator's decision and returns the account to Unknown, so traffic
+    /// resumes only after a probe proves it can pay. Returns the account as it
+    /// now is, for persisting.
+    pub fn set_operator_state(
+        &self,
+        qualified_id: &str,
+        enabled: bool,
+    ) -> std::result::Result<Account, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(acct) = find_mut(&mut inner.accounts, qualified_id) else {
+            return Err(format!("no account {qualified_id}"));
+        };
+        if enabled {
+            if acct.state != AccountState::Disabled {
+                return Err(format!(
+                    "{qualified_id} is {}, not DISABLED; there is nothing to enable",
+                    acct.state.label()
+                ));
+            }
+            acct.state = AccountState::Unknown;
+            acct.last_error = None;
+            acct.last_probe_at = None;
+        } else {
+            acct.state = AccountState::Disabled;
+            acct.last_error = Some(OPERATOR_DISABLED.to_string());
+        }
+        Ok(acct.clone())
+    }
+
     pub fn note_activity(&self) {
         if let Ok(mut t) = self.last_activity.lock() {
             *t = Instant::now();
@@ -1808,6 +1840,82 @@ mod tests {
             account.gates.is_empty(),
             "a reading from the old endpoint is worthless"
         );
+    }
+
+    #[test]
+    fn an_operator_disable_is_not_undone_by_a_probe_and_enable_returns_unknown() {
+        let pool = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![gate(
+                    GateKind::FiveHour,
+                    Decimal::from(10),
+                    Decimal::from(1),
+                    None,
+                )],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        let disabled = pool
+            .set_operator_state("p/a", false)
+            .expect("disable is allowed");
+        assert_eq!(disabled.state, AccountState::Disabled);
+        assert_eq!(disabled.last_error.as_deref(), Some(OPERATOR_DISABLED));
+
+        // A successful probe refreshes the reading but must not lift the
+        // operator's decision.
+        pool.apply_probe(
+            "p/a",
+            vec![gate(
+                GateKind::FiveHour,
+                Decimal::from(10),
+                Decimal::from(0),
+                None,
+            )],
+            now(),
+        );
+        let still = pool.account("p/a").expect("account");
+        assert_eq!(still.state, AccountState::Disabled);
+        assert_eq!(still.last_error.as_deref(), Some(OPERATOR_DISABLED));
+
+        let enabled = pool.set_operator_state("p/a", true).expect("enable");
+        assert_eq!(enabled.state, AccountState::Unknown);
+        assert_eq!(enabled.last_error, None);
+        assert_eq!(enabled.last_probe_at, None);
+
+        pool.apply_probe(
+            "p/a",
+            vec![gate(
+                GateKind::FiveHour,
+                Decimal::from(10),
+                Decimal::from(0),
+                None,
+            )],
+            now(),
+        );
+        assert_eq!(pool.account("p/a").unwrap().state, AccountState::Active);
+    }
+
+    #[test]
+    fn enabling_an_account_that_is_not_disabled_is_refused() {
+        let pool = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![gate(
+                    GateKind::FiveHour,
+                    Decimal::from(10),
+                    Decimal::from(1),
+                    None,
+                )],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        assert!(pool.set_operator_state("p/a", true).is_err());
+        assert!(pool.set_operator_state("p/nope", false).is_err());
     }
 
     #[test]

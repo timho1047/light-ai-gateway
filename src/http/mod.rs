@@ -145,6 +145,29 @@ pub trait ProxyBackend: Send + Sync + 'static {
         None
     }
 
+    /// Probe one account or all of them, through the configured providers.
+    fn probe_accounts<'a>(
+        &'a self,
+        _provider: Option<&'a str>,
+        _account: Option<&'a str>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), ApplyError>> + Send + 'a>>
+    {
+        Box::pin(async { Err(ApplyError("this backend cannot probe accounts".to_string())) })
+    }
+
+    /// Operator disable/enable on the live pool. Enable returns the account to
+    /// Unknown; only a probe makes it serve again.
+    fn set_account_enabled(
+        &self,
+        _provider: &str,
+        _account: &str,
+        _enabled: bool,
+    ) -> std::result::Result<(), ApplyError> {
+        Err(ApplyError(
+            "this backend cannot change account state".to_string(),
+        ))
+    }
+
     /// The configured-plus-learned price table the page reports on, read-only.
     fn price_table(&self) -> Option<crate::meter::PriceTable> {
         None
@@ -328,6 +351,51 @@ impl ProxyBackend for GatewayBackend {
 
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         self.gateway.runtime().prices().drifted()
+    }
+
+    fn probe_accounts<'a>(
+        &'a self,
+        provider: Option<&'a str>,
+        account: Option<&'a str>,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::result::Result<(), ApplyError>> + Send + 'a>>
+    {
+        let gateway = self.gateway.clone();
+        let provider = provider.map(str::to_string);
+        let account = account.map(str::to_string);
+        Box::pin(async move {
+            match (provider.as_deref(), account.as_deref()) {
+                (Some(provider), Some(account)) => {
+                    gateway.probe_account(provider, account).await;
+                }
+                (None, None) => gateway.probe_all().await,
+                _ => {
+                    return Err(ApplyError(
+                        "a probe needs both a provider and an account, or neither".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn set_account_enabled(
+        &self,
+        provider: &str,
+        account: &str,
+        enabled: bool,
+    ) -> std::result::Result<(), ApplyError> {
+        let qualified = crate::domain::qualified_id(provider, account);
+        let snapshot = self
+            .gateway
+            .pool
+            .set_operator_state(&qualified, enabled)
+            .map_err(ApplyError)?;
+        self.gateway.store.save_account(&snapshot);
+        self.gateway
+            .store
+            .flush_blocking()
+            .map_err(|error| ApplyError(error.to_string()))?;
+        Ok(())
     }
 
     fn price_table(&self) -> Option<crate::meter::PriceTable> {
@@ -626,6 +694,8 @@ pub(crate) fn build_router_with_console(
         .route("/usage", get(console::usage_page))
         .route("/requests", get(console::requests_page))
         .route("/prices", get(console::prices_page))
+        .route("/console/api/accounts/probe", post(console::accounts_probe))
+        .route("/console/api/accounts/state", post(console::accounts_state))
         .route("/console/api/prices/forget", post(console::prices_forget))
         .route("/config", get(console::config_page_handler))
         .route(

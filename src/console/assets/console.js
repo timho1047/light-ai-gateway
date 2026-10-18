@@ -537,6 +537,56 @@
     })(forgetButtons[fb]);
   }
 
+  /* ------------------------------------------- board account actions */
+
+  var accountButtons = document.querySelectorAll(
+    "[data-account-probe], [data-account-disable], [data-account-enable]"
+  );
+  for (var ab = 0; ab < accountButtons.length; ab++) {
+    (function (button) {
+      button.addEventListener("click", async function () {
+        var question = button.getAttribute("data-confirm");
+        if (question && !window.confirm(question)) { return; }
+        var provider = button.getAttribute("data-provider");
+        var account = button.getAttribute("data-account");
+        var probe = button.hasAttribute("data-account-probe");
+        var payload = { provider: provider, account: account };
+        if (!probe) {
+          payload.enabled = button.hasAttribute("data-account-enable");
+        }
+        var row = button.closest(".row-actions");
+        var siblings = row ? row.querySelectorAll("button") : [button];
+        var page = document.querySelector("[data-board-result]");
+        var label = button.textContent;
+        button.textContent = "…";
+        for (var d = 0; d < siblings.length; d++) { siblings[d].disabled = true; }
+        try {
+          var response = await fetch(
+            probe ? "/console/api/accounts/probe" : "/console/api/accounts/state",
+            {
+              method: "POST",
+              headers: headers(),
+              credentials: "same-origin",
+              body: JSON.stringify(payload)
+            }
+          );
+          if (response.ok) {
+            window.location.reload();
+            return;
+          }
+          var detail = await response.text();
+          try { detail = JSON.parse(detail).error || detail; } catch (ignored) {}
+          if (page) { page.textContent = detail; }
+        } catch (error) {
+          if (page) { page.textContent = String(error); }
+        } finally {
+          button.textContent = label;
+          for (var e = 0; e < siblings.length; e++) { siblings[e].disabled = false; }
+        }
+      });
+    })(accountButtons[ab]);
+  }
+
   /* flash messages vanish on their own; a close chip can remove them early */
   var flashes = document.querySelectorAll(".flash .close");
   for (var s = 0; s < flashes.length; s++) {

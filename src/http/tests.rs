@@ -414,6 +414,66 @@ impl ProxyBackend for FakeBackend {
         });
     }
 
+    fn probe_accounts<'a>(
+        &'a self,
+        provider: Option<&'a str>,
+        account: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<(), crate::http::ApplyError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let gates = || {
+                vec![gate(
+                    crate::domain::GateKind::FiveHour,
+                    Decimal::from(100),
+                    Decimal::from(5),
+                    None,
+                )]
+            };
+            match (provider, account) {
+                (Some(_), Some("broken")) => {
+                    return Err(crate::http::ApplyError(
+                        "the provider refused the probe: connection refused".to_string(),
+                    ));
+                }
+                (Some(provider), Some(account)) => {
+                    let qualified = crate::domain::qualified_id(provider, account);
+                    self.pool
+                        .apply_probe(&qualified, gates(), crate::domain::now());
+                }
+                (None, None) => {
+                    for account in self.pool.snapshot() {
+                        self.pool
+                            .apply_probe(&account.qualified(), gates(), crate::domain::now());
+                    }
+                }
+                _ => {
+                    return Err(crate::http::ApplyError(
+                        "a probe needs both a provider and an account, or neither".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn set_account_enabled(
+        &self,
+        provider: &str,
+        account: &str,
+        enabled: bool,
+    ) -> std::result::Result<(), crate::http::ApplyError> {
+        let qualified = crate::domain::qualified_id(provider, account);
+        self.pool
+            .set_operator_state(&qualified, enabled)
+            .map(|_| ())
+            .map_err(crate::http::ApplyError)
+    }
+
     fn price_table(&self) -> Option<crate::meter::PriceTable> {
         Some(self.runtime().prices().clone())
     }
@@ -3150,4 +3210,153 @@ async fn a_page_with_no_prices_says_so() {
         .await
         .unwrap();
     assert!(html.contains("No configured or learned prices yet") || html.contains("No ledger yet"));
+}
+
+#[tokio::test]
+async fn the_board_offers_probe_and_disable_actions() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let html = reqwest::get(format!("{addr}/?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("data-account-probe"));
+    assert!(html.contains("data-account-disable"));
+    assert!(html.contains("data-board-result"));
+    assert!(html.contains("Probe"));
+    assert!(html.contains("Disable"));
+}
+
+#[tokio::test]
+async fn probing_and_operator_state_work_through_the_console() {
+    let fake = fake_backend("http://127.0.0.1:1");
+    let addr = spawn_console_router(fake.clone()).await;
+    let client = reqwest::Client::new();
+
+    let probed = client
+        .post(format!("{addr}/console/api/accounts/probe"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probed.status(), 200);
+    for account in fake.pool.snapshot() {
+        assert_eq!(
+            account.gates.first().map(|gate| gate.used),
+            Some(Decimal::from(5)),
+            "probe all refreshed every account"
+        );
+    }
+
+    let disabled = client
+        .post(format!("{addr}/console/api/accounts/state"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({
+            "provider": "mock", "account": "a1", "enabled": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), 200);
+    let state = fake.pool.account("mock/a1").expect("account").state;
+    assert_eq!(state, crate::domain::AccountState::Disabled);
+
+    // A successful probe must not lift the operator's decision.
+    let probe_one = client
+        .post(format!("{addr}/console/api/accounts/probe"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock", "account": "a1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe_one.status(), 200);
+    let account = fake.pool.account("mock/a1").expect("account");
+    assert_eq!(account.state, crate::domain::AccountState::Disabled);
+    assert_eq!(
+        account.last_error.as_deref(),
+        Some(crate::accounts::OPERATOR_DISABLED)
+    );
+
+    let enabled = client
+        .post(format!("{addr}/console/api/accounts/state"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({
+            "provider": "mock", "account": "a1", "enabled": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), 200);
+    assert_eq!(
+        fake.pool.account("mock/a1").unwrap().state,
+        crate::domain::AccountState::Unknown,
+        "enable does not trust the account yet"
+    );
+
+    let probe_again = client
+        .post(format!("{addr}/console/api/accounts/probe"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock", "account": "a1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe_again.status(), 200);
+    assert_eq!(
+        fake.pool.account("mock/a1").unwrap().state,
+        crate::domain::AccountState::Active,
+        "only a successful probe makes it serve again"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_or_incomplete_probe_is_reported_without_a_hang() {
+    let addr = spawn_console_router(fake_backend("http://127.0.0.1:1")).await;
+    let client = reqwest::Client::new();
+
+    let failed = client
+        .post(format!("{addr}/console/api/accounts/probe"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock", "account": "broken" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 502);
+    let body: serde_json::Value = failed.json().await.unwrap();
+    let error = body["error"].as_str().expect("error text");
+    assert!(error.contains("connection refused"));
+    assert!(!error.contains('\n'));
+
+    let incomplete = client
+        .post(format!("{addr}/console/api/accounts/probe"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(incomplete.status(), 422);
+
+    // The mutation guard refuses a request that does not carry the console
+    // header, before any provider is contacted.
+    let unguarded = client
+        .post(format!("{addr}/console/api/accounts/state"))
+        .json(&serde_json::json!({
+            "provider": "mock", "account": "a1", "enabled": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(unguarded.status(), 200);
+}
+
+#[test]
+fn sanitised_provider_errors_are_one_short_line() {
+    let messy = "line one\n\tline two   with spaces";
+    let clean = super::console::sanitised(messy);
+    assert!(!clean.contains('\n'));
+    assert!(!clean.contains('\t'));
+    assert!(clean.contains("line one line two"));
+    let long = "x".repeat(600);
+    assert_eq!(super::console::sanitised(&long).chars().count(), 300);
 }
