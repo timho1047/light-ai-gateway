@@ -5,6 +5,7 @@
 //! modules beside this file; the chat-completions retry and relay rules are
 //! documented in `chat`.
 
+pub(crate) mod apply;
 pub(crate) mod catalog;
 mod chat;
 pub(crate) mod console;

@@ -8,13 +8,14 @@
 
 use super::AppState;
 use crate::config::Config;
-use crate::config_doc::{self, ConfigDocument, DraftAction, DraftChange, KeySpec};
+use crate::config_doc::{DraftAction, DraftChange, KeySpec};
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
 use crate::console::{
     assets, board, config_page, copy::Lang, doctor as doctor_view, layout, layout::Nav, prices,
     requests, usage,
 };
+use crate::http::apply;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -341,20 +342,6 @@ pub(super) async fn config_validate(
 ) -> Response {
     let lang = query.lang();
     let path = state.console.config_path.clone();
-
-    let original = match ConfigDocument::read(std::path::Path::new(&path)) {
-        Ok(document) => document,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::failed(&path, &error.to_string(), lang),
-            );
-        }
-    };
-    if original.fingerprint() != request.fingerprint {
-        return fragment(StatusCode::CONFLICT, config_page::stale(lang));
-    }
-
     let actions = match draft_actions(request.draft) {
         Ok(actions) => actions,
         Err(error) => {
@@ -364,39 +351,15 @@ pub(super) async fn config_validate(
             );
         }
     };
-    let edited = match original.apply_actions(&actions) {
-        Ok(document) => document,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::rejected(&error.field, None, &error.message, lang),
-            );
-        }
-    };
-
-    let config: Config = match toml::from_str(edited.raw()) {
-        Ok(config) => config,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::rejected("config", None, &error.to_string(), lang),
-            );
-        }
-    };
-    if let Some(violation) = config.violation() {
-        return fragment(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            config_page::rejected(
-                &violation.field,
-                Some(violation.code),
-                &violation.message,
-                lang,
-            ),
-        );
+    match apply::prepare_draft(
+        std::path::Path::new(&path),
+        &request.fingerprint,
+        actions,
+        state.backend.runtime().config(),
+    ) {
+        Ok(prepared) => fragment(StatusCode::OK, config_page::validated(&prepared.diff, lang)),
+        Err(error) => apply_failure(error, &path, lang),
     }
-
-    let diff = config_doc::diff(&original, &edited);
-    fragment(StatusCode::OK, config_page::validated(&diff, lang))
 }
 
 /// Persist a validated draft and publish it to the running gateway.
@@ -412,22 +375,7 @@ pub(super) async fn config_apply(
     Json(request): Json<ValidateRequest>,
 ) -> Response {
     let lang = query.lang();
-    let _serialized = state.console.apply_lock.lock().await;
     let path = state.console.config_path.clone();
-
-    let original = match ConfigDocument::read(std::path::Path::new(&path)) {
-        Ok(document) => document,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::failed(&path, &error.to_string(), lang),
-            );
-        }
-    };
-    if original.fingerprint() != request.fingerprint {
-        return fragment(StatusCode::CONFLICT, config_page::stale(lang));
-    }
-
     let actions = match draft_actions(request.draft) {
         Ok(actions) => actions,
         Err(error) => {
@@ -437,34 +385,65 @@ pub(super) async fn config_apply(
             );
         }
     };
-    let not_live = write_scope_refusals(&actions);
-    if !not_live.is_empty() {
+    let prepared = match apply::prepare_draft(
+        std::path::Path::new(&path),
+        &request.fingerprint,
+        actions,
+        state.backend.runtime().config(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return apply_failure(error, &path, lang),
+    };
+    if !prepared.restart.is_empty() {
         return fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
-            config_page::not_live(&not_live, lang),
+            config_page::restart_only(&prepared.restart, lang),
         );
     }
+    match apply::commit(
+        state.backend.as_ref(),
+        &state.console,
+        std::path::Path::new(&path),
+        &prepared,
+        apply::CommitMode::ReplaceFile,
+    )
+    .await
+    {
+        Ok(()) => fragment(
+            StatusCode::OK,
+            config_page::applied(
+                &prepared.diff,
+                &prepared.fingerprint,
+                prepared.structural,
+                lang,
+            ),
+        ),
+        Err(apply::CommitError::Stale) => fragment(StatusCode::CONFLICT, config_page::stale(lang)),
+        Err(apply::CommitError::Write(message)) | Err(apply::CommitError::Publish(message)) => {
+            fragment(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                config_page::failed(&path, &message, lang),
+            )
+        }
+    }
+}
 
-    let edited = match original.apply_actions(&actions) {
-        Ok(document) => document,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::rejected(&error.field, None, &error.message, lang),
-            );
-        }
-    };
-    let next: Config = match toml::from_str(edited.raw()) {
-        Ok(config) => config,
-        Err(error) => {
-            return fragment(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                config_page::rejected("config", None, &error.to_string(), lang),
-            );
-        }
-    };
-    if let Some(violation) = next.violation() {
-        return fragment(
+fn apply_failure(error: apply::Failure, path: &str, lang: Lang) -> Response {
+    match error {
+        apply::Failure::Stale => fragment(StatusCode::CONFLICT, config_page::stale(lang)),
+        apply::Failure::Read { message } => fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::failed(path, &message, lang),
+        ),
+        apply::Failure::Scope { fields } => fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::not_live(&fields, lang),
+        ),
+        apply::Failure::Document(error) => fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::rejected(&error.field, None, &error.message, lang),
+        ),
+        apply::Failure::Invalid(violation) => fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
             config_page::rejected(
                 &violation.field,
@@ -472,98 +451,12 @@ pub(super) async fn config_apply(
                 &violation.message,
                 lang,
             ),
-        );
-    }
-
-    let restart = crate::reload::restart_only_changes(state.backend.runtime().config(), &next);
-    if !restart.is_empty() {
-        return fragment(
+        ),
+        apply::Failure::Toml { message } => fragment(
             StatusCode::UNPROCESSABLE_ENTITY,
-            config_page::restart_only(&restart, lang),
-        );
-    }
-
-    let diff = config_doc::diff(&original, &edited);
-    let fingerprint = edited.fingerprint();
-    let raw = edited.raw().to_string();
-    let write_path = path.clone();
-    let mut write = move || {
-        crate::config_doc::write_atomic(std::path::Path::new(&write_path), &raw)
-            .map_err(|error| std::io::Error::other(error.to_string()))
-    };
-    // Adding or removing an account changes the page's rows; a plain value
-    // edit does not, and keeping the diff on screen is the better confirmation.
-    let structural = actions
-        .iter()
-        .any(|action| !matches!(action, DraftAction::Set(_)));
-    match state.backend.apply_config(next, &mut write) {
-        Ok(()) => {
-            if let Ok(mut reload) = state.console.reload.lock() {
-                reload.last_checked = Some(fingerprint.clone());
-                reload.last_error = None;
-                reload.last_success = Some(crate::domain::now());
-            }
-            fragment(
-                StatusCode::OK,
-                config_page::applied(&diff, &fingerprint, structural, lang),
-            )
-        }
-        Err(error) => fragment(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            config_page::failed(&path, &error.to_string(), lang),
+            config_page::rejected("config", None, &message, lang),
         ),
     }
-}
-
-/// The sections whose live apply has not landed yet. Routes and prices arrive in
-/// the next slice, so a crafted request that names them is refused loudly rather
-/// than written to a file the running gateway would ignore.
-/// Refuse paths the editable-field policy does not know, or marks read-only.
-///
-/// Secrets are deliberately not refused here: the document editor owns that
-/// refusal and returns a field-specific message, so the operator learns why a
-/// key cannot be set through a draft rather than a generic scope error.
-fn write_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
-    let mut fields: Vec<String> = Vec::new();
-    let mut refuse = |field: String| {
-        if !fields.contains(&field) {
-            fields.push(field);
-        }
-    };
-    for action in actions {
-        match action {
-            DraftAction::Set(change) => match crate::editable::field(&change.path) {
-                None => refuse(change.path.join(".")),
-                Some(policy)
-                    if policy.class == crate::editable::FieldClass::ReadOnly && !policy.secret =>
-                {
-                    refuse(change.path.join("."));
-                }
-                Some(_) => {}
-            },
-            DraftAction::Remove { path } => {
-                let is_account = path.first().map(String::as_str) == Some("providers")
-                    && path.get(2).map(String::as_str) == Some("accounts");
-                if !is_account {
-                    refuse(path.join("."));
-                }
-            }
-            DraftAction::AddAccount { provider, id, .. } => {
-                if provider.trim().is_empty() || id.trim().is_empty() {
-                    refuse("providers".to_string());
-                }
-            }
-            DraftAction::AddRoute { .. }
-            | DraftAction::RemoveRoute { .. }
-            | DraftAction::AddAlias { .. }
-            | DraftAction::RemoveAlias { .. }
-            | DraftAction::AddPrice { .. }
-            | DraftAction::RemovePrice { .. }
-            | DraftAction::AddSchedule { .. }
-            | DraftAction::RemoveSchedule { .. } => {}
-        }
-    }
-    fields
 }
 
 fn fragment(status: StatusCode, html: String) -> Response {

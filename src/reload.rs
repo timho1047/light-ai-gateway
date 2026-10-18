@@ -10,7 +10,6 @@
 //! a rename-based save is just a different inode with new bytes.
 
 use crate::config::Config;
-use crate::config_doc::ConfigDocument;
 use crate::http::ProxyBackend;
 use crate::http::console::ConsoleContext;
 use std::path::{Path, PathBuf};
@@ -90,60 +89,31 @@ pub async fn reload_once(
         }
     }
 
-    let document = match ConfigDocument::parse(&bytes) {
-        Ok(document) => document,
-        Err(error) => return reject(console, &fingerprint, &error.to_string()),
+    let prepared = match crate::http::apply::prepare_external(&bytes, backend.runtime().config()) {
+        Ok(prepared) => prepared,
+        Err(error) => return reject(console, &fingerprint, &error.message()),
     };
-    let next: Config = match toml::from_str(document.raw()) {
-        Ok(config) => config,
-        Err(error) => return reject(console, &fingerprint, &error.to_string()),
-    };
-    if let Some(violation) = next.violation() {
-        return reject(
-            console,
-            &fingerprint,
-            &format!("{}: {}", violation.field, violation.message),
-        );
-    }
-
-    let restart = restart_only_changes(backend.runtime().config(), &next);
-    if !restart.is_empty() {
+    if !prepared.restart.is_empty() {
         return reject(
             console,
             &fingerprint,
             &format!(
                 "these fields need a restart, so the running configuration is unchanged: {}",
-                restart.join(", ")
+                prepared.restart.join(", ")
             ),
         );
     }
 
-    // Same serialised critical section as a console apply.
-    let _serialized = console.apply_lock.lock().await;
-    // The editor may have saved again while we waited. Leave that newer file to
-    // the next tick rather than publishing bytes we did not fingerprint.
-    let current = match std::fs::read_to_string(path) {
-        Ok(current) => current,
-        Err(error) => {
-            return reject(
-                console,
-                &fingerprint,
-                &format!("reading {}: {error}", path.display()),
-            );
-        }
-    };
-    if crate::config_doc::fingerprint(&current) != fingerprint {
-        return Outcome::Unchanged;
-    }
-    let mut external_write = || Ok(());
-    let applied = backend.apply_config(next, &mut external_write);
-    match applied {
+    match crate::http::apply::commit(
+        backend,
+        console,
+        path,
+        &prepared,
+        crate::http::apply::CommitMode::ExternalFile,
+    )
+    .await
+    {
         Ok(()) => {
-            if let Ok(mut state) = console.reload.lock() {
-                state.last_checked = Some(fingerprint.clone());
-                state.last_error = None;
-                state.last_success = Some(OffsetDateTime::now_utc());
-            }
             tracing::info!(
                 config = %path.display(),
                 fingerprint = %fingerprint,
@@ -151,7 +121,11 @@ pub async fn reload_once(
             );
             Outcome::Applied { fingerprint }
         }
-        Err(error) => reject(console, &fingerprint, &error.to_string()),
+        Err(crate::http::apply::CommitError::Stale) => Outcome::Unchanged,
+        Err(crate::http::apply::CommitError::Write(message))
+        | Err(crate::http::apply::CommitError::Publish(message)) => {
+            reject(console, &fingerprint, &message)
+        }
     }
 }
 
