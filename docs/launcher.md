@@ -36,8 +36,11 @@ API base (`.../v1`) and console URL. The record is written by the process that
 bound the listener, so a configured port 0 still prints the port the kernel
 actually assigned. A foreground `lgw serve` writes no record; the launcher falls
 back to the legacy log line only for a process started before this handshake.
-`update` prints the same pair when it restarts the gateway. `status` and a second `launch` (which is refused) read the
-same line from the existing log and print the same URLs.
+`update` prints the same pair when it restarts the gateway. `status` and a refused second `launch` read the running process's readiness
+record. Only a launch record written before the handshake existed may fall back to
+the legacy log line; that fallback is never used for a normal new launch or the
+relaunch inside `update`, so an old append-only log line cannot become the
+current URL.
 
 ## Process identity
 

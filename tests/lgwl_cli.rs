@@ -27,10 +27,12 @@ impl Fixture {
         let fake = dir.join("fake-lgw");
         fs::write(
             &fake,
-            "#!/usr/bin/env bash\n\
-             echo 'INFO light-ai-gateway listening listen=127.0.0.1:18787 console=http://127.0.0.1:18787/'\n\
-             trap 'exit 0' TERM\n\
-             while true; do sleep 0.2; done\n",
+            r#"#!/usr/bin/env bash
+printf '%s' '{"url":"http://127.0.0.1:18787/"}' > "$LGW_READY_FILE"
+echo 'INFO light-ai-gateway listening listen=127.0.0.1:18787 console=http://127.0.0.1:18787/'
+trap 'exit 0' TERM
+while true; do sleep 0.2; done
+"#,
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();

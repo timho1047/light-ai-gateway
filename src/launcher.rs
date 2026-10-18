@@ -79,6 +79,10 @@ pub struct State {
     /// Arguments passed to lgw before the serve subcommand.
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    /// True for a launch made after the readiness handshake existed. A legacy
+    /// record has no field and therefore reads as false.
+    #[serde(default)]
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +332,7 @@ impl Launcher {
             process_start,
             args: options.args.clone(),
             cwd: options.cwd.clone(),
+            ready: true,
         };
         if let Err(error) = write_state(&self.paths, &state) {
             let _ = terminate(pid, libc::SIGTERM);
@@ -378,13 +383,14 @@ impl Launcher {
 /// Wait for the address the kernel actually bound. A new child publishes it as
 /// a readiness record; the log parser stays only as a fallback for a process
 /// started before the handshake existed.
-pub fn console_url(paths: &Paths, timeout: Duration) -> Option<String> {
+pub fn console_url(paths: &Paths, timeout: Duration, allow_legacy_log: bool) -> Option<String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(url) = crate::readiness::read(&paths.ready) {
             return Some(url);
         }
-        if let Ok(lines) = read_tail(&paths.log, 200)
+        if allow_legacy_log
+            && let Ok(lines) = read_tail(&paths.log, 200)
             && let Some(url) = parse_console_url(&lines)
         {
             return Some(url);
@@ -400,7 +406,7 @@ fn parse_console_url(lines: &[String]) -> Option<String> {
     for line in lines.iter().rev() {
         // tracing colorises its field names even when the log is a file, so the
         // invisible console and equals sign may be separated by escape codes.
-        let plain = strip_ansi(line);
+        let plain = crate::ansi::strip(line).replace('\x1b', "");
         let Some((_, rest)) = plain.split_once("console=") else {
             continue;
         };
@@ -408,32 +414,6 @@ fn parse_console_url(lines: &[String]) -> Option<String> {
         return Some(token.trim_end_matches('/').to_string());
     }
     None
-}
-
-fn strip_ansi(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-                i += 2;
-                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    i += 1;
-                }
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        let ch = text[i..].chars().next().unwrap_or('?');
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
 }
 
 /// Tail the log without loading it more than once per command.
@@ -782,6 +762,23 @@ mod tests {
     }
 
     #[test]
+    fn a_handshake_launch_never_falls_back_to_an_old_log_line() {
+        let paths = temp_paths("stale-url");
+        paths.ensure().unwrap();
+        fs::write(
+            &paths.log,
+            "INFO light-ai-gateway listening console=http://127.0.0.1:1111/\n",
+        )
+        .unwrap();
+        assert_eq!(console_url(&paths, Duration::ZERO, false), None);
+        assert_eq!(
+            console_url(&paths, Duration::ZERO, true),
+            Some("http://127.0.0.1:1111".to_string()),
+            "only a legacy launch may read the log"
+        );
+        let _ = fs::remove_dir_all(&paths.dir);
+    }
+    #[test]
     fn the_ready_record_wins_over_the_legacy_log_line() {
         let paths = temp_paths("ready");
         paths.ensure().unwrap();
@@ -792,7 +789,7 @@ mod tests {
         .unwrap();
         crate::readiness::write(&paths.ready, "http://127.0.0.1:2222/").unwrap();
         assert_eq!(
-            console_url(&paths, Duration::ZERO),
+            console_url(&paths, Duration::ZERO, false),
             Some("http://127.0.0.1:2222".to_string())
         );
         let _ = fs::remove_dir_all(&paths.dir);
@@ -918,6 +915,7 @@ mod tests {
             process_start: "a different process".to_string(),
             args: Vec::new(),
             cwd: paths.dir.clone(),
+            ready: false,
         };
         write_state(&paths, &bogus).unwrap();
         assert_eq!(launcher.status().unwrap(), Status::Stopped { stale: true });

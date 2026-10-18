@@ -52,8 +52,8 @@ enum Command {
     Status,
 }
 
-fn print_urls(launcher: &Launcher, wait: Duration, fallback: bool) {
-    match console_url(launcher.paths(), wait) {
+fn print_urls(launcher: &Launcher, wait: Duration, fallback: bool, allow_legacy_log: bool) {
+    match console_url(launcher.paths(), wait, allow_legacy_log) {
         Some(base) => {
             println!("api:     {base}/v1");
             println!("console: {base}/");
@@ -72,12 +72,12 @@ fn main() -> Result<()> {
             match launcher.launch(&LaunchOptions::new(config, cwd))? {
                 LaunchOutcome::Started(state) => {
                     println!("started lgw (pid {})", state.pid);
-                    print_urls(&launcher, Duration::from_secs(5), true);
+                    print_urls(&launcher, Duration::from_secs(5), true, false);
                     println!("log: {}", launcher.paths().log.display());
                     println!("follow it with: lgwl log");
                 }
                 LaunchOutcome::AlreadyRunning(state) => {
-                    print_urls(&launcher, Duration::from_secs(1), false);
+                    print_urls(&launcher, Duration::from_secs(1), false, !state.ready);
                     bail!("lgw is already running (pid {})", state.pid);
                 }
             }
@@ -109,7 +109,9 @@ fn main() -> Result<()> {
             println!("updated from {}", outcome.repo.display());
             if outcome.restarted {
                 println!("lgw was restarted with its previous arguments");
-                print_urls(&launcher, Duration::from_secs(5), false);
+                if let Status::Running(state) = launcher.status()? {
+                    print_urls(&launcher, Duration::from_secs(5), false, !state.ready);
+                }
             } else if outcome.was_running {
                 println!("lgw was stopped for the update; start it with: lgwl launch");
             } else {
@@ -130,7 +132,7 @@ fn main() -> Result<()> {
                         })
                         .unwrap_or_else(|| format!("unix {}", state.started_at))
                 );
-                print_urls(&launcher, Duration::from_secs(1), false);
+                print_urls(&launcher, Duration::from_secs(1), false, !state.ready);
                 println!("args: {:?}", state.args);
                 println!("cwd: {}", state.cwd.display());
                 println!("log: {}", launcher.paths().log.display());
