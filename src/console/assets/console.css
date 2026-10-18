@@ -1391,3 +1391,25 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
   background: var(--ok);
   vertical-align: 1px;
 }
+
+.section-sub {
+  margin: 22px 0 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.raw-toml {
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  max-height: 460px;
+  overflow: auto;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.7;
+}

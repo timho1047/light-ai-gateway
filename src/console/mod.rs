@@ -7,5 +7,6 @@
 
 pub mod assets;
 pub mod board;
+pub mod config_page;
 pub mod copy;
 pub mod layout;
