@@ -12,6 +12,7 @@ pub mod domain;
 pub mod error;
 pub mod http;
 pub mod interval;
+pub mod keys;
 pub mod meter;
 pub mod prices;
 pub mod quota;

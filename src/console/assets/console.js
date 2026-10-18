@@ -621,6 +621,92 @@
     })(probeAllButtons[pb]);
   }
 
+  /* ---------------------------------------------------------- keys page */
+
+  var keyAdd = document.querySelector("[data-key-add]");
+  if (keyAdd) {
+    var keySubmit = keyAdd.querySelector("[data-key-add-submit]");
+    var keyResult = document.querySelector("[data-keys-result]");
+    if (keySubmit) {
+      keySubmit.addEventListener("click", async function () {
+        var field = function (name) {
+          return keyAdd.querySelector('[data-key-field="' + name + '"]');
+        };
+        var provider = field("provider").value.trim();
+        var account = field("account").value.trim();
+        var secret = field("secret").value;
+        var keyLabel = keySubmit.textContent;
+        keySubmit.disabled = true;
+        keySubmit.textContent = "…";
+        try {
+          var response = await fetch("/console/api/keys/add", {
+            method: "POST",
+            headers: headers(),
+            credentials: "same-origin",
+            body: JSON.stringify({ provider: provider, account: account, key: secret })
+          });
+          if (response.ok) {
+            field("secret").value = "";
+            window.location.reload();
+            return;
+          }
+          var detail = await response.text();
+          try { detail = JSON.parse(detail).error || detail; } catch (ignored) {}
+          if (keyResult) { keyResult.textContent = detail; }
+        } catch (error) {
+          if (keyResult) { keyResult.textContent = String(error); }
+        } finally {
+          keySubmit.disabled = false;
+          keySubmit.textContent = keyLabel;
+        }
+      });
+    }
+  }
+
+  var keyButtons = document.querySelectorAll("[data-key-test], [data-key-remove]");
+  for (var kb = 0; kb < keyButtons.length; kb++) {
+    (function (button) {
+      button.addEventListener("click", async function () {
+        var question = button.getAttribute("data-confirm");
+        if (question && !window.confirm(question)) { return; }
+        var test = button.hasAttribute("data-key-test");
+        var result = document.querySelector("[data-keys-result]");
+        var label = button.textContent;
+        button.disabled = true;
+        button.textContent = "…";
+        try {
+          var response = await fetch(
+            test ? "/console/api/keys/test?lang=en" : "/console/api/keys/remove",
+            {
+              method: "POST",
+              headers: headers(),
+              credentials: "same-origin",
+              body: JSON.stringify({
+                provider: button.getAttribute("data-provider"),
+                account: button.getAttribute("data-account")
+              })
+            }
+          );
+          var payload = await response.json().catch(function () { return {}; });
+          if (!response.ok) {
+            if (result) { result.textContent = payload.error || "request failed"; }
+            return;
+          }
+          if (test) {
+            if (result) { result.textContent = payload.detail || ""; }
+            return;
+          }
+          window.location.reload();
+        } catch (error) {
+          if (result) { result.textContent = String(error); }
+        } finally {
+          button.textContent = label;
+          button.disabled = false;
+        }
+      });
+    })(keyButtons[kb]);
+  }
+
   /* flash messages vanish on their own; a close chip can remove them early */
   var flashes = document.querySelectorAll(".flash .close");
   for (var s = 0; s < flashes.length; s++) {

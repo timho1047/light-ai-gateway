@@ -817,6 +817,138 @@ pub(super) async fn doctor_page(
     page(&state, lang, Nav::Doctor, body)
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct KeysQuery {
+    lang: Option<String>,
+}
+
+/// The Keys page: sources and statuses, never values.
+pub(super) async fn keys_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<KeysQuery>,
+) -> Response {
+    let lang = Lang::from_param(query.lang.as_deref());
+    let report = state.backend.keys_report();
+    let body = crate::console::keys::render(report.as_ref(), lang);
+    page(&state, lang, Nav::Keys, body)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct KeyAddRequest {
+    provider: Option<String>,
+    account: Option<String>,
+    key: Option<String>,
+}
+
+pub(super) async fn keys_add(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<KeyAddRequest>,
+) -> Response {
+    let provider = request.provider.filter(|value| !value.trim().is_empty());
+    let account = request.account.filter(|value| !value.trim().is_empty());
+    let secret = request.key.filter(|value| !value.trim().is_empty());
+    let (Some(provider), Some(account), Some(secret)) = (provider, account, secret) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "provider, account and key are required" })),
+        )
+            .into_response();
+    };
+    match state.backend.key_add(&provider, &account, &secret) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "stored": true }))).into_response(),
+        Err(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": sanitised(&error.0) })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct KeyTargetRequest {
+    provider: Option<String>,
+    account: Option<String>,
+}
+
+fn key_target(request: KeyTargetRequest) -> Option<(String, String)> {
+    let provider = request.provider.filter(|value| !value.trim().is_empty())?;
+    let account = request.account.filter(|value| !value.trim().is_empty())?;
+    Some((provider, account))
+}
+
+pub(super) async fn keys_test(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LangQuery>,
+    Json(request): Json<KeyTargetRequest>,
+) -> Response {
+    let lang = query.lang();
+    let s = lang.strings();
+    let Some((provider, account)) = key_target(request) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "provider and account are required" })),
+        )
+            .into_response();
+    };
+    let tested = state.backend.key_test(&provider, &account);
+    match tokio::time::timeout(std::time::Duration::from_secs(15), tested).await {
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "the provider did not answer within 15 seconds" })),
+        )
+            .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": sanitised(&error.0) })),
+        )
+            .into_response(),
+        Ok(Ok(outcome)) => {
+            let detail = match outcome {
+                crate::keys::KeyTestOutcome::LocalToken { chars } => {
+                    s.keys_test_local.replacen("{}", &chars.to_string(), 1)
+                }
+                crate::keys::KeyTestOutcome::NoProbe { chars } => {
+                    s.keys_test_no_probe.replacen("{}", &chars.to_string(), 1)
+                }
+                crate::keys::KeyTestOutcome::Probed { probe, gates } => s
+                    .keys_test_probed
+                    .replacen("{}", &probe, 1)
+                    .replacen("{}", &gates.to_string(), 1),
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "detail": detail })),
+            )
+                .into_response()
+        }
+    }
+}
+
+pub(super) async fn keys_remove(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<KeyTargetRequest>,
+) -> Response {
+    let Some((provider, account)) = key_target(request) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "provider and account are required" })),
+        )
+            .into_response();
+    };
+    match state.backend.key_remove(&provider, &account) {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "removed": removed })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": sanitised(&error.0) })),
+        )
+            .into_response(),
+    }
+}
+
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the
 /// binary. Only exact names resolve, so a path traversal has nothing to reach.
 pub(super) async fn asset(Path(path): Path<String>) -> Response {

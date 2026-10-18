@@ -52,39 +52,9 @@ fn read_secret(provider: &str, account: &str, from_stdin: bool) -> Result<String
     Ok(trimmed)
 }
 
-/// Whether `lgw keys add` may write this provider/account, and why not if it may not.
-///
-/// The credential is looked up by provider/account, so both normally have to exist
-/// in the configuration or the entry could never be reached. The gateway's OWN
-/// access token is the exception: it guards this process's port, it has no
-/// `[providers.local]` entry by design, and `lgw doctor` tells operators to add it
-/// by name -- so refusing it made the advice unusable.
+/// The shared validator owns the rule; the terminal keeps the wording.
 fn keys_add_target(config: &Config, provider: &str, account: &str) -> Result<()> {
-    if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
-        return Ok(());
-    }
-    if provider == LOCAL_KEY_PROVIDER {
-        bail!(
-            "{provider:?} is reserved for the gateway's own access token, whose only \
-             account is {LOCAL_KEY_ACCOUNT:?}"
-        );
-    }
-    let p = config.providers.get(provider).with_context(|| {
-        let known: Vec<&str> = config.providers.keys().map(String::as_str).collect();
-        format!(
-            "unknown provider {provider:?}. Configured providers: [{}]",
-            known.join(", ")
-        )
-    })?;
-    if !p.accounts.contains_key(account) {
-        let known: Vec<&str> = p.accounts.keys().map(String::as_str).collect();
-        bail!(
-            "unknown account {account:?} under provider {provider:?}. \
-             Configured accounts: [{}]",
-            known.join(", ")
-        );
-    }
-    Ok(())
+    crate::keys::add_target(config, provider, account)
 }
 
 fn cmd_keys_add(
@@ -98,106 +68,30 @@ fn cmd_keys_add(
     keys_add_target(config, provider, account)?;
 
     let secret = read_secret(provider, account, from_stdin)?;
-    creds
-        .set(provider, account, &secret)
-        .with_context(|| format!("storing the credential for {provider}/{account}"))?;
-
-    // Read it back: a store that silently drops writes is worse than one that
-    // fails, because the operator only discovers it at request time.
-    match creds.get(provider, account)? {
-        Some(stored)
-            if crate::secrets::constant_time_eq(stored.expose().as_bytes(), secret.as_bytes()) =>
-        {
-            println!(
-                "{} {provider}/{account} in {} ({})",
-                pal.green("stored"),
-                creds.backend_name(),
-                crate::secrets::describe_secret(&secret)
-            );
-            if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
-                // The command doctor prints has to end somewhere useful: storing
-                // the token is half of it, the config line and the restart are the
-                // other half.
-                println!(
-                    "{}",
-                    pal.dim(
-                        "next: set local_key = { keychain = true } under [server], then restart lgw serve"
-                    )
-                );
-            }
-            Ok(())
-        }
-        _ => bail!(
-            "the credential was written but could not be read back from {}; \
-             the store may be unavailable",
-            creds.backend_name()
-        ),
+    crate::keys::store(config, creds, provider, account, &secret)?;
+    println!(
+        "{} {provider}/{account} in {} ({})",
+        pal.green("stored"),
+        creds.backend_name(),
+        crate::secrets::describe_secret(&secret)
+    );
+    if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
+        // The command doctor prints has to end somewhere useful: storing the
+        // token is half of it, the config line and the restart are the other
+        // half.
+        println!(
+            "{}",
+            pal.dim(
+                "next: set local_key = { keychain = true } under [server], then restart lgw serve"
+            )
+        );
     }
+    Ok(())
 }
 
-/// One row of the credential report. Pure, so it can be tested without
-/// capturing stdout.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CredentialRow {
-    provider: String,
-    account: String,
-    /// Where the secret comes from, never the secret itself.
-    source: String,
-    status: String,
-    /// Whether the credential resolved. The status text is for the reader; this
-    /// is the same fact in a form the renderer can colour on without parsing it.
-    resolves: bool,
-}
-
-fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<CredentialRow> {
-    let mut rows = Vec::new();
-    for (provider, p) in &config.providers {
-        for (id, a) in &p.accounts {
-            let secret_ref = a.key.clone().unwrap_or(SecretRef::Keychain);
-            rows.push(credential_row(creds, provider, id, &secret_ref));
-        }
-    }
-    // The gateway's own access token is not a provider credential, but it is a
-    // stored secret with a status, and "did I set that up?" is what this table is
-    // for. It is listed only when the config says to read it from the store.
-    if let Some(secret_ref @ SecretRef::Keychain) = &config.server.local_key {
-        rows.push(credential_row(
-            creds,
-            LOCAL_KEY_PROVIDER,
-            LOCAL_KEY_ACCOUNT,
-            secret_ref,
-        ));
-    }
-    rows
-}
-
-/// One credential: where it comes from and whether it resolves. Never the secret.
-fn credential_row(
-    creds: &CredentialStore,
-    provider: &str,
-    account: &str,
-    secret_ref: &SecretRef,
-) -> CredentialRow {
-    let (status, resolves) = match secret_ref.resolve(creds, provider, account) {
-        Ok(_) => ("ok".to_string(), true),
-        Err(e) => (format!("MISSING ({e})"), false),
-    };
-    // Say which item the key came out of. Every key lives in the vault, and the
-    // vault is the one item macOS asks about once.
-    let mut source = secret_ref.describe();
-    if matches!(secret_ref, SecretRef::Keychain) {
-        let origin = creds.origin(provider, account);
-        if origin != crate::secrets::CredentialOrigin::Absent {
-            source = format!("{source} ({})", origin.short());
-        }
-    }
-    CredentialRow {
-        provider: provider.to_string(),
-        account: account.to_string(),
-        source,
-        status,
-        resolves,
-    }
+/// The shared report owns the rows; the terminal owns the table.
+fn credential_rows(config: &Config, creds: &CredentialStore) -> Vec<crate::keys::CredentialRow> {
+    crate::keys::rows(config, creds)
 }
 
 fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Result<()> {
@@ -238,7 +132,7 @@ fn cmd_keys_list(config: &Config, creds: &CredentialStore, pal: &Palette) -> Res
 }
 
 fn cmd_keys_remove(creds: &CredentialStore, provider: &str, account: &str) -> Result<()> {
-    if creds.delete(provider, account)? {
+    if crate::keys::remove(creds, provider, account)? {
         println!("removed {provider}/{account} from {}", creds.backend_name());
     } else {
         println!("nothing stored for {provider}/{account}");
@@ -251,9 +145,7 @@ fn cmd_keys_remove(creds: &CredentialStore, provider: &str, account: &str) -> Re
 /// The length alone is enough: it catches a truncated paste, and it is the only
 /// fact about that token a report may print.
 fn local_token_status(creds: &CredentialStore) -> Result<Option<usize>> {
-    Ok(creds
-        .get(LOCAL_KEY_PROVIDER, LOCAL_KEY_ACCOUNT)?
-        .map(|key| key.expose().len()))
+    crate::keys::local_token_status(creds)
 }
 
 /// Resolve the stored credential and prove it works against the provider.

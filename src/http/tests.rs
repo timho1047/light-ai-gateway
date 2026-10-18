@@ -260,6 +260,8 @@ struct FakeBackend {
     usage: Mutex<Option<crate::store::UsageReport>>,
     /// Requests the page tests put here instead of opening a real ledger.
     history: Mutex<Option<Vec<crate::store::RequestHistory>>>,
+    /// The credentials the Keys page reads and writes in tests.
+    credentials: crate::secrets::CredentialStore,
 }
 
 impl FakeBackend {
@@ -273,6 +275,7 @@ impl FakeBackend {
             applied_count: std::sync::atomic::AtomicUsize::new(0),
             usage: Mutex::new(None),
             history: Mutex::new(None),
+            credentials: crate::secrets::CredentialStore::memory(),
         }
     }
 
@@ -412,6 +415,71 @@ impl ProxyBackend for FakeBackend {
             class,
             attempt,
         });
+    }
+
+    fn keys_report(&self) -> Option<crate::keys::KeysReport> {
+        Some(crate::keys::report(
+            self.runtime().config(),
+            &self.credentials,
+        ))
+    }
+
+    fn key_add(
+        &self,
+        provider: &str,
+        account: &str,
+        secret: &str,
+    ) -> std::result::Result<(), crate::http::ApplyError> {
+        let config = self.runtime().config().clone();
+        crate::keys::store(&config, &self.credentials, provider, account, secret)
+            .map_err(|error| crate::http::ApplyError(error.to_string()))
+    }
+
+    fn key_remove(
+        &self,
+        provider: &str,
+        account: &str,
+    ) -> std::result::Result<bool, crate::http::ApplyError> {
+        crate::keys::remove(&self.credentials, provider, account)
+            .map_err(|error| crate::http::ApplyError(error.to_string()))
+    }
+
+    fn key_test<'a>(
+        &'a self,
+        provider: &'a str,
+        account: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<
+                        crate::keys::KeyTestOutcome,
+                        crate::http::ApplyError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            if provider == crate::secrets::LOCAL_KEY_PROVIDER
+                && account == crate::secrets::LOCAL_KEY_ACCOUNT
+            {
+                return match crate::keys::local_token_status(&self.credentials) {
+                    Ok(Some(chars)) => Ok(crate::keys::KeyTestOutcome::LocalToken { chars }),
+                    _ => Err(crate::http::ApplyError(
+                        "no local gateway token is stored".to_string(),
+                    )),
+                };
+            }
+            match self.credentials.get(provider, account) {
+                Ok(Some(key)) => Ok(crate::keys::KeyTestOutcome::Probed {
+                    probe: "mock".to_string(),
+                    gates: key.expose().len().max(1),
+                }),
+                _ => Err(crate::http::ApplyError(
+                    "the credential is missing or could not be resolved".to_string(),
+                )),
+            }
+        })
     }
 
     fn probe_accounts<'a>(
@@ -3479,4 +3547,97 @@ key = "sk-probe-test"
     );
     let _ = gateway.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_keys_page_lists_sources_and_manages_the_store() {
+    let config = Config::from_toml_str(APPLY_TOML).expect("config");
+    let fake = fake_backend_with_config(config);
+    let addr = spawn_console_router(fake.clone()).await;
+
+    let page = reqwest::get(format!("{addr}/keys?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("inline-literal"));
+    assert!(page.contains("data-key-add"));
+    assert!(
+        !page.contains("sk-apply-a1"),
+        "a value never reaches the page"
+    );
+
+    let secret = "sk-console-very-secret-123";
+    let added = reqwest::Client::new()
+        .post(format!("{addr}/console/api/keys/add"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({
+            "provider": "mock", "account": "a1", "key": secret
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
+    assert!(!added.text().await.unwrap().contains(secret));
+    let stored = fake.credentials.get("mock", "a1").unwrap().expect("stored");
+    assert_eq!(stored.expose(), secret);
+
+    let page = reqwest::get(format!("{addr}/keys?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains(secret), "the value is write-only");
+    assert!(page.contains("mock"));
+
+    let tested = reqwest::Client::new()
+        .post(format!("{addr}/console/api/keys/test?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock", "account": "a1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tested.status(), 200);
+    let body: serde_json::Value = tested.json().await.unwrap();
+    let detail = body["detail"].as_str().expect("detail");
+    assert!(detail.contains("ok"), "got {detail}");
+    assert!(!detail.contains(secret));
+
+    let removed = reqwest::Client::new()
+        .post(format!("{addr}/console/api/keys/remove"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({ "provider": "mock", "account": "a1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+    assert!(fake.credentials.get("mock", "a1").unwrap().is_none());
+
+    let chinese = reqwest::get(format!("{addr}/keys?lang=zh"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(chinese.contains("密钥"));
+    assert!(chinese.contains("来源"));
+}
+
+#[tokio::test]
+async fn key_mutations_require_the_console_guards() {
+    let config = Config::from_toml_str(APPLY_TOML).expect("config");
+    let fake = fake_backend_with_config(config);
+    let addr = spawn_console_router(fake.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("{addr}/console/api/keys/add"))
+        .json(&serde_json::json!({
+            "provider": "mock", "account": "a1", "key": "sk-unguarded"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(response.status(), 200);
+    assert!(fake.credentials.get("mock", "a1").unwrap().is_none());
 }

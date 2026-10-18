@@ -145,6 +145,48 @@ pub trait ProxyBackend: Send + Sync + 'static {
         None
     }
 
+    /// The credential report and operations the Keys page uses. The value never
+    /// crosses any of these seams.
+    fn keys_report(&self) -> Option<crate::keys::KeysReport> {
+        None
+    }
+
+    fn key_add(
+        &self,
+        _provider: &str,
+        _account: &str,
+        _secret: &str,
+    ) -> std::result::Result<(), ApplyError> {
+        Err(ApplyError(
+            "this backend cannot store credentials".to_string(),
+        ))
+    }
+
+    fn key_remove(&self, _provider: &str, _account: &str) -> std::result::Result<bool, ApplyError> {
+        Err(ApplyError(
+            "this backend cannot remove credentials".to_string(),
+        ))
+    }
+
+    fn key_test<'a>(
+        &'a self,
+        _provider: &'a str,
+        _account: &'a str,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<crate::keys::KeyTestOutcome, ApplyError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(ApplyError(
+                "this backend cannot test credentials".to_string(),
+            ))
+        })
+    }
+
     /// Probe one account or all of them, through the configured providers.
     fn probe_accounts<'a>(
         &'a self,
@@ -351,6 +393,69 @@ impl ProxyBackend for GatewayBackend {
 
     fn price_drift(&self) -> Vec<(String, String, TierKey, crate::meter::PriceDrift)> {
         self.gateway.runtime().prices().drifted()
+    }
+
+    fn keys_report(&self) -> Option<crate::keys::KeysReport> {
+        Some(crate::keys::report(
+            self.gateway.runtime().config(),
+            &self.gateway.credentials,
+        ))
+    }
+
+    fn key_add(
+        &self,
+        provider: &str,
+        account: &str,
+        secret: &str,
+    ) -> std::result::Result<(), ApplyError> {
+        let config = self.gateway.runtime().config().clone();
+        crate::keys::store(
+            &config,
+            &self.gateway.credentials,
+            provider,
+            account,
+            secret,
+        )
+        .map_err(|error| ApplyError(error.to_string()))
+    }
+
+    fn key_remove(&self, provider: &str, account: &str) -> std::result::Result<bool, ApplyError> {
+        crate::keys::remove(&self.gateway.credentials, provider, account)
+            .map_err(|error| ApplyError(error.to_string()))
+    }
+
+    fn key_test<'a>(
+        &'a self,
+        provider: &'a str,
+        account: &'a str,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<crate::keys::KeyTestOutcome, ApplyError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let config = self.gateway.runtime().config().clone();
+        let credentials = self.gateway.credentials.clone();
+        let provider = provider.to_string();
+        let account = account.to_string();
+        Box::pin(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|error| ApplyError(error.to_string()))?;
+            crate::keys::probe(
+                &config,
+                &credentials,
+                &provider,
+                &account,
+                &client,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .map_err(|error| ApplyError(error.to_string()))
+        })
     }
 
     fn probe_accounts<'a>(
@@ -695,6 +800,10 @@ pub(crate) fn build_router_with_console(
         .route("/requests", get(console::requests_page))
         .route("/prices", get(console::prices_page))
         .route("/doctor", get(console::doctor_page))
+        .route("/keys", get(console::keys_page))
+        .route("/console/api/keys/add", post(console::keys_add))
+        .route("/console/api/keys/test", post(console::keys_test))
+        .route("/console/api/keys/remove", post(console::keys_remove))
         .route("/console/api/accounts/probe", post(console::accounts_probe))
         .route("/console/api/accounts/state", post(console::accounts_state))
         .route("/console/api/prices/forget", post(console::prices_forget))
