@@ -31,10 +31,12 @@ implemented.
 `--config` is passed through to `lgw`; without it, `lgw` uses its normal
 resolution order relative to the directory `lgwl launch` was run from.
 
-After starting, `launch` waits briefly for the startup line and prints the API
-base (`.../v1`) and console URL. The address comes from the log, so a
-configured port 0 still prints the port the kernel actually bound. `update`
-prints the same pair when it restarts the gateway. `status` and a second `launch` (which is refused) read the
+After starting, `launch` waits briefly for a readiness record and prints the
+API base (`.../v1`) and console URL. The record is written by the process that
+bound the listener, so a configured port 0 still prints the port the kernel
+actually assigned. A foreground `lgw serve` writes no record; the launcher falls
+back to the legacy log line only for a process started before this handshake.
+`update` prints the same pair when it restarts the gateway. `status` and a second `launch` (which is refused) read the
 same line from the existing log and print the same URLs.
 
 ## Process identity

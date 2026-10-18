@@ -264,3 +264,9 @@ The state file that lets the Launcher recognise its gateway: pid, process start
 time, launch arguments and working directory. The start time is what makes a
 pid an identity.
 _Avoid_: pid file, lock file
+
+**Readiness record**:
+The small startup record that lgw serve writes when a launcher asks for one: the
+URL the kernel actually bound. The log is for humans; the launcher reads this
+record instead of parsing it.
+_Avoid_: lock file, log scrape
