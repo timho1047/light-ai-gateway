@@ -103,10 +103,11 @@ pub fn render(
         );
     }
 
-    let (lang_target, lang_label) = match lang {
-        Lang::En => ("zh", "简体中文"),
-        Lang::Zh => ("en", "English"),
+    let (lang_target, lang_label, lang_name) = match lang {
+        Lang::En => ("zh", "EN", "简体中文"),
+        Lang::Zh => ("en", "中文", "English"),
     };
+    let lang_action = format!("{}: {lang_name}", s.lang_switch);
     let lang_href = match lang {
         Lang::En => format!("{}?lang=zh", active.path()),
         Lang::Zh => active.path().to_string(),
@@ -132,13 +133,22 @@ pub fn render(
   </div>
 </header>
 <nav class="site-nav" aria-label="Console">
-  {nav}
-  <span class="spacer"></span>
+  <div class="nav-links">{nav}</div>
   <div class="nav-tools">
-    <button class="btn btn-sm theme-toggle" type="button" data-theme-toggle aria-pressed="false">
-      <span class="theme-dark-label">{to_night}</span><span class="theme-light-label">{to_day}</span>
-    </button>
-    <a class="btn btn-sm lang-switch" href="{lang_href}" data-lang="{lang_target}">{lang_label}</a>
+    <div class="utility-group">
+      <button class="tool" type="button" data-theme-toggle aria-pressed="false"
+        data-label-light="{theme_switch_light}" data-label-dark="{theme_switch_dark}"
+        aria-label="{theme_switch_dark}" title="{theme_switch_dark}">
+        <span class="tool-icon sun-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13"><circle cx="8" cy="8" r="3" fill="none" stroke="currentColor"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5L13 13M13 3l-1.5 1.5M4.5 11.5L3 13" stroke="currentColor" fill="none"/></svg></span>
+        <span class="tool-icon moon-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13"><path d="M10.5 2.5a5.5 5.5 0 1 0 3 7.8A6 6 0 0 1 10.5 2.5Z" fill="none" stroke="currentColor"/></svg></span>
+        <span class="theme-light-label">{theme_light}</span><span class="theme-dark-label">{theme_dark}</span>
+      </button>
+      <a class="tool" href="{lang_href}" data-lang="{lang_target}" hreflang="{lang_target}"
+        aria-label="{lang_action}" title="{lang_action}">
+        <span class="tool-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor"/><path d="M2.5 8h11M8 2.5c2 2 2 9 0 11M8 2.5c-2 2-2 9 0 11" fill="none" stroke="currentColor"/></svg></span>
+        <span>{lang_label}</span>
+      </a>
+    </div>
   </div>
 </nav>
 <main class="page">
@@ -177,8 +187,11 @@ pub fn render(
         live = esc(s.live),
         listen = esc(listen),
         nav = nav,
-        to_night = esc(s.theme_to_night),
-        to_day = esc(s.theme_to_day),
+        theme_light = esc(s.theme_light),
+        theme_dark = esc(s.theme_dark),
+        theme_switch_light = esc(s.theme_switch_light),
+        theme_switch_dark = esc(s.theme_switch_dark),
+        lang_action = esc(&lang_action),
         lang_href = esc(&lang_href),
         lang_target = lang_target,
         lang_label = lang_label,
@@ -240,5 +253,42 @@ mod tests {
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;script&gt;"));
         assert!(html.contains("/tmp/a&lt;b&gt;.toml"));
+    }
+}
+
+#[cfg(test)]
+mod utility_tests {
+    use super::*;
+
+    fn page(lang: Lang) -> String {
+        render(
+            lang,
+            Nav::Board,
+            "Board",
+            "127.0.0.1:8787",
+            "/tmp/config.toml",
+            "",
+        )
+    }
+
+    #[test]
+    fn theme_and_language_are_one_consistent_control_group() {
+        let html = page(Lang::En);
+        assert!(html.contains("class=\"utility-group\""));
+        assert_eq!(html.matches("class=\"tool\"").count(), 2);
+        assert!(html.contains("data-label-light=\"Switch to light theme\""));
+        assert!(html.contains("data-label-dark=\"Switch to dark theme\""));
+        assert!(html.contains(">Light<"));
+        assert!(html.contains(">Dark<"));
+        assert!(html.contains(">EN<"));
+        assert!(html.contains("aria-label=\"Switch language: 简体中文\""));
+    }
+
+    #[test]
+    fn the_language_control_names_the_current_language_in_chinese() {
+        let html = page(Lang::Zh);
+        assert!(html.contains(">中文<"));
+        assert!(html.contains("aria-label=\"切换语言: English\""));
+        assert!(html.contains("data-lang=\"en\""));
     }
 }

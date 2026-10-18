@@ -10,7 +10,9 @@
 控制台是 `lgw serve` 提供的运维界面：看板、用量报告、最近的请求、CLI 的每一个动作，
 以及 `config.toml` 的编辑器。它由与代理相同的进程、相同的监听器在 `/` 上提供。
 
-它是单个运维的工具，不是客户端 API，也不是多用户管理面板。没有登录、没有账号、没有
+外壳会利用宽屏：内容上限 1680px，边距随视口伸缩，表格、列表和看板的两栏都会用上
+这份宽度，而不是缩在居中的窄栏里。它是单个运维的工具，不是客户端 API，也不是
+多用户管理面板。没有登录、没有账号、没有
 cookie、没有会话。能到达它的只有运行网关的这台机器。
 
 ## 访问
@@ -88,6 +90,11 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 5. 应用之前会显示 TOML diff。文件以 0600 权限原子替换（同目录下的临时文件，再
    rename），快照在这之后才发布。
 
+表单在屏幕上分成六个区：服务、策略、Provider 与账号、路由与别名、价格，以及
+只读的原始 TOML。左侧粘性导航切换当前区，并显示该区未应用的修改数；草稿被拒绝时
+会自动切到第一个错误所在的区。六个区共享同一份草稿和同一次应用。没有 JavaScript
+时所有区都可见，导航退化为页内跳转链接。
+
 如果表单加载之后文件在磁盘上变了，应用会返回 409 并要求重新加载；它绝不覆盖在编辑器里
 做过的改动。校验或构建快照失败的改动，什么都不变。
 
@@ -137,7 +144,8 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 
 文案有英文和简体中文。`?lang=zh` 选择中文，默认是英文；链接会带上这个参数，顶栏的切换
 也能改它。切换会把选择记进 `localStorage`（绝不是 cookie）；主题（明亮/暗色，默认
-明亮）也用同样的方式记忆。
+明亮）也用同样的方式记忆。主题和语言在同一个两段式控件里：两者都显示当前状态，
+并在可访问名称里说明点击后会变成什么。
 
 ## 禁止
 
@@ -172,5 +180,7 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 - `the_requests_page_shows_attempts_and_filters`
 - `the_prices_page_shows_both_rates_and_forgets_them`
 - `the_doctor_page_reports_every_check_in_both_languages`
+- `the_form_is_split_into_linked_panels`
+- `theme_and_language_are_one_consistent_control_group`
 - `the_keys_page_lists_sources_and_manages_the_store`
 - `probing_and_operator_state_work_through_the_console`

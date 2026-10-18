@@ -39,7 +39,13 @@
     root.setAttribute("data-theme", theme);
     var buttons = document.querySelectorAll("[data-theme-toggle]");
     for (var i = 0; i < buttons.length; i++) {
-      buttons[i].setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+      var button = buttons[i];
+      button.setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+      var action = button.getAttribute(theme === "dark" ? "data-label-light" : "data-label-dark");
+      if (action) {
+        button.setAttribute("aria-label", action);
+        button.setAttribute("title", action);
+      }
     }
     store(THEME_KEY, theme);
   }
@@ -315,6 +321,185 @@
   }
 
 
+  /* ------------------------------------------- configuration sections */
+
+  // The rail is a list of hash links and every panel is visible until this runs:
+  // without JavaScript the page is still a complete, usable long form.
+  var tabForms = document.querySelectorAll("form[data-config-draft]");
+  for (var tf = 0; tf < tabForms.length; tf++) {
+    (function (form) {
+      var rail = form.querySelector("[data-config-tabs]");
+      if (!rail) { return; }
+      var tabs = Array.prototype.slice.call(rail.querySelectorAll("[data-config-tab]"));
+      var panels = Array.prototype.slice.call(form.querySelectorAll("[data-config-panel]"));
+      var result = document.querySelector("[data-config-result]");
+      var total = form.querySelector("[data-config-total]");
+      var pendingTemplate = form.getAttribute("data-pending-label") || "{}";
+      var active = null;
+
+      function panelFor(key) {
+        for (var i = 0; i < panels.length; i++) {
+          if (panels[i].getAttribute("data-config-panel") === key) { return panels[i]; }
+        }
+        return null;
+      }
+
+      function tabFor(key) {
+        for (var i = 0; i < tabs.length; i++) {
+          if (tabs[i].getAttribute("data-config-tab") === key) { return tabs[i]; }
+        }
+        return null;
+      }
+
+      function activate(key, focusTab) {
+        if (!panelFor(key)) {
+          key = tabs.length ? tabs[0].getAttribute("data-config-tab") : null;
+        }
+        if (!key) { return; }
+        active = key;
+        for (var t = 0; t < tabs.length; t++) {
+          var selected = tabs[t].getAttribute("data-config-tab") === key;
+          tabs[t].setAttribute("aria-selected", selected ? "true" : "false");
+          tabs[t].tabIndex = selected ? 0 : -1;
+        }
+        for (var p = 0; p < panels.length; p++) {
+          panels[p].classList.toggle(
+            "is-active",
+            panels[p].getAttribute("data-config-panel") === key
+          );
+        }
+        if (window.history && window.history.replaceState) {
+          window.history.replaceState(null, "", "#" + key);
+        } else {
+          window.location.hash = key;
+        }
+        if (focusTab) { tabFor(key).focus(); }
+      }
+
+      function hashKey() {
+        var key = window.location.hash.replace(/^#/, "");
+        return panelFor(key) ? key : null;
+      }
+
+      // Upgrade the links into the tab pattern only once the panels can follow it.
+      rail.setAttribute("role", "tablist");
+      rail.setAttribute("aria-orientation", "vertical");
+      for (var r = 0; r < tabs.length; r++) { tabs[r].setAttribute("role", "tab"); }
+      for (var p = 0; p < panels.length; p++) { panels[p].setAttribute("role", "tabpanel"); }
+      activate(hashKey() || tabs[0].getAttribute("data-config-tab"), false);
+      form.setAttribute("data-tabs-ready", "");
+
+      for (var c = 0; c < tabs.length; c++) {
+        (function (tab) {
+          tab.addEventListener("click", function (event) {
+            event.preventDefault();
+            activate(tab.getAttribute("data-config-tab"), false);
+          });
+        })(tabs[c]);
+      }
+
+      rail.addEventListener("keydown", function (event) {
+        var index = tabs.indexOf(document.activeElement);
+        if (index < 0) { return; }
+        var next = index;
+        if (event.key === "ArrowDown" || event.key === "ArrowRight") { next = (index + 1) % tabs.length; }
+        else if (event.key === "ArrowUp" || event.key === "ArrowLeft") { next = (index - 1 + tabs.length) % tabs.length; }
+        else if (event.key === "Home") { next = 0; }
+        else if (event.key === "End") { next = tabs.length - 1; }
+        else { return; }
+        event.preventDefault();
+        activate(tabs[next].getAttribute("data-config-tab"), true);
+      });
+
+      window.addEventListener("hashchange", function () {
+        var key = hashKey();
+        if (key && key !== active) { activate(key, false); }
+      });
+
+      function pendingIn(panel) {
+        var count = 0;
+        var fields = panel.querySelectorAll("input[data-path], select[data-path]");
+        for (var f = 0; f < fields.length; f++) {
+          if (fields[f].value !== fields[f].getAttribute("data-initial")) { count++; }
+        }
+        count += panel.querySelectorAll(
+          "[data-account-remove].is-armed, [data-remove-action].is-armed"
+        ).length;
+        var addAccounts = panel.querySelectorAll("[data-add-account]");
+        for (var a = 0; a < addAccounts.length; a++) {
+          var id = addAccounts[a].querySelector('[data-add-field="id"]');
+          if (id && id.value.trim()) { count++; }
+        }
+        var addForms = panel.querySelectorAll("[data-add-form]");
+        for (var f2 = 0; f2 < addForms.length; f2++) {
+          var required = addForms[f2].getAttribute("data-required");
+          var input = addForms[f2].querySelector('[data-add-field="' + required + '"]');
+          if (input && input.value.trim()) { count++; }
+        }
+        return count;
+      }
+
+      function refreshCounts() {
+        var sum = 0;
+        for (var p = 0; p < panels.length; p++) {
+          var count = pendingIn(panels[p]);
+          var badge = tabs.length
+            ? tabs[p].querySelector("[data-tab-count]")
+            : null;
+          if (badge) {
+            badge.textContent = count ? String(count) : "";
+            badge.setAttribute(
+              "aria-label",
+              count ? pendingTemplate.replace("{}", count) : ""
+            );
+          }
+          sum += count;
+        }
+        if (total) {
+          total.textContent = sum ? pendingTemplate.replace("{}", sum) : "";
+        }
+      }
+
+      form.lgwRefreshCounts = refreshCounts;
+      form.addEventListener("input", refreshCounts);
+      form.addEventListener("change", refreshCounts);
+      form.addEventListener("click", function (event) {
+        if (event.target.closest &&
+            event.target.closest("[data-account-remove], [data-remove-action]")) {
+          window.setTimeout(refreshCounts, 0);
+        }
+      });
+      refreshCounts();
+
+      // A refused draft can name a field on any panel; bring that panel forward
+      // instead of leaving the operator to hunt through hidden sections.
+      if (result && window.MutationObserver) {
+        new MutationObserver(function () {
+          if (!result.querySelector(".banner.error")) { return; }
+          var candidates = result.querySelectorAll(".field-label, .error-list .mono");
+          for (var i = 0; i < candidates.length; i++) {
+            var text = candidates[i].textContent.trim();
+            var key = null;
+            if (text.indexOf("server.") === 0) { key = "server"; }
+            else if (text.indexOf("policy.") === 0) { key = "policy"; }
+            else if (text.indexOf("providers") === 0) { key = "providers"; }
+            else if (text.indexOf("routes.") === 0 || text.indexOf("provider_prefix_aliases.") === 0) { key = "routing"; }
+            else if (text.indexOf("prices.") === 0 || text.indexOf("schedules") === 0) { key = "prices"; }
+            if (key && panelFor(key)) {
+              activate(key, false);
+              var panel = panelFor(key);
+              var target = panel.querySelector(
+                "input[data-path], select[data-path], input, select, button"
+              );
+              if (target) { target.focus(); } else { panel.focus(); }
+              return;
+            }
+          }
+        }).observe(result, { childList: true, subtree: true });
+      }
+    })(tabForms[tf]);
+  }
+
   /* -------------------------------------------- configuration drafts */
 
   // The configuration form posts the changed leaves, never the whole file:
@@ -435,6 +620,7 @@
           if (applied) {
             form.setAttribute("data-fingerprint", applied.getAttribute("data-fingerprint"));
             for (var f = 0; f < fields.length; f++) { remember(fields[f]); }
+            if (form.lgwRefreshCounts) { form.lgwRefreshCounts(); }
             if (applied.hasAttribute("data-reload")) {
               // A structural apply changes the rows themselves; the page has to
               // be rebuilt from the new file rather than patched in place.

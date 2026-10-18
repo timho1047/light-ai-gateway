@@ -33,11 +33,13 @@ pub fn render(view: &ConfigView) -> String {
     }
     let _ = write!(
         out,
-        "<form id=\"config-form\" data-config-draft data-fingerprint=\"{}\">",
-        esc(view.fingerprint)
+        "<form id=\"config-form\" data-config-draft data-fingerprint=\"{}\" data-pending-label=\"{}\">",
+        esc(view.fingerprint),
+        esc(s.config_pending),
     );
+    out.push_str(&config_shell(view, s));
 
-    out.push_str(&section(s.section_server, |body| {
+    out.push_str(&panel("server", s.section_server, |body| {
         // Listener settings are read-only here: they take effect on the next
         // start, and an editable input would imply an Apply can move them.
         field(body, "server.listen", &view.config.server.listen, false, s);
@@ -55,7 +57,7 @@ pub fn render(view: &ConfigView) -> String {
         field(body, "server.local_key", &local_key, false, s);
     }));
 
-    out.push_str(&section(s.section_policy, |body| {
+    out.push_str(&panel("policy", s.section_policy, |body| {
         let p = &view.config.policy;
         editable_text(
             body,
@@ -162,7 +164,7 @@ pub fn render(view: &ConfigView) -> String {
         );
     }));
 
-    out.push_str(&section(s.section_providers, |body| {
+    out.push_str(&panel("providers", s.section_providers, |body| {
         if view.config.providers.is_empty() {
             let _ = write!(body, "<div class=\"empty\">{}</div>", esc(s.no_providers));
         }
@@ -228,7 +230,8 @@ pub fn render(view: &ConfigView) -> String {
         }
     }));
 
-    out.push_str(&section(s.section_routes, |body| {
+    out.push_str(&panel("routing", s.config_tab_routing, |body| {
+        subhead(body, s.section_routes);
         if view.config.routes.is_empty() {
             let _ = write!(body, r#"<div class="empty">{}</div>"#, esc(s.no_routes));
         } else {
@@ -254,9 +257,8 @@ pub fn render(view: &ConfigView) -> String {
             "model",
             &[("model", s.config_model), ("provider", s.config_provider)],
         );
-    }));
 
-    out.push_str(&section(s.section_aliases, |body| {
+        subhead(body, s.section_aliases);
         if view.config.provider_prefix_aliases.is_empty() {
             let _ = write!(body, r#"<div class="empty">{}</div>"#, esc(s.no_aliases));
         } else {
@@ -284,7 +286,7 @@ pub fn render(view: &ConfigView) -> String {
         );
     }));
 
-    out.push_str(&section(s.section_prices, |body| {
+    out.push_str(&panel("prices", s.section_prices, |body| {
         if view.config.prices.is_empty() {
             let _ = write!(body, r#"<div class="empty">{}</div>"#, esc(s.no_prices));
         }
@@ -475,12 +477,18 @@ pub fn render(view: &ConfigView) -> String {
         }
     }));
 
-    out.push_str(&config_actions(view, s));
-    out.push_str("</form>");
-
     if let Some(raw) = view.raw {
-        out.push_str(&raw_section(raw, s));
+        out.push_str(&panel("raw", s.config_raw_title, |body| {
+            let _ = write!(
+                body,
+                r#"<p class="lede">{}</p><pre class="raw-toml">{}</pre>"#,
+                esc(s.config_rawnote),
+                esc(raw),
+            );
+        }));
     }
+    out.push_str(&config_actions(view, s));
+    out.push_str("</div></div></form>");
     out
 }
 
@@ -792,28 +800,41 @@ fn header(view: &ConfigView, s: &Strings) -> String {
     )
 }
 
-fn raw_section(raw: &str, s: &Strings) -> String {
+/// The section rail and the panel column. It is a plain list of hash links until
+/// the script upgrades it into tabs, so every section stays reachable without
+/// JavaScript (all panels are visible in that state).
+fn config_shell(view: &ConfigView, s: &Strings) -> String {
+    let mut tabs = String::new();
+    let entries = [
+        ("server", s.section_server),
+        ("policy", s.section_policy),
+        ("providers", s.section_providers),
+        ("routing", s.config_tab_routing),
+        ("prices", s.section_prices),
+        ("raw", s.config_raw_title),
+    ];
+    for (key, title) in entries {
+        if key == "raw" && view.raw.is_none() {
+            continue;
+        }
+        let _ = write!(
+            tabs,
+            r##"<a class="config-tab" id="config-tab-{key}" href="#{key}" data-config-tab="{key}" aria-controls="config-panel-{key}"><span>{title}</span><span class="config-tab-count" data-tab-count="{key}"></span></a>"##,
+            title = esc(title),
+        );
+    }
     format!(
-        r#"<section class="section">
-  <div class="section-head">
-    <h2 class="section-title">{}</h2>
-    <p class="lede">{}</p>
-  </div>
-  <pre class="raw-toml">{}</pre>
-</section>"#,
-        esc(s.config_raw_title),
-        esc(s.config_rawnote),
-        esc(raw),
+        r#"<div class="config-layout"><nav class="config-rail" aria-label="{}"><div class="config-tabs" data-config-tabs>{tabs}</div><p class="config-rail-note hint" data-config-total aria-live="polite"></p></nav><div class="config-panels">"#,
+        esc(s.config_tabs_label),
     )
 }
 
-fn section(title: &str, build: impl FnOnce(&mut String)) -> String {
+fn panel(key: &str, title: &str, build: impl FnOnce(&mut String)) -> String {
     let mut body = String::new();
     build(&mut body);
     format!(
-        "<section class=\"section\"><div class=\"section-head\"><h2 class=\"section-title\">{}</h2></div>{}</section>",
+        r#"<section class="config-panel" id="config-panel-{key}" data-config-panel="{key}" aria-labelledby="config-tab-{key}" tabindex="-1"><h2 class="config-panel-title">{}</h2>{body}</section>"#,
         esc(title),
-        body
     )
 }
 
@@ -1164,5 +1185,84 @@ label = "<img src=x onerror=alert(1)>"
         assert!(!html.contains("<img src=x"));
         assert!(!html.contains("glm/<x>"));
         assert!(html.contains("&lt;img"));
+    }
+}
+
+#[cfg(test)]
+mod tab_layout_tests {
+    use super::*;
+    use crate::config::sample_toml;
+
+    fn view<'a>(config: &'a Config, raw: &'a str) -> ConfigView<'a> {
+        ConfigView {
+            config,
+            path: "/home/op/.config/lgw/config.toml",
+            fingerprint: "fnv64:feedface",
+            last_applied: "just now",
+            raw: Some(raw),
+            reload_error: None,
+            lang: Lang::En,
+        }
+    }
+
+    #[test]
+    fn the_form_is_split_into_linked_panels() {
+        let config = Config::from_toml_str(sample_toml()).expect("sample");
+        let html = render(&view(&config, "listen = \"127.0.0.1:8787\"\n"));
+        for key in ["server", "policy", "providers", "routing", "prices", "raw"] {
+            assert!(
+                html.contains(&format!("data-config-tab=\"{key}\"")),
+                "missing tab {key}"
+            );
+            assert!(
+                html.contains(&format!("id=\"config-panel-{key}\"")),
+                "missing panel {key}"
+            );
+        }
+        // Routing owns both route and alias rows, in that order.
+        let panel = html.find("id=\"config-panel-routing\"").expect("routing");
+        let prices = html.find("id=\"config-panel-prices\"").expect("prices");
+        let routes = html[panel..prices]
+            .find("routes.&lt;model&gt;")
+            .expect("routes");
+        let aliases = html[panel..prices]
+            .find("Provider aliases")
+            .expect("aliases");
+        assert!(
+            routes < aliases,
+            "routes come before aliases inside Routing"
+        );
+
+        // Progressive enhancement: the server never hides a panel itself.
+        assert!(!html.contains("data-tabs-ready"));
+        assert!(!html.contains("hidden"));
+    }
+
+    #[test]
+    fn every_tab_is_named_in_the_page_language() {
+        let config = Config::from_toml_str(sample_toml()).expect("sample");
+        let mut zh = view(&config, "");
+        zh.lang = Lang::Zh;
+        let html = render(&zh);
+        for title in [
+            "服务",
+            "策略",
+            "Provider 与账号",
+            "路由与别名",
+            "价格",
+            "原始 TOML",
+        ] {
+            assert!(html.contains(title), "missing {title}");
+        }
+    }
+
+    #[test]
+    fn a_page_without_raw_text_has_no_raw_tab() {
+        let config = Config::from_toml_str(sample_toml()).expect("sample");
+        let mut plain = view(&config, "");
+        plain.raw = None;
+        let html = render(&plain);
+        assert!(!html.contains("data-config-tab=\"raw\""));
+        assert!(!html.contains("config-panel-raw"));
     }
 }

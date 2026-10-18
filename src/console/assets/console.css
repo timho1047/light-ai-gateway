@@ -17,7 +17,8 @@
     "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
   --font-mono: "SF Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono",
     "PingFang SC", "Microsoft YaHei", monospace;
-  --page-max: 1280px;
+  --page-max: 1680px;
+  --page-pad: clamp(24px, 4vw, 64px);
   --gap: 24px;
   --radius: 3px;
   --ease: 120ms ease-out;
@@ -129,7 +130,7 @@ table {
 .site-header {
   max-width: var(--page-max);
   margin: 0 auto;
-  padding: 30px 40px 0;
+  padding: 30px var(--page-pad) 0;
   border-top: 6px solid var(--ink-strong);
 }
 
@@ -188,7 +189,7 @@ table {
   gap: 26px;
   max-width: var(--page-max);
   margin: 0 auto;
-  padding: 0 40px;
+  padding: 0 var(--page-pad);
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--line-strong);
@@ -217,8 +218,18 @@ table {
   border-color: var(--ink);
 }
 
-.site-nav .spacer {
+.site-nav .nav-links {
+  display: flex;
+  align-items: center;
+  gap: 26px;
   flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.site-nav .nav-links::-webkit-scrollbar {
+  display: none;
 }
 
 .site-nav .nav-tools {
@@ -230,12 +241,12 @@ table {
 .page {
   max-width: var(--page-max);
   margin: 0 auto;
-  padding: 34px 40px 112px;
+  padding: 34px var(--page-pad) 112px;
 }
 
 .page-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
+  grid-template-columns: minmax(0, 1fr) 320px;
   gap: 56px;
   align-items: start;
 }
@@ -266,7 +277,7 @@ table {
 .site-footer {
   max-width: var(--page-max);
   margin: 0 auto;
-  padding: 16px 40px 90px;
+  padding: 16px var(--page-pad) 90px;
   display: flex;
   justify-content: space-between;
   gap: 20px;
@@ -1324,10 +1335,10 @@ dialog.confirm::backdrop {
     text-align: left;
   }
 
-  .site-nav {
+  .site-nav .nav-links {
     gap: 18px;
-    overflow-x: auto;
   }
+
 
   .rail {
     grid-template-columns: 1fr;
@@ -1377,11 +1388,71 @@ dialog.confirm::backdrop {
 }
 
 /* theme toggle: the visible label names the theme the click switches to */
-.theme-toggle .theme-light-label { display: none; }
-html[data-theme="dark"] .theme-toggle .theme-light-label { display: inline; }
-html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
-.nav-tools .btn { text-transform: none; letter-spacing: 0.03em; }
-.lang-switch { font-family: var(--font-body); }
+/* The two utility controls share one shape: both show the state they are in,
+ * and both name the state they switch to in their accessible label. */
+.utility-group {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--line-strong);
+  border-radius: 2px;
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--ease), background var(--ease);
+}
+
+.tool + .tool {
+  border-left: 1px solid var(--line);
+}
+
+.tool:hover {
+  color: var(--ink);
+  background: var(--panel);
+}
+
+.tool-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.sun-icon,
+.moon-icon {
+  display: none;
+}
+
+html[data-theme="light"] .sun-icon,
+html[data-theme="dark"] .moon-icon {
+  display: inline-flex;
+}
+
+.theme-dark-label {
+  display: none;
+}
+
+html[data-theme="dark"] .theme-dark-label {
+  display: inline;
+}
+
+html[data-theme="dark"] .theme-light-label {
+  display: none;
+}
 
 .live-dot {
   display: inline-block;
@@ -1417,7 +1488,7 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
 
 .board-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 290px;
+  grid-template-columns: minmax(0, 1fr) 320px;
   gap: 56px;
   align-items: start;
 }
@@ -2030,4 +2101,200 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
 .bar.spend i.metered {
   flex: 1;
   background: var(--warn);
+}
+
+/* ------------------------------------------------------- config sections */
+
+.config-layout {
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr);
+  gap: 48px;
+  align-items: start;
+}
+
+.config-rail {
+  min-width: 0;
+  max-width: 100%;
+  position: sticky;
+  top: 72px;
+  border-top: 1px solid var(--line-strong);
+}
+
+.config-tabs {
+  display: flex;
+  flex-direction: column;
+}
+
+.config-tab {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 0 11px 10px;
+  border-bottom: 1px solid var(--line);
+  border-left: 2px solid transparent;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.13em;
+  line-height: 1.35;
+  text-transform: uppercase;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--ease), border-color var(--ease), background var(--ease);
+}
+
+.config-tab:hover {
+  color: var(--ink);
+  background: var(--panel);
+}
+
+.config-tab[aria-selected="true"] {
+  border-left-color: var(--ink);
+  color: var(--ink-strong);
+}
+
+.config-tab-count {
+  min-width: 20px;
+  padding: 1px 5px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  color: var(--warn);
+  font-size: 9px;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.config-tab-count:empty {
+  display: none;
+}
+
+.config-rail-note {
+  margin: 14px 0 0;
+  padding-left: 10px;
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.config-panels {
+  min-width: 0;
+  max-width: 100%;
+  padding-bottom: 12px;
+}
+
+.config-panel {
+  scroll-margin-top: 84px;
+}
+
+.config-panel-title {
+  margin: 0 0 14px;
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 400;
+  line-height: 1.1;
+  letter-spacing: -0.015em;
+  color: var(--ink-strong);
+}
+
+[data-tabs-ready] .config-panel {
+  display: none;
+}
+
+[data-tabs-ready] .config-panel.is-active {
+  display: block;
+}
+
+[data-tabs-ready] .config-panel-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.config-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  margin-top: 26px;
+  padding: 12px 0;
+  border-top: 1px solid var(--line-strong);
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  backdrop-filter: blur(8px);
+}
+
+@media (max-width: 1080px) {
+  .config-layout {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
+
+  .config-rail {
+    position: static;
+    border-top: 0;
+  }
+
+  .config-tabs {
+    flex-direction: row;
+    gap: 22px;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--line-strong);
+  }
+
+  .config-tab {
+    flex: 0 0 auto;
+    padding: 10px 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-top: 2px solid transparent;
+    white-space: nowrap;
+  }
+
+  .config-tab[aria-selected="true"] {
+    border-left-color: transparent;
+    border-top-color: var(--ink);
+  }
+
+  .config-rail-note {
+    margin: 8px 0 0;
+    padding-left: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .config-tabs {
+    gap: 18px;
+  }
+}
+
+/* The generic nav-link rules are heavier than the utility class; these keep the
+ * two controls in one shape regardless of which element carries them. */
+.site-nav .utility-group .tool {
+  padding: 0 10px;
+  margin: 0;
+  border: 0;
+  border-bottom: 0;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.site-nav .utility-group .tool + .tool {
+  border-left: 1px solid var(--line);
+}
+
+.site-nav .utility-group .tool:hover {
+  color: var(--ink);
+  border-bottom-color: transparent;
+}
+
+.config-panel:focus {
+  outline: none;
 }

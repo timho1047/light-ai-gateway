@@ -272,9 +272,11 @@ usage, recent requests, probing and enabling accounts, doctor, stored credential
 prices and drift -- plus one thing the CLI does not have: editing
 `config.toml` in a form.
 
-Applying writes the same file back -- comments and keys the form does not know are
-kept -- and applies it to the running process without dropping in-flight
-requests. The few settings that need a restart instead (`listen`, `db_path`,
+The form uses the width of a wide screen: configuration is split into Server,
+Policy, Providers & accounts, Routing & aliases, Prices, and raw TOML sections with
+a sticky rail. Applying writes the same file back -- comments and keys the form
+does not know are kept -- and applies it to the running process without dropping
+in-flight requests. The few settings that need a restart instead (`listen`, `db_path`,
 `max_body_bytes`) are named in the console rather than silently ignored. The copy
 switches between English and Chinese in the top bar.
 

@@ -13,7 +13,9 @@ report, recent requests, every action the CLI has, and an editor for
 `config.toml`. It is served by the same process and the same listener as the
 proxy, at `/`.
 
-It is one operator's tool, not a client API and not a multi-user admin panel.
+The shell uses wide screens: content is capped at 1680px with a fluid gutter, and
+lists, tables and the two-column Board use that width instead of a narrow centred
+column. It is one operator's tool, not a client API and not a multi-user admin panel.
 There is no login, no account, no cookie and no session. The only thing that can
 reach it is the machine the gateway runs on.
 
@@ -110,6 +112,12 @@ copy and not a database:
    file in the same directory, then rename) with mode 0600, and only then is the
    snapshot published.
 
+On screen the form is split into six sections: Server, Policy, Providers & accounts,
+Routing & aliases, Prices, and the read-only raw TOML. A sticky rail switches the
+visible section and counts its unsaved changes; a refused draft brings the section
+own the first error forward. All six sections are one draft and one Apply. Without
+JavaScript every section is visible and the rail is ordinary in-page links.
+
 If the file changed on disk after the form was loaded, Apply answers 409 and asks
 for a reload; it never overwrites an edit made in an editor. A change that fails
 validation or snapshot construction changes nothing at all.
@@ -173,7 +181,9 @@ The Usage page reads the ledger through a read-only connection and never writes.
 The copy is English and Simplified Chinese. `?lang=zh` selects Chinese and the
 default is English; links carry the parameter and the switch in the top bar
 changes it. The switch remembers the choice in `localStorage` (never a cookie), and
-the theme (light/dark, light by default) is remembered the same way.
+the theme (light/dark, light by default) is remembered the same way. Theme and
+language sit in one two-part control; both show the state they are in and name the
+change they make in their accessible label.
 
 ## Must not
 
@@ -208,5 +218,7 @@ Integration tests, named as the behaviour they assert:
 - `the_requests_page_shows_attempts_and_filters`
 - `the_prices_page_shows_both_rates_and_forgets_them`
 - `the_doctor_page_reports_every_check_in_both_languages`
+- `the_form_is_split_into_linked_panels`
+- `theme_and_language_are_one_consistent_control_group`
 - `the_keys_page_lists_sources_and_manages_the_store`
 - `probing_and_operator_state_work_through_the_console`
