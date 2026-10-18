@@ -17,6 +17,7 @@ pub mod keys;
 pub mod launcher;
 pub mod meter;
 pub mod prices;
+pub mod probe;
 pub mod quota;
 pub mod quota_report;
 pub mod readiness;

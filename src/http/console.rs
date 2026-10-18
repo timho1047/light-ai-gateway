@@ -689,11 +689,11 @@ pub(super) async fn doctor_page(
     let report = match Config::load(&path) {
         Err(error) => doctor_view::unavailable(&crate::doctor::sanitise(&format!("{error:#}"))),
         Ok(config) => {
-            let credentials = crate::secrets::CredentialStore::from_env();
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(6))
-                .build()
-                .unwrap_or_default();
+            let credentials = state
+                .backend
+                .credentials()
+                .unwrap_or_else(crate::secrets::CredentialStore::from_env);
+            let client = crate::probe::client(&config).unwrap_or_default();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(20),
                 crate::doctor::run(

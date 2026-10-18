@@ -36,7 +36,7 @@ use crate::ansi::Palette;
 use crate::config::Config;
 use crate::secrets::CredentialStore;
 use crate::store::{self, Ledger};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -366,22 +366,9 @@ fn open_ledger(db: &Path) -> Result<Ledger> {
     })
 }
 
-/// HTTP client for quota probes.
-///
-/// ONE constructor on purpose. The policy here is load-bearing and two call
-/// sites had already drifted apart once: the daemon pinned redirects and the CLI
-/// probes did not, so a 3xx could have carried a bearer token to whatever host a
-/// Location header named. Two copies of a security policy is one copy too many.
+/// HTTP client for quota probes: one constructor owned by the shared policy.
 fn probe_client(config: &Config) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(
-            config.policy.connect_timeout_secs.max(1),
-        ))
-        // The bearer token is attached before the request leaves, so following a
-        // redirect would hand the credential to the host it names.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building the probe HTTP client")
+    crate::probe::client(config)
 }
 
 /// Which credential backend to use. See CredentialStore::from_env.

@@ -146,8 +146,6 @@ pub trait ProxyBackend: Send + Sync + 'static {
         None
     }
 
-    /// The credential report and operations the Keys page uses. The value never
-    /// crosses any of these seams.
     fn keys_report(&self) -> Option<crate::keys::KeysReport> {
         None
     }
@@ -212,6 +210,10 @@ pub trait ProxyBackend: Send + Sync + 'static {
     }
 
     /// The configured-plus-learned price table the page reports on, read-only.
+    fn credentials(&self) -> Option<crate::secrets::CredentialStore> {
+        None
+    }
+
     fn price_table(&self) -> Option<crate::meter::PriceTable> {
         None
     }
@@ -396,6 +398,10 @@ impl ProxyBackend for GatewayBackend {
         self.gateway.runtime().prices().drifted()
     }
 
+    fn credentials(&self) -> Option<crate::secrets::CredentialStore> {
+        Some(self.gateway.credentials.clone())
+    }
+
     fn keys_report(&self) -> Option<crate::keys::KeysReport> {
         Some(crate::keys::report(
             self.gateway.runtime().config(),
@@ -442,10 +448,8 @@ impl ProxyBackend for GatewayBackend {
         let provider = provider.to_string();
         let account = account.to_string();
         Box::pin(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(|error| ApplyError(error.to_string()))?;
+            let client =
+                crate::probe::client(&config).map_err(|error| ApplyError(error.to_string()))?;
             crate::keys::probe(
                 &config,
                 &credentials,

@@ -417,6 +417,10 @@ impl ProxyBackend for FakeBackend {
         });
     }
 
+    fn credentials(&self) -> Option<crate::secrets::CredentialStore> {
+        Some(self.credentials.clone())
+    }
+
     fn keys_report(&self) -> Option<crate::keys::KeysReport> {
         Some(crate::keys::report(
             self.runtime().config(),
