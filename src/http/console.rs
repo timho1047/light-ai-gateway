@@ -12,7 +12,8 @@ use crate::config_doc::{self, ConfigDocument, DraftAction, DraftChange, KeySpec}
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
 use crate::console::{
-    assets, board, config_page, copy::Lang, layout, layout::Nav, prices, requests, usage,
+    assets, board, config_page, copy::Lang, doctor as doctor_view, layout, layout::Nav, prices,
+    requests, usage,
 };
 use axum::Json;
 use axum::body::Body;
@@ -773,6 +774,47 @@ pub(super) fn sanitised(message: &str) -> String {
     } else {
         clean
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct DoctorQuery {
+    lang: Option<String>,
+}
+
+/// The Doctor page. Runs the same checks as the terminal command, with every
+/// network step bounded; the file it reads is the one the console describes.
+pub(super) async fn doctor_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<DoctorQuery>,
+) -> Response {
+    let lang = Lang::from_param(query.lang.as_deref());
+    let path = std::path::PathBuf::from(&state.console.config_path);
+    let report = match Config::load(&path) {
+        Err(error) => doctor_view::unavailable(&crate::doctor::sanitise(&format!("{error:#}"))),
+        Ok(config) => {
+            let credentials = crate::secrets::CredentialStore::from_env();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(6))
+                .build()
+                .unwrap_or_default();
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                crate::doctor::run(
+                    &config,
+                    &credentials,
+                    &client,
+                    std::time::Duration::from_secs(6),
+                ),
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(_) => doctor_view::unavailable("doctor timed out while checking providers"),
+            }
+        }
+    };
+    let body = doctor_view::render(&report, lang);
+    page(&state, lang, Nav::Doctor, body)
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the

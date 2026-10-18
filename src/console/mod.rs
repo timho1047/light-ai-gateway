@@ -9,6 +9,7 @@ pub mod assets;
 pub mod board;
 pub mod config_page;
 pub mod copy;
+pub mod doctor;
 pub mod guard;
 pub mod layout;
 pub mod prices;

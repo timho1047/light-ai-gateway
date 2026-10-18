@@ -1923,3 +1923,46 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
   line-height: 1.55;
   color: var(--warn);
 }
+
+.doctor-table td,
+.doctor-table th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.doctor-table td {
+  vertical-align: top;
+}
+
+.doctor-table .detail {
+  white-space: normal;
+  line-height: 1.55;
+}
+
+.verdict {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.verdict.ok {
+  border-color: var(--line-strong);
+}
+
+.verdict.warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.verdict.fail {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.verdict.skip {
+  color: var(--faint);
+}

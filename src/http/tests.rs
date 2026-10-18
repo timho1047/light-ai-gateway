@@ -3360,3 +3360,123 @@ fn sanitised_provider_errors_are_one_short_line() {
     let long = "x".repeat(600);
     assert_eq!(super::console::sanitised(&long).chars().count(), 300);
 }
+
+#[tokio::test]
+async fn the_doctor_page_reports_every_check_in_both_languages() {
+    let (addr, _fake, _path, dir) = routes_router().await;
+    let english = reqwest::get(format!("{addr}/doctor?lang=en"))
+        .await
+        .unwrap();
+    assert_eq!(english.status(), 200);
+    let english = english.text().await.unwrap();
+    assert!(english.contains("Doctor"));
+    assert!(english.contains("providers"));
+    assert!(english.contains("adapter = none"));
+    assert!(english.contains("FAIL"));
+    assert!(english.contains("data-probe-all"));
+    assert!(
+        !english.contains("sk-mock-a1") && !english.contains("sk-alt-a1"),
+        "a doctor page must never carry a credential value"
+    );
+
+    let chinese = reqwest::get(format!("{addr}/doctor?lang=zh"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(chinese.contains("诊断"));
+    assert!(chinese.contains("失败"));
+    assert!(chinese.contains("adapter = none"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn probing_reaches_the_provider_through_a_mock_upstream() {
+    // A provider that answers the xKiro usage endpoint.
+    let app = axum::Router::new().route(
+        "/v1/usage",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "plan": "pro",
+                "windows": [{
+                    "kind": "short",
+                    "window_sec": 18_000,
+                    "spent_usd": "0.5",
+                    "cap_usd": "2.0",
+                    "remaining_usd": "1.5",
+                    "resets_in_sec": 3_600
+                }],
+                "free_tokens": { "used_today": 10, "limit_per_day": 100, "remaining": 90 },
+                "wallet": { "balance_usd": "5.0", "held_usd": "0.0" }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "lgw-probe-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let db = dir.join("gateway.db");
+    let toml = format!(
+        r#"
+[server]
+listen = "127.0.0.1:0"
+db_path = "{}"
+
+[providers.xkiro]
+adapter = "xkiro"
+base_url = "http://{upstream}"
+
+[providers.xkiro.accounts.a1]
+key = "sk-probe-test"
+
+[routes]
+"z-ai/glm-5.3-flash" = "xkiro"
+"#,
+        db.display()
+    );
+    std::fs::write(&path, &toml).unwrap();
+    let config = Config::from_toml_str(&toml).expect("config");
+    let gateway = crate::router::Gateway::new(config).await.expect("gateway");
+    let backend: Arc<dyn super::ProxyBackend> =
+        Arc::new(super::GatewayBackend::new(gateway.clone()));
+    let addr = spawn_console_router_with(backend, path.to_str().unwrap()).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{addr}/console/api/accounts/probe"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let accounts = gateway.snapshot();
+    assert_eq!(accounts.len(), 1);
+    let account = &accounts[0];
+    assert_eq!(account.state, crate::domain::AccountState::Active);
+    assert!(
+        account
+            .gates
+            .iter()
+            .any(|gate| gate.kind == crate::domain::GateKind::FiveHour),
+        "the mock upstream's window reached the board: {:?}",
+        account.gates
+    );
+    let _ = gateway.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

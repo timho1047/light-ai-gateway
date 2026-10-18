@@ -694,6 +694,7 @@ pub(crate) fn build_router_with_console(
         .route("/usage", get(console::usage_page))
         .route("/requests", get(console::requests_page))
         .route("/prices", get(console::prices_page))
+        .route("/doctor", get(console::doctor_page))
         .route("/console/api/accounts/probe", post(console::accounts_probe))
         .route("/console/api/accounts/state", post(console::accounts_state))
         .route("/console/api/prices/forget", post(console::prices_forget))

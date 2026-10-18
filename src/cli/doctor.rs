@@ -3,68 +3,13 @@
 use super::{ConfigOrigin, probe_client};
 use crate::ansi::Palette;
 use crate::config::{Config, QuotaAdapter, SecretRef};
+use crate::doctor::{listens_on_loopback, routes_by_provider, unreachable_prices};
 use crate::quota::probe_for;
 use crate::secrets::{CredentialStore, LOCAL_KEY_ACCOUNT, LOCAL_KEY_PROVIDER};
 use crate::store;
 use anyhow::{Result, bail};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
-
-/// Whether a listen address is confined to this machine.
-///
-/// The address is a string in the config, so this has to be a textual check:
-/// anything that does not name the loopback interface is treated as reachable
-/// by others, which is the safe direction.
-fn listens_on_loopback(listen: &str) -> bool {
-    let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or(listen);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
-}
-
-/// A price entry that no route can reach.
-struct UnreachablePrice {
-    provider: String,
-    model: String,
-    /// Configured routes whose name is close to it: the likely typo.
-    closest: Vec<String>,
-}
-
-/// Price entries no route points at.
-///
-/// The price table is keyed by the model id the PROVIDER sees, which is the route
-/// name. An entry whose model no route maps to that provider is dead config --
-/// and worse than dead: the route it was written for is priced by the conservative
-/// default, so real traffic is sized at 15/75 per million instead of the rate
-/// card. That is exactly how a wrong vendor prefix in [routes] hides, which is why
-/// doctor says it out loud.
-fn unreachable_prices(config: &Config) -> Vec<UnreachablePrice> {
-    let mut out = Vec::new();
-    for (provider, models) in &config.prices {
-        for model in models.keys() {
-            if config.routes.get(model).is_some_and(|p| p == provider) {
-                continue;
-            }
-            out.push(UnreachablePrice {
-                provider: provider.clone(),
-                model: model.clone(),
-                closest: crate::closest_names(config.routes.keys().map(String::as_str), model, 3)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            });
-        }
-    }
-    out
-}
-
-/// The configured routes, grouped by provider and ordered by model name.
-fn routes_by_provider(config: &Config) -> BTreeMap<&str, Vec<&str>> {
-    let mut out: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (model, provider) in &config.routes {
-        out.entry(provider.as_str()).or_default().push(model);
-    }
-    out
-}
 
 pub(super) async fn cmd_doctor(
     path: &Path,
@@ -350,6 +295,7 @@ pub(super) async fn cmd_doctor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doctor::{routes_by_provider, unreachable_prices};
 
     /// The bug this exists for: the price was written for the id xkiro publishes,
     /// the route was typed with the wrong vendor prefix, and the two never met.

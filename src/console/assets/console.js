@@ -587,6 +587,40 @@
     })(accountButtons[ab]);
   }
 
+  /* ------------------------------------------------ doctor probe all */
+
+  var probeAllButtons = document.querySelectorAll("[data-probe-all]");
+  for (var pb = 0; pb < probeAllButtons.length; pb++) {
+    (function (button) {
+      button.addEventListener("click", async function () {
+        var result = document.querySelector("[data-doctor-result]");
+        var label = button.textContent;
+        button.disabled = true;
+        button.textContent = "…";
+        try {
+          var response = await fetch("/console/api/accounts/probe", {
+            method: "POST",
+            headers: headers(),
+            credentials: "same-origin",
+            body: JSON.stringify({})
+          });
+          if (response.ok) {
+            window.location.reload();
+            return;
+          }
+          var detail = await response.text();
+          try { detail = JSON.parse(detail).error || detail; } catch (ignored) {}
+          if (result) { result.textContent = detail; }
+        } catch (error) {
+          if (result) { result.textContent = String(error); }
+        } finally {
+          button.textContent = label;
+          button.disabled = false;
+        }
+      });
+    })(probeAllButtons[pb]);
+  }
+
   /* flash messages vanish on their own; a close chip can remove them early */
   var flashes = document.querySelectorAll(".flash .close");
   for (var s = 0; s < flashes.length; s++) {
