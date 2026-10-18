@@ -1,12 +1,15 @@
 //! The Configuration page: a draft editor over the file the gateway is running.
 //!
-//! Server and policy fields are inputs; provider, account, route and price rows
-//! are still a report until their edit paths land. Every field carries a live or
-//! restart-only marker, and the raw TOML view below shows the file with literal
-//! secrets redacted. Validating a draft never writes: it checks the changed file
-//! and shows the exact lines that would move.
+//! Scalar fields are described by `form::Field`; the editable policy decides
+//! whether each renders as an input, a boolean select or a read-only value, and
+//! which marker it carries. Rows with add/remove actions (accounts, routes,
+//! prices and schedules) keep their explicit builders because their actions are
+//! not plain path writes. The raw TOML view shows the file with literal secrets
+//! redacted. Validating a draft never writes: it checks the changed file and
+//! shows the exact lines that would move.
 
 use super::copy::{Lang, Strings};
+use super::form::{self, Field, data_path};
 use super::layout::esc;
 use super::violations;
 use crate::config::{AccountConfig, Config, QuotaAdapter};
@@ -40,126 +43,63 @@ pub fn render(view: &ConfigView) -> String {
     out.push_str(&config_shell(view, s));
 
     out.push_str(&panel("server", s.section_server, |body| {
-        // Listener settings are read-only here: they take effect on the next
-        // start, and an editable input would imply an Apply can move them.
-        readonly_field(
-            body,
-            &["server", "listen"],
-            "server.listen",
-            &view.config.server.listen,
-            s,
-        );
-        readonly_field(
-            body,
-            &["server", "db_path"],
-            "server.db_path",
-            &view.config.server.db_path,
-            s,
-        );
+        // Listener settings take effect on the next start, so the descriptor
+        // renders them as read-only from the same policy that Apply uses.
         let local_key = match &view.config.server.local_key {
             Some(secret) => secret.describe(),
             None => s.config_none.to_string(),
         };
-        readonly_field(
+        form::render_all(
             body,
-            &["server", "local_key"],
-            "server.local_key",
-            &local_key,
+            &[
+                Field::path(&["server", "listen"], view.config.server.listen.as_str()),
+                Field::path(&["server", "db_path"], view.config.server.db_path.as_str()),
+                Field::path(&["server", "local_key"], local_key),
+            ],
             s,
         );
     }));
 
     out.push_str(&panel("policy", s.section_policy, |body| {
         let p = &view.config.policy;
-        editable_text(
+        form::render_all(
             body,
-            &["policy", "soft_threshold"],
-            "policy.soft_threshold",
-            &fnum(p.soft_threshold),
-            s,
-        );
-        editable_bool(
-            body,
-            &["policy", "allow_metered"],
-            "policy.allow_metered",
-            p.allow_metered,
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "poll_interval_secs"],
-            "policy.poll_interval_secs",
-            &p.poll_interval_secs.to_string(),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "poll_interval_active_secs"],
-            "policy.poll_interval_active_secs",
-            &p.poll_interval_active_secs.to_string(),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "poll_interval_idle_secs"],
-            "policy.poll_interval_idle_secs",
-            &p.poll_interval_idle_secs.to_string(),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "drift_threshold"],
-            "policy.drift_threshold",
-            &fnum(p.drift_threshold),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "hard_margin"],
-            "policy.hard_margin",
-            &fnum(p.hard_margin),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "max_retries"],
-            "policy.max_retries",
-            &p.max_retries.to_string(),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "connect_timeout_secs"],
-            "policy.connect_timeout_secs",
-            &p.connect_timeout_secs.to_string(),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "ttft_timeout_secs"],
-            "policy.ttft_timeout_secs",
-            &p.ttft_timeout_secs.to_string(),
-            s,
-        );
-        editable_text(
-            body,
-            &["policy", "idle_timeout_secs"],
-            "policy.idle_timeout_secs",
-            &p.idle_timeout_secs.to_string(),
-            s,
-        );
-        editable_bool(
-            body,
-            &["policy", "probe_before_switch"],
-            "policy.probe_before_switch",
-            p.probe_before_switch,
-            s,
-        );
-        readonly_field(
-            body,
-            &["policy", "max_body_bytes"],
-            "policy.max_body_bytes",
-            &p.max_body_bytes.to_string(),
+            &[
+                Field::path(&["policy", "soft_threshold"], fnum(p.soft_threshold)),
+                Field::path(&["policy", "allow_metered"], form::flag(p.allow_metered)),
+                Field::path(
+                    &["policy", "poll_interval_secs"],
+                    p.poll_interval_secs.to_string(),
+                ),
+                Field::path(
+                    &["policy", "poll_interval_active_secs"],
+                    p.poll_interval_active_secs.to_string(),
+                ),
+                Field::path(
+                    &["policy", "poll_interval_idle_secs"],
+                    p.poll_interval_idle_secs.to_string(),
+                ),
+                Field::path(&["policy", "drift_threshold"], fnum(p.drift_threshold)),
+                Field::path(&["policy", "hard_margin"], fnum(p.hard_margin)),
+                Field::path(&["policy", "max_retries"], p.max_retries.to_string()),
+                Field::path(
+                    &["policy", "connect_timeout_secs"],
+                    p.connect_timeout_secs.to_string(),
+                ),
+                Field::path(
+                    &["policy", "ttft_timeout_secs"],
+                    p.ttft_timeout_secs.to_string(),
+                ),
+                Field::path(
+                    &["policy", "idle_timeout_secs"],
+                    p.idle_timeout_secs.to_string(),
+                ),
+                Field::path(
+                    &["policy", "probe_before_switch"],
+                    form::flag(p.probe_before_switch),
+                ),
+                Field::path(&["policy", "max_body_bytes"], p.max_body_bytes.to_string()),
+            ],
             s,
         );
     }));
@@ -170,51 +110,44 @@ pub fn render(view: &ConfigView) -> String {
         }
         for (provider, cfg) in &view.config.providers {
             subhead(body, &format!("providers.{provider}"));
-            let provider_path: [&str; 2] = ["providers", provider.as_str()];
-            editable_text(
+            form::render_all(
                 body,
-                &[provider_path[0], provider_path[1], "adapter"],
-                "adapter",
-                adapter_name(cfg.adapter),
-                s,
-            );
-            editable_text(
-                body,
-                &[provider_path[0], provider_path[1], "base_url"],
-                "base_url",
-                &cfg.base_url,
-                s,
-            );
-            editable_text(
-                body,
-                &[provider_path[0], provider_path[1], "probe_base_url"],
-                "probe_base_url",
-                cfg.probe_base_url.as_deref().unwrap_or(""),
-                s,
-            );
-            editable_text(
-                body,
-                &[provider_path[0], provider_path[1], "currency"],
-                "currency",
-                &cfg.currency,
-                s,
-            );
-            editable_text(
-                body,
-                &[provider_path[0], provider_path[1], "credit_multiplier"],
-                "credit_multiplier",
-                &cfg.credit_multiplier
-                    .map(fnum)
-                    .unwrap_or_else(|| "1".to_string()),
-                s,
-            );
-            readonly_field(
-                body,
-                &[provider_path[0], provider_path[1], "allow_metered"],
-                "allow_metered",
-                &cfg.allow_metered
-                    .map(flag)
-                    .unwrap_or_else(|| s.follows_policy.to_string()),
+                &[
+                    Field::new(
+                        &["providers", provider.as_str(), "adapter"],
+                        "adapter",
+                        adapter_name(cfg.adapter),
+                    ),
+                    Field::new(
+                        &["providers", provider.as_str(), "base_url"],
+                        "base_url",
+                        cfg.base_url.as_str(),
+                    ),
+                    Field::new(
+                        &["providers", provider.as_str(), "probe_base_url"],
+                        "probe_base_url",
+                        cfg.probe_base_url.as_deref().unwrap_or(""),
+                    ),
+                    Field::new(
+                        &["providers", provider.as_str(), "currency"],
+                        "currency",
+                        cfg.currency.as_str(),
+                    ),
+                    Field::new(
+                        &["providers", provider.as_str(), "credit_multiplier"],
+                        "credit_multiplier",
+                        cfg.credit_multiplier
+                            .map(fnum)
+                            .unwrap_or_else(|| "1".to_string()),
+                    ),
+                    Field::new(
+                        &["providers", provider.as_str(), "allow_metered"],
+                        "allow_metered",
+                        cfg.allow_metered
+                            .map(flag)
+                            .unwrap_or_else(|| s.follows_policy.to_string()),
+                    ),
+                ],
                 s,
             );
             for (id, account) in &cfg.accounts {
@@ -288,25 +221,25 @@ pub fn render(view: &ConfigView) -> String {
         for (provider, models) in &view.config.prices {
             for (model, price) in models {
                 subhead(body, &format!("prices.{provider}.{model}"));
-                editable_text(
+                form::render_all(
                     body,
-                    &["prices", provider, model, "input"],
-                    s.config_input_m,
-                    &fnum(price.input),
-                    s,
-                );
-                editable_text(
-                    body,
-                    &["prices", provider, model, "output"],
-                    s.config_output_m,
-                    &fnum(price.output),
-                    s,
-                );
-                editable_text(
-                    body,
-                    &["prices", provider, model, "cache_read"],
-                    s.config_cache_m,
-                    &price.cache_read.map(fnum).unwrap_or_default(),
+                    &[
+                        Field::new(
+                            &["prices", provider, model, "input"],
+                            s.config_input_m,
+                            fnum(price.input),
+                        ),
+                        Field::new(
+                            &["prices", provider, model, "output"],
+                            s.config_output_m,
+                            fnum(price.output),
+                        ),
+                        Field::new(
+                            &["prices", provider, model, "cache_read"],
+                            s.config_cache_m,
+                            price.cache_read.map(fnum).unwrap_or_default(),
+                        ),
+                    ],
                     s,
                 );
                 let price_payload =
@@ -333,13 +266,6 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "name",
                     ];
-                    editable_text(
-                        body,
-                        &name_path,
-                        s.config_schedule_name,
-                        tier.name.as_deref().unwrap_or(""),
-                        s,
-                    );
                     let days_path = [
                         "prices",
                         provider.as_str(),
@@ -348,7 +274,6 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "days",
                     ];
-                    editable_text(body, &days_path, s.config_days, &tier.days, s);
                     let hours_path = [
                         "prices",
                         provider.as_str(),
@@ -357,7 +282,6 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "hours",
                     ];
-                    editable_text(body, &hours_path, s.config_hours, &tier.hours, s);
                     let tz_path = [
                         "prices",
                         provider.as_str(),
@@ -366,13 +290,6 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "tz",
                     ];
-                    editable_text(
-                        body,
-                        &tz_path,
-                        s.config_tz,
-                        tier.tz.as_deref().unwrap_or(""),
-                        s,
-                    );
                     let input_path = [
                         "prices",
                         provider.as_str(),
@@ -381,7 +298,6 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "input",
                     ];
-                    editable_text(body, &input_path, s.config_input_m, &fnum(tier.input), s);
                     let output_path = [
                         "prices",
                         provider.as_str(),
@@ -390,7 +306,6 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "output",
                     ];
-                    editable_text(body, &output_path, s.config_output_m, &fnum(tier.output), s);
                     let cache_path = [
                         "prices",
                         provider.as_str(),
@@ -399,11 +314,25 @@ pub fn render(view: &ConfigView) -> String {
                         index_text.as_str(),
                         "cache_read",
                     ];
-                    editable_text(
+                    form::render_all(
                         body,
-                        &cache_path,
-                        s.config_cache_m,
-                        &tier.cache_read.map(fnum).unwrap_or_default(),
+                        &[
+                            Field::new(
+                                &name_path,
+                                s.config_schedule_name,
+                                tier.name.as_deref().unwrap_or(""),
+                            ),
+                            Field::new(&days_path, s.config_days, tier.days.as_str()),
+                            Field::new(&hours_path, s.config_hours, tier.hours.as_str()),
+                            Field::new(&tz_path, s.config_tz, tier.tz.as_deref().unwrap_or("")),
+                            Field::new(&input_path, s.config_input_m, fnum(tier.input)),
+                            Field::new(&output_path, s.config_output_m, fnum(tier.output)),
+                            Field::new(
+                                &cache_path,
+                                s.config_cache_m,
+                                tier.cache_read.map(fnum).unwrap_or_default(),
+                            ),
+                        ],
                         s,
                     );
                     let schedule_payload = serde_json::json!({
@@ -539,54 +468,6 @@ fn add_account_form(provider: &str, s: &Strings) -> String {
         esc(s.config_key_value),
         esc(s.config_add_note),
     )
-}
-
-/// What the form sends: one entry per changed leaf, the path split into TOML
-/// keys so a model name containing a dot or slash is never parsed as structure.
-fn data_path(path: &[&str]) -> String {
-    let segments: Vec<String> = path
-        .iter()
-        .map(|segment| format!("\"{segment}\""))
-        .collect();
-    format!("[{}]", segments.join(","))
-}
-
-fn marker_for_path(path: &[&str], s: &Strings) -> String {
-    let owned: Vec<String> = path.iter().map(|segment| segment.to_string()).collect();
-    let class = crate::editable::field(&owned)
-        .map(|policy| policy.class)
-        .unwrap_or(crate::editable::FieldClass::ReadOnly);
-    let (class, text) = match class {
-        crate::editable::FieldClass::Live => ("live", s.config_live),
-        crate::editable::FieldClass::RestartOnly => ("restart", s.config_restart),
-        crate::editable::FieldClass::ReadOnly => ("readonly", s.config_readonly),
-    };
-    format!("<span class=\"tag {}\">{}</span>", class, esc(text))
-}
-
-fn editable_text(out: &mut String, path: &[&str], label: &str, value: &str, s: &Strings) {
-    let _ = write!(
-        out,
-        r#"<div class="field"><span class="field-label mono">{}</span><input type="text" value="{}" data-path="{}" data-initial="{}" spellcheck="false" autocomplete="off"><span class="hint">{}</span></div>"#,
-        esc(label),
-        esc(value),
-        esc(&data_path(path)),
-        esc(value),
-        marker_for_path(path, s),
-    );
-}
-
-fn editable_bool(out: &mut String, path: &[&str], label: &str, value: bool, s: &Strings) {
-    let true_selected = if value { " selected" } else { "" };
-    let false_selected = if value { "" } else { " selected" };
-    let _ = write!(
-        out,
-        r#"<div class="field"><span class="field-label mono">{}</span><select data-path="{}" data-initial="{}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select><span class="hint">{}</span></div>"#,
-        esc(label),
-        esc(&data_path(path)),
-        if value { "true" } else { "false" },
-        marker_for_path(path, s),
-    );
 }
 
 fn config_actions(view: &ConfigView, s: &Strings) -> String {
@@ -800,17 +681,6 @@ fn subhead(out: &mut String, label: &str) {
     let _ = write!(out, "<h3 class=\"section-sub mono\">{}</h3>", esc(label));
 }
 
-fn readonly_field(out: &mut String, path: &[&str], label: &str, value: &str, s: &Strings) {
-    let marker = marker_for_path(path, s);
-    let _ = write!(
-        out,
-        r#"<div class="field"><span class="field-label mono">{}</span><span class="mono">{}</span><span class="hint">{}</span></div>"#,
-        esc(label),
-        esc(value),
-        marker,
-    );
-}
-
 fn account_fields(
     out: &mut String,
     provider: &str,
@@ -839,105 +709,97 @@ fn account_fields(
         esc(s.config_remove_undo),
         esc(s.config_remove_account),
     );
-    editable_text(
+    form::render_all(
         out,
         &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "label",
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "label",
+                ],
+                "label",
+                label,
+            ),
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "key",
+                    "source",
+                ],
+                "key source",
+                source,
+            ),
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "currency",
+                ],
+                "currency",
+                currency,
+            ),
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "credit_multiplier",
+                ],
+                "credit_multiplier",
+                account
+                    .credit_multiplier
+                    .map(fnum)
+                    .unwrap_or_else(|| "1".to_string()),
+            ),
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "concurrency_limit",
+                ],
+                "concurrency_limit",
+                account
+                    .concurrency_limit
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            ),
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "rpm_limit",
+                ],
+                "rpm_limit",
+                account.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
+            ),
+            Field::new(
+                &[
+                    account_path[0],
+                    account_path[1],
+                    account_path[2],
+                    account_path[3],
+                    "allow_metered",
+                ],
+                "allow_metered",
+                account
+                    .allow_metered
+                    .map(flag)
+                    .unwrap_or_else(|| s.follows_provider.to_string()),
+            ),
         ],
-        "label",
-        &label,
-        s,
-    );
-    readonly_field(
-        out,
-        &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "key",
-            "source",
-        ],
-        "key source",
-        &source,
-        s,
-    );
-    editable_text(
-        out,
-        &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "currency",
-        ],
-        "currency",
-        &currency,
-        s,
-    );
-    editable_text(
-        out,
-        &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "credit_multiplier",
-        ],
-        "credit_multiplier",
-        &account
-            .credit_multiplier
-            .map(fnum)
-            .unwrap_or_else(|| "1".to_string()),
-        s,
-    );
-    editable_text(
-        out,
-        &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "concurrency_limit",
-        ],
-        "concurrency_limit",
-        &account
-            .concurrency_limit
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
-        s,
-    );
-    editable_text(
-        out,
-        &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "rpm_limit",
-        ],
-        "rpm_limit",
-        &account.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
-        s,
-    );
-    readonly_field(
-        out,
-        &[
-            account_path[0],
-            account_path[1],
-            account_path[2],
-            account_path[3],
-            "allow_metered",
-        ],
-        "allow_metered",
-        &account
-            .allow_metered
-            .map(flag)
-            .unwrap_or_else(|| s.follows_provider.to_string()),
         s,
     );
 }

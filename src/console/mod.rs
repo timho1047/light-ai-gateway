@@ -10,6 +10,7 @@ pub mod board;
 pub mod config_page;
 pub mod copy;
 pub mod doctor;
+pub mod form;
 pub mod guard;
 pub mod keys;
 pub mod layout;
