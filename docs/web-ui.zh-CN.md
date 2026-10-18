@@ -17,7 +17,7 @@ cookie、没有会话。能到达它的只有运行网关的这台机器。
 
 | 界面 | 路径 | 谁能到达 |
 |---|---|---|
-| 控制台页面 | `GET /` | 只有 loopback 对端 |
+| 控制台页面 | `GET /`、`/usage`、`/requests`、`/prices`、`/config`、`/keys`、`/doctor` | 只有 loopback 对端 |
 | 内嵌资源 | `GET /console/assets/*` | 只有 loopback 对端 |
 | 控制台 API | `/console/api/*` | 只有 loopback 对端 |
 | OpenAI 兼容 API | `/v1/*` | 不变：`local_key` bearer 规则 |
@@ -41,7 +41,14 @@ cookie、没有会话。能到达它的只有运行网关的这台机器。
   `Cache-Control: no-store`。
 - 读没有副作用；任何改动都是 POST。
 
-控制台完全不用 cookie；语言是 URL 参数，不是服务端状态。浏览器不是运维和自己机器之间的
+### 响应
+
+页面是服务端渲染的 HTML；看板轮询 `/console/partials/board` 的 HTML 片段。
+会改状态的动作返回小的结果载荷给页面自己的脚本消费（草稿校验和应用返回 HTML，账号、
+价格、凭据动作返回 JSON）。没有 JSON 管理 API，也没有给第三方客户端用的机器接口。
+
+控制台完全不用 cookie；语言和主题记在浏览器里（URL 参数加 `localStorage`），
+不是服务端状态。浏览器不是运维和自己机器之间的
 边界，但运维访问的任何页面都能向 loopback 发请求。把它们挡在外面的是 `Origin`/`Host`/
 自定义头的三重检查；loopback 对端检查则把其它所有主机挡在外面。
 
@@ -52,15 +59,21 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 
 | CLI | 控制台 |
 |---|---|
-| `lgw status [--refresh]` | 看板；刷新会先探测 |
-| `lgw usage --since --group-by` | 用量控件 |
-| `lgw accounts list/probe/disable/enable` | 池子里的账号行和单账号操作 |
-| `lgw tail` | 最近的请求 |
-| `lgw doctor` | 诊断 |
-| `lgw keys add/list/remove/test` | 密钥；列表显示来源，从不显示值 |
-| `lgw prices`、`--drift-only`、`--forget` | 价格 |
+| `lgw status [--refresh]` | 看板；`--refresh` 对应诊断页的 Probe all，以及看板每行的 Probe |
+| `lgw usage --since --group-by` | 用量页：范围与分组控件 |
+| `lgw accounts list/probe/disable/enable` | 看板账号行：Probe、Disable、Enable |
+| `lgw tail --limit` | 请求页：时间、状态、尝试与成本，带条数控制 |
+| `lgw doctor` | 诊断页：全部检查 + 双语结论 |
+| `lgw keys add/list/remove/test` | 密钥页：来源与状态、Store key、Test、Remove |
+| `lgw prices`、`--drift-only`、`--forget` | 价格页：两侧价格与漂移；Forget all/provider/model |
 | `lgw init` | 不提供：网关已经有配置 |
-| 手动编辑 `config.toml` | 配置 |
+| 手动编辑 `config.toml` | 配置页：草稿、校验、diff、应用 |
+
+已知差异都是刻意的：`lgw usage` 在用量表后还会打印价格与漂移面板，控制台把它拆成用量页和
+价格页；`lgw tail` 接受任意条数，控制台提供 25/50/100/250；`lgw prices --drift-only`
+是过滤，控制台只是把显著漂移排在前面而不是隐藏其余；`lgw serve` 负责启动进程，没有控制台
+对应项，因为控制台正是由它提供的。控制台和 CLI 也共用账号状态机、provider 探测适配器
+和 doctor 检查装配；只有持久化目标不同 —— 控制台还必须更新运行中的池子，而终端写账本行。
 
 网络动作（探测、诊断、密钥测试）在同一个请求里带进度状态和结果跑完，不是后台任务。
 
@@ -77,6 +90,10 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 
 如果表单加载之后文件在磁盘上变了，应用会返回 409 并要求重新加载；它绝不覆盖在编辑器里
 做过的改动。校验或构建快照失败的改动，什么都不变。
+
+控制台之外的编辑不会被忽略：watcher 按文件内容轮询，新字节走同一套应用规则和同一条
+串行路径。读不出来的文件会保留旧快照，并把失败显示在配置页和日志里；修好文件后无需重启
+或控制台操作即可生效。控制台自己写入的文件不会再被应用第二次。
 
 密钥不是可编辑的值。key 字段显示的是它的来源（凭据库、环境变量、文件，或存在内联
 字面量）；新增或轮换 key 只会写进操作系统的凭据库。任何响应、日志或页面都不会带上 key。
@@ -98,6 +115,7 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 | `[prices]` 的配置值和档位表 | |
 | `server.local_key` | |
 
+监听地址与请求体上限字段在表单里是只读的；构造出来的草稿若试图改它们，会按字段名被拒绝。
 新账号以 `unknown` 进入，探测成功之前不能服务。被移除的账号会退役：它不再接新工作，最后
 几笔在途尝试仍对着它进来时那个池子结算。改一家 provider 的 adapter 或 base URL 会把它
 的账号重置成 `unknown` 并重新探测；来自旧端点的读数绝不保留。
@@ -112,13 +130,14 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 - 金额保持账本的 Decimal 精度；控制台从不把它当浮点数重新相加。
 - 尝试级明细在 30 天后被清理，所以延迟数字（TTFT p50/p95、TPS）到 30 天为止；花销、
   token 和请求数不会。
-- 页面按定时器刷新（看板 10 秒、用量页 30 秒），也可以按需刷新。没有 websocket，也没有
-  流式 tail。
+- 看板每 10 秒重新取一次自己的片段；其它页面在加载时和动作后刷新。没有 websocket，
+  也没有流式 tail。
 
 ## 语言
 
 文案有英文和简体中文。`?lang=zh` 选择中文，默认是英文；链接会带上这个参数，顶栏的切换
-也能改它。不存进 cookie。
+也能改它。切换会把选择记进 `localStorage`（绝不是 cookie）；主题（明亮/暗色，默认
+明亮）也用同样的方式记忆。
 
 ## 禁止
 
@@ -136,14 +155,22 @@ CLI 能做的每一件事都在控制台上，除了启动自己、以及写一�
 
 集成测试，按它们断言的行为命名：
 
-- `the_console_is_loopback_only`
-- `a_cross_origin_write_is_refused`
-- `a_host_header_from_another_name_is_refused`
-- `a_stale_form_does_not_overwrite_the_file`
-- `an_invalid_draft_changes_nothing`
-- `comments_and_unknown_keys_survive_a_save`
-- `a_removed_account_drains_and_keeps_its_ledger_rows`
-- `an_in_flight_request_keeps_its_snapshot`
-- `a_restart_only_setting_is_refused_by_name`
-- `no_console_response_contains_a_key`
-- `chinese_and_english_pages_render_the_same_fields`
+- `a_foreign_host_does_not_see_the_console`
+- `the_console_is_not_behind_the_local_key`
+- `console_writes_need_json_and_the_console_header`
+- `a_stale_apply_leaves_the_newer_file_untouched`
+- `an_invalid_draft_is_a_field_error_in_both_languages`
+- `a_draft_keeps_comments_order_and_unknown_fields`
+- `a_removed_account_retires_after_its_in_flight_attempt_settles`
+- `a_published_snapshot_does_not_reprice_an_in_flight_request`
+- `a_restart_only_apply_is_refused_by_name_and_writes_nothing`
+- `an_invalid_apply_changes_neither_the_file_nor_the_snapshot`
+- `an_external_edit_is_applied_once_through_the_watcher`
+- `an_invalid_external_edit_keeps_serving_and_surfaces_the_failure`
+- `a_console_save_is_not_applied_again_by_the_watcher`
+- `the_usage_page_shows_the_same_numbers_in_both_languages`
+- `the_requests_page_shows_attempts_and_filters`
+- `the_prices_page_shows_both_rates_and_forgets_them`
+- `the_doctor_page_reports_every_check_in_both_languages`
+- `the_keys_page_lists_sources_and_manages_the_store`
+- `probing_and_operator_state_work_through_the_console`

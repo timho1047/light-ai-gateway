@@ -38,17 +38,11 @@ pub fn render(view: &ConfigView) -> String {
     );
 
     out.push_str(&section(s.section_server, |body| {
-        editable_text(
+        // Listener settings are read-only here: they take effect on the next
+        // start, and an editable input would imply an Apply can move them.
+        field(body, "server.listen", &view.config.server.listen, false, s);
+        field(
             body,
-            &["server", "listen"],
-            "server.listen",
-            &view.config.server.listen,
-            false,
-            s,
-        );
-        editable_text(
-            body,
-            &["server", "db_path"],
             "server.db_path",
             &view.config.server.db_path,
             false,
@@ -58,7 +52,7 @@ pub fn render(view: &ConfigView) -> String {
             Some(secret) => secret.describe(),
             None => s.config_none.to_string(),
         };
-        field(body, "server.local_key", &local_key, true, s);
+        field(body, "server.local_key", &local_key, false, s);
     }));
 
     out.push_str(&section(s.section_policy, |body| {
@@ -159,9 +153,8 @@ pub fn render(view: &ConfigView) -> String {
             true,
             s,
         );
-        editable_text(
+        field(
             body,
-            &["policy", "max_body_bytes"],
             "policy.max_body_bytes",
             &p.max_body_bytes.to_string(),
             false,

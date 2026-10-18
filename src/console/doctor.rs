@@ -46,7 +46,7 @@ pub fn render(report: &DoctorReport, lang: Lang) -> String {
 
     let _ = write!(
         out,
-        r#"<table class="table doctor-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
+        r#"<div class="table-wrap"><table class="table doctor-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
         esc(s.doctor_col_check),
         esc(s.doctor_col_verdict),
         esc(s.doctor_col_detail),
@@ -62,7 +62,7 @@ pub fn render(report: &DoctorReport, lang: Lang) -> String {
             esc(&check.detail),
         );
     }
-    out.push_str("</tbody></table></section>");
+    out.push_str("</tbody></table></div></section>");
     out
 }
 

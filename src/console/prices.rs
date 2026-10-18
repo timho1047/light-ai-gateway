@@ -96,7 +96,7 @@ pub fn render(table: Option<&crate::meter::PriceTable>, lang: Lang) -> String {
 
             let _ = write!(
                 out,
-                r#"<table class="table prices-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
+                r#"<div class="table-wrap"><table class="table prices-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
                 esc(s.prices_col_tier),
                 esc(s.prices_col_source),
                 esc(s.prices_col_mix),
@@ -145,7 +145,7 @@ pub fn render(table: Option<&crate::meter::PriceTable>, lang: Lang) -> String {
                     row.samples,
                 );
             }
-            out.push_str("</tbody></table>");
+            out.push_str("</tbody></table></div>");
         }
         out.push_str("</div>");
     }

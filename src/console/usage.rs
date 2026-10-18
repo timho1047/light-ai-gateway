@@ -11,6 +11,7 @@ use super::layout::esc;
 use crate::domain::GroupBy;
 use crate::store::UsageReport;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use time::OffsetDateTime;
@@ -154,6 +155,7 @@ pub fn render(report: Option<&UsageReport>, range: Range, group: Group, lang: La
             out.push_str(&summary(report, s));
             out.push_str(&table(report, s));
             out.push_str(&chart(report, s));
+            out.push_str(&spend_chart(report, s));
             out.push_str(&latency(report, s));
         }
     }
@@ -306,7 +308,7 @@ fn table(report: &UsageReport, s: &Strings) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
-        r#"<table class="table usage-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
+        r#"<div class="table-wrap"><table class="table usage-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
         esc(s.usage_col_key),
         esc(s.usage_col_requests),
         esc(s.usage_col_failures),
@@ -351,7 +353,7 @@ fn table(report: &UsageReport, s: &Strings) -> String {
             esc(&cache),
         );
     }
-    out.push_str("</tbody></table>");
+    out.push_str("</tbody></table></div>");
     out
 }
 
@@ -395,6 +397,76 @@ fn chart(report: &UsageReport, s: &Strings) -> String {
         bars,
         esc(&summary),
         esc(s.usage_chart_note),
+    )
+}
+
+/// Covered and Metered spend over time. Currencies cannot be added together, so
+/// the chart shows the currency with the most spend and says which one it is.
+fn spend_chart(report: &UsageReport, s: &Strings) -> String {
+    // Per currency, per day: [covered, metered].
+    let mut coverage: BTreeMap<&str, (Decimal, Decimal)> = BTreeMap::new();
+    let mut per_day: BTreeMap<&str, BTreeMap<String, (Decimal, Decimal)>> = BTreeMap::new();
+    for row in &report.daily {
+        let totals = coverage.entry(row.currency.as_str()).or_default();
+        totals.0 += row.covered_cost;
+        totals.1 += row.metered_cost;
+        let days = per_day.entry(row.currency.as_str()).or_default();
+        let day = days.entry(row.key.clone()).or_default();
+        day.0 += row.covered_cost;
+        day.1 += row.metered_cost;
+    }
+    let Some((currency, _)) = coverage
+        .iter()
+        .max_by_key(|(_, (covered, metered))| *covered + *metered)
+    else {
+        return String::new();
+    };
+    let days = &per_day[currency];
+    let max = days
+        .values()
+        .map(|(covered, metered)| *covered + *metered)
+        .max()
+        .unwrap_or(Decimal::ZERO);
+    if max <= Decimal::ZERO {
+        return String::new();
+    }
+    let (covered_total, metered_total) = coverage[currency];
+    let summary = format!(
+        "{}: {} · {}: {} · {}",
+        s.usage_covered,
+        crate::table::money_with(covered_total, currency),
+        s.usage_metered,
+        crate::table::money_with(metered_total, currency),
+        esc(currency),
+    );
+    let mut bars = String::new();
+    for (day, (covered, metered)) in days {
+        let total = *covered + *metered;
+        let height = (total / max * Decimal::from(100))
+            .to_f64()
+            .unwrap_or(0.0)
+            .max(2.0);
+        let covered_share = if total > Decimal::ZERO {
+            (covered / total * Decimal::from(100))
+                .to_f64()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let _ = write!(
+            bars,
+            r#"<div class="bar spend" style="height:{height:.0}%" title="{day}: {c} covered / {m} metered"><i class="covered" style="height:{covered_share:.0}%"></i><i class="metered"></i></div>"#,
+            c = crate::table::money_with(*covered, currency),
+            m = crate::table::money_with(*metered, currency),
+        );
+    }
+    format!(
+        r#"<div class="usage-chart card"><div class="eyebrow">{}</div><div class="bars" role="img" aria-label="{}">{}</div><p class="chart-summary">{}</p><p class="hint">{}</p></div>"#,
+        esc(s.usage_spend_chart_title),
+        esc(&summary),
+        bars,
+        esc(&summary),
+        esc(s.usage_spend_note),
     )
 }
 
@@ -484,12 +556,16 @@ mod tests {
                     key: "2026-10-17".to_string(),
                     currency: "USD".to_string(),
                     requests: 2,
+                    covered_cost: "0.2".parse().unwrap(),
+                    metered_cost: "0.1".parse().unwrap(),
                     ..UsageFullRow::default()
                 },
                 UsageFullRow {
                     key: "2026-10-18".to_string(),
                     currency: "USD".to_string(),
                     requests: 4,
+                    covered_cost: "0.3".parse().unwrap(),
+                    metered_cost: "0.2".parse().unwrap(),
                     ..UsageFullRow::default()
                 },
             ],
@@ -516,6 +592,9 @@ mod tests {
             "covered and metered must not be summed"
         );
         assert!(html.contains("2026-10-18"));
+        assert!(html.contains("Daily spend"));
+        assert!(html.contains("0.5 USD"), "covered total");
+        assert!(html.contains("0.3 USD"), "metered total");
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub fn render(report: Option<&KeysReport>, lang: Lang) -> String {
     } else {
         let _ = write!(
             out,
-            r#"<table class="table keys-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
+            r#"<div class="table-wrap"><table class="table keys-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>"#,
             esc(s.keys_col_provider),
             esc(s.keys_col_account),
             esc(s.keys_col_source),
@@ -84,7 +84,7 @@ pub fn render(report: Option<&KeysReport>, lang: Lang) -> String {
                 esc(&s.keys_test_local.replacen("{}", &chars.to_string(), 1)),
             );
         }
-        out.push_str("</tbody></table>");
+        out.push_str("</tbody></table></div>");
     }
 
     let _ = write!(

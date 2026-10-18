@@ -388,6 +388,31 @@ pub struct Reconfigured {
     pub probe: Vec<(ProviderId, AccountId)>,
 }
 
+/// The operator state machine, shared by the live pool and the CLI. A disable is
+/// absolute until an operator says otherwise; an enable only returns the account
+/// to Unknown so a probe still has to prove it can pay.
+pub fn operator_transition(
+    account: &mut Account,
+    enabled: bool,
+) -> std::result::Result<(), String> {
+    if enabled {
+        if account.state != AccountState::Disabled {
+            return Err(format!(
+                "{} is {}, not DISABLED; there is nothing to enable",
+                account.qualified(),
+                account.state.label()
+            ));
+        }
+        account.state = AccountState::Unknown;
+        account.last_error = None;
+        account.last_probe_at = None;
+    } else {
+        account.state = AccountState::Disabled;
+        account.last_error = Some(OPERATOR_DISABLED.to_string());
+    }
+    Ok(())
+}
+
 /// The last_error marker that records "no longer configured", distinct from an
 /// operator disabling an account: only adding the account back clears it.
 pub const RETIRED_BY_APPLY: &str = "retired by configuration apply (no longer in the file)";
@@ -590,20 +615,7 @@ impl Pool {
         let Some(acct) = find_mut(&mut inner.accounts, qualified_id) else {
             return Err(format!("no account {qualified_id}"));
         };
-        if enabled {
-            if acct.state != AccountState::Disabled {
-                return Err(format!(
-                    "{qualified_id} is {}, not DISABLED; there is nothing to enable",
-                    acct.state.label()
-                ));
-            }
-            acct.state = AccountState::Unknown;
-            acct.last_error = None;
-            acct.last_probe_at = None;
-        } else {
-            acct.state = AccountState::Disabled;
-            acct.last_error = Some(OPERATOR_DISABLED.to_string());
-        }
+        operator_transition(acct, enabled)?;
         Ok(acct.clone())
     }
 

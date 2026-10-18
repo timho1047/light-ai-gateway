@@ -4,7 +4,7 @@ use super::status::{cmd_status, render_board};
 use super::{AccountsArgs, AccountsCommand};
 use crate::ansi::Palette;
 use crate::config::Config;
-use crate::domain::{AccountOverview, AccountState};
+use crate::domain::AccountOverview;
 use crate::router::Gateway;
 use crate::store::{self, Ledger};
 use anyhow::{Context, Result, bail};
@@ -99,12 +99,7 @@ fn cmd_accounts_disable(config: &Config, account_id: &str, pal: &Palette) -> Res
         account.window_started_at = row.window_started_at;
     }
 
-    // There is no dedicated "operator disabled" transition in the frozen pool
-    // API; an account that can never be billed again is exactly the Disabled
-    // state that insufficient credit produces, so it is used here and the
-    // reason is rewritten to say what really happened.
-    account.state = AccountState::Disabled;
-    account.last_error = Some(crate::accounts::OPERATOR_DISABLED.to_string());
+    crate::accounts::operator_transition(&mut account, false).map_err(anyhow::Error::msg)?;
 
     let handle = store::StoreHandle::spawn(&db)?;
     // One account, one row. Never a snapshot.
@@ -149,20 +144,14 @@ fn cmd_accounts_enable(config: &Config, account_id: &str, pal: &Palette) -> Resu
             .into_iter()
             .find(|r| crate::domain::qualified_id(&r.provider, &r.account_id) == qualified)
     {
-        if row.state != AccountState::Disabled {
-            bail!(
-                "{qualified} is {}, not DISABLED; there is nothing to enable",
-                row.state.label()
-            );
-        }
+        account.state = row.state;
         account.gates = row.gates;
         account.available_at = row.available_at;
         account.window_started_at = row.window_started_at;
         account.last_probe_at = None;
     }
 
-    account.state = AccountState::Unknown;
-    account.last_error = None;
+    crate::accounts::operator_transition(&mut account, true).map_err(anyhow::Error::msg)?;
 
     let handle = store::StoreHandle::spawn(&db)?;
     handle.save_account(&account);

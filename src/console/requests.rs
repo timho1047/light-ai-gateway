@@ -165,7 +165,7 @@ fn table(rows: &[RequestHistory], s: &Strings) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
-        r#"<table class="table requests-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
+        r#"<div class="table-wrap"><table class="table requests-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>"#,
         esc(s.requests_col_time),
         esc(s.requests_col_status),
         esc(s.requests_col_attempt),
@@ -196,7 +196,7 @@ fn table(rows: &[RequestHistory], s: &Strings) -> String {
             }
         }
     }
-    out.push_str("</tbody></table>");
+    out.push_str("</tbody></table></div>");
     out
 }
 

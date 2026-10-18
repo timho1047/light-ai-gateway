@@ -1993,3 +1993,41 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
   border-color: var(--warn);
   color: var(--warn);
 }
+
+.table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.table-wrap > table {
+  min-width: 620px;
+}
+
+@media (max-width: 720px) {
+  .table-wrap > table.accounts,
+  .table-wrap > table.prices-table {
+    min-width: 860px;
+  }
+}
+
+.bar.spend {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  background: transparent;
+}
+
+.bar.spend i {
+  display: block;
+  width: 100%;
+}
+
+.bar.spend i.covered {
+  background: var(--ink);
+}
+
+.bar.spend i.metered {
+  flex: 1;
+  background: var(--warn);
+}

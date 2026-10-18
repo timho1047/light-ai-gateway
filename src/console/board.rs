@@ -71,7 +71,7 @@ fn table(out: &mut String, accounts: &[AccountOverview], at: OffsetDateTime, lan
     } else {
         let _ = write!(
             out,
-            r#"<table class="accounts">
+            r#"<div class="table-wrap"><table class="accounts">
   <thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead>
   <tbody>"#,
             esc(s.col_account),
@@ -83,7 +83,7 @@ fn table(out: &mut String, accounts: &[AccountOverview], at: OffsetDateTime, lan
         for account in accounts {
             row(out, account, at, lang);
         }
-        out.push_str("</tbody></table>");
+        out.push_str("</tbody></table></div>");
     }
 }
 
