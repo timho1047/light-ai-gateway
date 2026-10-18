@@ -38,8 +38,8 @@ pub(super) async fn list_models(
 ) -> Response {
     // One snapshot for the whole list: the routes and provider views it renders
     // come from the configuration that admitted it.
-    let runtime = state.backend.runtime();
-    let backend = state.backend.as_ref();
+    let runtime = state.request.runtime();
+    let backend = state.request.as_ref();
 
     if let Some(named) = &query.provider
         && !runtime.config().providers.contains_key(named)

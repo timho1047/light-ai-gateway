@@ -10,7 +10,7 @@
 //! a rename-based save is just a different inode with new bytes.
 
 use crate::config::Config;
-use crate::http::ProxyBackend;
+use crate::http::OperatorBackend;
 use crate::http::console::ConsoleContext;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -70,7 +70,7 @@ pub fn mark_loaded(shared: &SharedReload, fingerprint: &str, at: OffsetDateTime)
 /// One poll of the file. Public for tests; the running gateway calls it from
 /// spawn() on a one-second cadence.
 pub async fn reload_once(
-    backend: &dyn ProxyBackend,
+    backend: &dyn OperatorBackend,
     path: &Path,
     console: &ConsoleContext,
 ) -> Outcome {
@@ -132,7 +132,7 @@ pub async fn reload_once(
 /// Poll the file forever. A failed poll is recorded in ReloadState and the
 /// running snapshot keeps serving; a later fixed file is picked up normally.
 pub fn spawn(
-    backend: Arc<dyn ProxyBackend>,
+    backend: Arc<dyn OperatorBackend>,
     path: PathBuf,
     console: ConsoleContext,
 ) -> tokio::task::JoinHandle<()> {

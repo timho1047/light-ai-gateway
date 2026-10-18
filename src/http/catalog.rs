@@ -3,7 +3,7 @@
 //! Shared by `/v1/models` and `lgw doctor`; a second copy of this would be a
 //! second answer about what a provider publishes.
 
-use super::{ProxyBackend, read_bounded, upstream_error_message};
+use super::{RequestBackend, read_bounded, upstream_error_message};
 use crate::domain::ApiKey;
 use crate::runtime::Runtime;
 use axum::http::header;
@@ -72,7 +72,7 @@ fn catalog_from(value: Value) -> Catalog {
 
 /// Read one provider's catalog with an eligible account's key, through the pool.
 pub(super) async fn catalog_for_provider(
-    backend: &dyn ProxyBackend,
+    backend: &dyn RequestBackend,
     runtime: &Runtime,
     provider: &str,
     request_id: &str,

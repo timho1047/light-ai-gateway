@@ -105,13 +105,13 @@ pub(super) async fn board_partial(
 /// from the same seams the pool exposes, so a refresh cannot show numbers from
 /// two different moments in different places.
 fn board_html(state: &AppState, lang: Lang) -> String {
-    let snapshot = state.backend.snapshot();
-    let vitals = state.backend.board_vitals();
-    let drift = state.backend.price_drift();
+    let snapshot = state.operator.snapshot();
+    let vitals = state.operator.board_vitals();
+    let drift = state.operator.price_drift();
     let input = board::BoardInput {
         accounts: &snapshot,
         vitals: vitals.as_ref(),
-        in_flight: state.backend.in_flight(),
+        in_flight: state.operator.in_flight(),
         drift: &drift,
     };
     board::render(&input, crate::domain::now(), lang)
@@ -126,7 +126,7 @@ pub(super) async fn config_page_handler(
 ) -> Response {
     let lang = query.lang();
     let strings = lang.strings();
-    let runtime = state.backend.runtime();
+    let runtime = state.operator.runtime();
     let path = state.console.config_path.clone();
 
     let (fingerprint, raw, mut body) =
@@ -355,7 +355,7 @@ pub(super) async fn config_validate(
         std::path::Path::new(&path),
         &request.fingerprint,
         actions,
-        state.backend.runtime().config(),
+        state.operator.runtime().config(),
     ) {
         Ok(prepared) => fragment(StatusCode::OK, config_page::validated(&prepared.diff, lang)),
         Err(error) => apply_failure(error, &path, lang),
@@ -389,7 +389,7 @@ pub(super) async fn config_apply(
         std::path::Path::new(&path),
         &request.fingerprint,
         actions,
-        state.backend.runtime().config(),
+        state.operator.runtime().config(),
     ) {
         Ok(prepared) => prepared,
         Err(error) => return apply_failure(error, &path, lang),
@@ -401,7 +401,7 @@ pub(super) async fn config_apply(
         );
     }
     match apply::commit(
-        state.backend.as_ref(),
+        state.operator.as_ref(),
         &state.console,
         std::path::Path::new(&path),
         &prepared,
@@ -486,7 +486,7 @@ pub(super) async fn usage_page(
     let group = usage::Group::parse(query.group.as_deref());
     let now = crate::domain::now();
     let report = state
-        .backend
+        .operator
         .usage_report(now, range.since(now), &[group.group_by()]);
     let body = usage::render(report.as_ref(), range, group, lang);
     page(&state, lang, Nav::Usage, body)
@@ -516,7 +516,7 @@ pub(super) async fn requests_page(
         requests::Filters::sanitise(query.limit, query.errors.as_deref() == Some("1"), coverage);
     let history =
         state
-            .backend
+            .operator
             .request_history(filters.limit, filters.errors_only, filters.coverage);
     let body = requests::render(history.as_deref(), filters, lang);
     page(&state, lang, Nav::Requests, body)
@@ -533,7 +533,7 @@ pub(super) async fn prices_page(
     Query(query): Query<PricesQuery>,
 ) -> Response {
     let lang = Lang::from_param(query.lang.as_deref());
-    let table = state.backend.price_table();
+    let table = state.operator.price_table();
     let body = prices::render(table.as_ref(), lang);
     page(&state, lang, Nav::Prices, body)
 }
@@ -563,7 +563,7 @@ pub(super) async fn prices_forget(
     }
     let _serialized = state.console.apply_lock.lock().await;
     match state
-        .backend
+        .operator
         .forget_prices(provider.as_deref(), model.as_deref())
     {
         Ok(forgotten) => (
@@ -602,7 +602,7 @@ pub(super) async fn accounts_probe(
             .into_response();
     }
     let probing = state
-        .backend
+        .operator
         .probe_accounts(provider.as_deref(), account.as_deref());
     match tokio::time::timeout(std::time::Duration::from_secs(15), probing).await {
         Err(_) => (
@@ -642,7 +642,7 @@ pub(super) async fn accounts_state(
             .into_response();
     };
     match state
-        .backend
+        .operator
         .set_account_enabled(&provider, &account, request.enabled)
     {
         Ok(()) => (
@@ -690,7 +690,7 @@ pub(super) async fn doctor_page(
         Err(error) => doctor_view::unavailable(&crate::doctor::sanitise(&format!("{error:#}"))),
         Ok(config) => {
             let credentials = state
-                .backend
+                .operator
                 .credentials()
                 .unwrap_or_else(crate::secrets::CredentialStore::from_env);
             let client = crate::probe::client(&config).unwrap_or_default();
@@ -725,7 +725,7 @@ pub(super) async fn keys_page(
     Query(query): Query<KeysQuery>,
 ) -> Response {
     let lang = Lang::from_param(query.lang.as_deref());
-    let report = state.backend.keys_report();
+    let report = state.operator.keys_report();
     let body = crate::console::keys::render(report.as_ref(), lang);
     page(&state, lang, Nav::Keys, body)
 }
@@ -751,7 +751,7 @@ pub(super) async fn keys_add(
         )
             .into_response();
     };
-    match state.backend.key_add(&provider, &account, &secret) {
+    match state.operator.key_add(&provider, &account, &secret) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "stored": true }))).into_response(),
         Err(error) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -787,7 +787,7 @@ pub(super) async fn keys_test(
         )
             .into_response();
     };
-    let tested = state.backend.key_test(&provider, &account);
+    let tested = state.operator.key_test(&provider, &account);
     match tokio::time::timeout(std::time::Duration::from_secs(15), tested).await {
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
@@ -832,7 +832,7 @@ pub(super) async fn keys_remove(
         )
             .into_response();
     };
-    match state.backend.key_remove(&provider, &account) {
+    match state.operator.key_remove(&provider, &account) {
         Ok(removed) => (
             StatusCode::OK,
             Json(serde_json::json!({ "removed": removed })),

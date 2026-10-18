@@ -294,11 +294,13 @@ fn runtime_for(config: &Config) -> Arc<Runtime> {
     Arc::new(Runtime::new(Arc::new(config.clone()), Arc::new(prices)).unwrap())
 }
 
-impl ProxyBackend for FakeBackend {
+impl RuntimeSource for FakeBackend {
     fn runtime(&self) -> Arc<Runtime> {
         self.runtime.read().unwrap().clone()
     }
+}
 
+impl RequestBackend for FakeBackend {
     fn resolve(&self, runtime: &Runtime, client_model: &str) -> Result<ResolvedRoute> {
         runtime.resolve(client_model)
     }
@@ -346,10 +348,6 @@ impl ProxyBackend for FakeBackend {
 
     fn account(&self, account_id: &str) -> Option<Account> {
         self.pool.account(account_id)
-    }
-
-    fn snapshot(&self) -> Vec<Account> {
-        self.pool.snapshot()
     }
 
     fn retry_after_for(&self, provider: &str) -> Option<Duration> {
@@ -415,6 +413,12 @@ impl ProxyBackend for FakeBackend {
             class,
             attempt,
         });
+    }
+}
+
+impl OperatorBackend for FakeBackend {
+    fn snapshot(&self) -> Vec<Account> {
+        self.pool.snapshot()
     }
 
     fn credentials(&self) -> Option<crate::secrets::CredentialStore> {
@@ -1539,12 +1543,18 @@ async fn a_published_snapshot_does_not_reprice_an_in_flight_request() {
 /// A console-enabled router on an ephemeral port. The listener binds first so
 /// the console's Host allowlist pins the port the kernel actually gave us,
 /// and the service carries peer addresses the guard can read.
-async fn spawn_console_router(backend: Arc<dyn ProxyBackend>) -> String {
+async fn spawn_console_router<B>(backend: Arc<B>) -> String
+where
+    B: super::RequestBackend + super::OperatorBackend + 'static,
+{
     spawn_console_router_with(backend, "/tmp/lgw-test-config.toml").await
 }
 
 /// The same router, with the configuration file path the config page describes.
-async fn spawn_console_router_with(backend: Arc<dyn ProxyBackend>, config_path: &str) -> String {
+async fn spawn_console_router_with<B>(backend: Arc<B>, config_path: &str) -> String
+where
+    B: super::RequestBackend + super::OperatorBackend + 'static,
+{
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let console = super::console::ConsoleContext::new(&addr.to_string(), addr.port(), config_path);
@@ -3550,8 +3560,7 @@ key = "sk-probe-test"
     std::fs::write(&path, &toml).unwrap();
     let config = Config::from_toml_str(&toml).expect("config");
     let gateway = crate::router::Gateway::new(config).await.expect("gateway");
-    let backend: Arc<dyn super::ProxyBackend> =
-        Arc::new(super::GatewayBackend::new(gateway.clone()));
+    let backend: Arc<super::GatewayBackend> = Arc::new(super::GatewayBackend::new(gateway.clone()));
     let addr = spawn_console_router_with(backend, path.to_str().unwrap()).await;
 
     let response = reqwest::Client::new()

@@ -67,20 +67,14 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-/// The slice of gateway behaviour the HTTP layer needs.
-///
-/// This seam exists so the router can be driven end-to-end in tests without a
-/// live database or a probed pool. GatewayBackend is the production wiring;
-/// every method mirrors a frozen Gateway/pool signature.
-///
-/// Configuration is never lent out by the backend: a handler captures the
-/// [`Runtime`] once at admission with [`ProxyBackend::runtime`] and passes it to
-/// every method that needs configuration, so a later publication cannot change
-/// the route, timeout or price an in-flight request is running under.
-pub trait ProxyBackend: Send + Sync + 'static {
+/// The configuration snapshot every request-path and operator method runs on.
+pub trait RuntimeSource: Send + Sync + 'static {
     /// The configuration snapshot new requests are admitted under.
     fn runtime(&self) -> Arc<Runtime>;
+}
 
+/// Request admission and settlement: one slow model call, from route to ledger.
+pub trait RequestBackend: RuntimeSource {
     fn resolve(&self, runtime: &Runtime, client_model: &str) -> Result<ResolvedRoute>;
 
     // Eight arguments, each a different fact about the attempt: the snapshot it
@@ -111,6 +105,70 @@ pub trait ProxyBackend: Send + Sync + 'static {
     /// Look up an account by canonical provider/id identity.
     fn account(&self, qualified_id: &str) -> Option<Account>;
 
+    /// Refresh an account's quota reading immediately before switching to it.
+    ///
+    /// A boxed future rather than an async-trait method so the default can be a
+    /// no-op and test backends need no implementation. The real gateway honours
+    /// policy.probe_before_switch; without this call that setting was parsed and
+    /// then never read, so a switch could land on an account that had already
+    /// filled up since the last poll.
+    fn ensure_fresh<'a>(
+        &'a self,
+        _runtime: &'a Runtime,
+        _provider: &'a str,
+        _account_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
+
+    fn retry_after_for(&self, provider: &str) -> Option<Duration>;
+
+    fn http(&self, runtime: &Runtime) -> reqwest::Client;
+
+    /// Which price window a request starting now falls into.
+    fn tier_at(&self, runtime: &Runtime, provider: &str, model: &str) -> TierKey;
+
+    /// Price a usage sample through the learned price table. None means the
+    /// model is unknown and the caller must fall back conservatively.
+    fn estimate_cost(
+        &self,
+        runtime: &Runtime,
+        provider: &str,
+        model: &str,
+        tier: &TierKey,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal>;
+
+    fn record_success(
+        &self,
+        reservation: Reservation,
+        usage: &TokenUsage,
+        cost: Decimal,
+        attempt: AttemptRecord,
+        record: RequestRecord,
+    );
+
+    fn record_failure(
+        &self,
+        reservation: Reservation,
+        class: UpstreamErrorClass,
+        retry_after: Option<Duration>,
+        window_reset: Option<OffsetDateTime>,
+        attempt: AttemptRecord,
+    );
+
+    /// Persist a request-level row once every attempt has failed.
+    ///
+    /// Attempts are already stored individually; this exists so a total failure
+    /// still shows up in history and usage reports instead of leaving orphaned
+    /// attempt rows behind.
+    fn record_failed_request(&self, _record: RequestRecord) {}
+}
+
+/// Operator reads and mutations: the Board, reports, credentials and config
+/// publication. None of these methods run on the request hot path.
+pub trait OperatorBackend: RuntimeSource {
     /// Every account the pool knows, with its last-known gates.
     ///
     /// What the poller last saw, never a fresh probe. The usage report is read
@@ -252,66 +310,6 @@ pub trait ProxyBackend: Send + Sync + 'static {
             "this backend cannot apply configuration".to_string(),
         ))
     }
-
-    /// Refresh an account's quota reading immediately before switching to it.
-    ///
-    /// A boxed future rather than an async-trait method so the default can be a
-    /// no-op and test backends need no implementation. The real gateway honours
-    /// policy.probe_before_switch; without this call that setting was parsed and
-    /// then never read, so a switch could land on an account that had already
-    /// filled up since the last poll.
-    fn ensure_fresh<'a>(
-        &'a self,
-        _runtime: &'a Runtime,
-        _provider: &'a str,
-        _account_id: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async {})
-    }
-
-    fn retry_after_for(&self, provider: &str) -> Option<Duration>;
-
-    fn http(&self, runtime: &Runtime) -> reqwest::Client;
-
-    /// Which price window a request starting now falls into.
-    fn tier_at(&self, runtime: &Runtime, provider: &str, model: &str) -> TierKey;
-
-    /// Price a usage sample through the learned price table. None means the
-    /// model is unknown and the caller must fall back conservatively.
-    fn estimate_cost(
-        &self,
-        runtime: &Runtime,
-        provider: &str,
-        model: &str,
-        tier: &TierKey,
-        usage: &TokenUsage,
-        multiplier: Decimal,
-    ) -> Option<Decimal>;
-
-    fn record_success(
-        &self,
-        reservation: Reservation,
-        usage: &TokenUsage,
-        cost: Decimal,
-        attempt: AttemptRecord,
-        record: RequestRecord,
-    );
-
-    fn record_failure(
-        &self,
-        reservation: Reservation,
-        class: UpstreamErrorClass,
-        retry_after: Option<Duration>,
-        window_reset: Option<OffsetDateTime>,
-        attempt: AttemptRecord,
-    );
-
-    /// Persist a request-level row once every attempt has failed.
-    ///
-    /// Attempts are already stored individually; this exists so a total failure
-    /// still shows up in history and usage reports instead of leaving orphaned
-    /// attempt rows behind.
-    fn record_failed_request(&self, _record: RequestRecord) {}
 }
 
 /// Production wiring: a thin adapter over the frozen Gateway API.
@@ -325,11 +323,13 @@ impl GatewayBackend {
     }
 }
 
-impl ProxyBackend for GatewayBackend {
+impl RuntimeSource for GatewayBackend {
     fn runtime(&self) -> Arc<Runtime> {
         self.gateway.runtime()
     }
+}
 
+impl RequestBackend for GatewayBackend {
     fn resolve(&self, runtime: &Runtime, client_model: &str) -> Result<ResolvedRoute> {
         runtime.resolve(client_model)
     }
@@ -379,6 +379,75 @@ impl ProxyBackend for GatewayBackend {
         self.gateway.pool.account(qualified_id)
     }
 
+    fn ensure_fresh<'a>(
+        &'a self,
+        runtime: &'a Runtime,
+        provider: &'a str,
+        account_id: &'a str,
+    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.gateway
+                .ensure_fresh(runtime, provider, account_id)
+                .await;
+        })
+    }
+
+    fn retry_after_for(&self, provider: &str) -> Option<Duration> {
+        self.gateway.pool.retry_after_for(provider)
+    }
+
+    fn http(&self, runtime: &Runtime) -> reqwest::Client {
+        runtime.http().clone()
+    }
+
+    fn tier_at(&self, runtime: &Runtime, provider: &str, model: &str) -> TierKey {
+        runtime.tier_at(provider, model, crate::domain::now())
+    }
+
+    fn estimate_cost(
+        &self,
+        runtime: &Runtime,
+        provider: &str,
+        model: &str,
+        tier: &TierKey,
+        usage: &TokenUsage,
+        multiplier: Decimal,
+    ) -> Option<Decimal> {
+        runtime
+            .prices()
+            .estimate(provider, model, tier, usage, multiplier)
+    }
+
+    fn record_success(
+        &self,
+        reservation: Reservation,
+        usage: &TokenUsage,
+        cost: Decimal,
+        attempt: AttemptRecord,
+        record: RequestRecord,
+    ) {
+        self.gateway
+            .record_success(reservation, usage, cost, attempt, record);
+    }
+
+    fn record_failure(
+        &self,
+        reservation: Reservation,
+        class: UpstreamErrorClass,
+        retry_after: Option<Duration>,
+        window_reset: Option<OffsetDateTime>,
+        attempt: AttemptRecord,
+    ) {
+        self.gateway
+            .record_failure(reservation, class, retry_after, window_reset, attempt);
+    }
+
+    fn record_failed_request(&self, record: RequestRecord) {
+        self.gateway.record_failed_request(record);
+    }
+}
+
+impl OperatorBackend for GatewayBackend {
     fn snapshot(&self) -> Vec<Account> {
         self.gateway.snapshot()
     }
@@ -616,73 +685,6 @@ impl ProxyBackend for GatewayBackend {
         }
         Ok(())
     }
-
-    fn ensure_fresh<'a>(
-        &'a self,
-        runtime: &'a Runtime,
-        provider: &'a str,
-        account_id: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            self.gateway
-                .ensure_fresh(runtime, provider, account_id)
-                .await;
-        })
-    }
-
-    fn retry_after_for(&self, provider: &str) -> Option<Duration> {
-        self.gateway.pool.retry_after_for(provider)
-    }
-
-    fn http(&self, runtime: &Runtime) -> reqwest::Client {
-        runtime.http().clone()
-    }
-
-    fn tier_at(&self, runtime: &Runtime, provider: &str, model: &str) -> TierKey {
-        runtime.tier_at(provider, model, crate::domain::now())
-    }
-
-    fn estimate_cost(
-        &self,
-        runtime: &Runtime,
-        provider: &str,
-        model: &str,
-        tier: &TierKey,
-        usage: &TokenUsage,
-        multiplier: Decimal,
-    ) -> Option<Decimal> {
-        runtime
-            .prices()
-            .estimate(provider, model, tier, usage, multiplier)
-    }
-
-    fn record_success(
-        &self,
-        reservation: Reservation,
-        usage: &TokenUsage,
-        cost: Decimal,
-        attempt: AttemptRecord,
-        record: RequestRecord,
-    ) {
-        self.gateway
-            .record_success(reservation, usage, cost, attempt, record);
-    }
-
-    fn record_failure(
-        &self,
-        reservation: Reservation,
-        class: UpstreamErrorClass,
-        retry_after: Option<Duration>,
-        window_reset: Option<OffsetDateTime>,
-        attempt: AttemptRecord,
-    ) {
-        self.gateway
-            .record_failure(reservation, class, retry_after, window_reset, attempt);
-    }
-
-    fn record_failed_request(&self, record: RequestRecord) {
-        self.gateway.record_failed_request(record);
-    }
 }
 
 /// Run the proxy and the console until shutdown.
@@ -811,16 +813,22 @@ pub fn build_router(gateway: Arc<Gateway>) -> axum::Router {
 }
 
 /// Build the router against any backend. Exposed for integration tests.
-pub fn build_router_with(backend: Arc<dyn ProxyBackend>) -> axum::Router {
+pub fn build_router_with<B>(backend: Arc<B>) -> axum::Router
+where
+    B: RequestBackend + OperatorBackend + 'static,
+{
     build_router_with_console(backend, console::ConsoleContext::for_tests())
 }
 
 /// Build the router with the listener context the console needs. Production
 /// passes the bound address; tests pass an ephemeral one.
-pub(crate) fn build_router_with_console(
-    backend: Arc<dyn ProxyBackend>,
+pub(crate) fn build_router_with_console<B>(
+    backend: Arc<B>,
     console: console::ConsoleContext,
-) -> axum::Router {
+) -> axum::Router
+where
+    B: RequestBackend + OperatorBackend + 'static,
+{
     // Authentication and the body limit are startup decisions: they follow the
     // snapshot installed when the listener was assembled, not a later publish.
     let runtime = backend.runtime();
@@ -854,8 +862,11 @@ pub(crate) fn build_router_with_console(
             }
         },
     };
+    let request: Arc<dyn RequestBackend> = backend.clone();
+    let operator: Arc<dyn OperatorBackend> = backend;
     let state = Arc::new(AppState {
-        backend,
+        request,
+        operator,
         auth,
         console,
     });
@@ -907,7 +918,8 @@ pub(crate) fn build_router_with_console(
 }
 
 struct AppState {
-    backend: Arc<dyn ProxyBackend>,
+    request: Arc<dyn RequestBackend>,
+    operator: Arc<dyn OperatorBackend>,
     auth: LocalAuth,
     console: console::ConsoleContext,
 }

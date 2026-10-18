@@ -34,7 +34,7 @@ pub(super) async fn usage(
     State(state): State<Arc<AppState>>,
     Query(query): Query<UsageQuery>,
 ) -> Response {
-    let accounts = state.backend.snapshot();
+    let accounts = state.operator.snapshot();
     let scope = Scope {
         provider: query.provider.as_deref(),
         account: query.account.as_deref(),

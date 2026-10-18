@@ -9,7 +9,7 @@
 use crate::config::{Config, ConfigViolation};
 use crate::config_doc::{self, ConfigDocument, DiffLine, DraftAction, DraftError};
 use crate::editable::FieldClass;
-use crate::http::ProxyBackend;
+use crate::http::OperatorBackend;
 use crate::http::console::ConsoleContext;
 use std::path::Path;
 
@@ -188,7 +188,7 @@ fn scope_refusals(actions: &[DraftAction]) -> Vec<String> {
 /// Commit a prepared edit under the apply lock. This is the only place that
 /// writes the file, publishes a snapshot and records ReloadState.
 pub async fn commit(
-    backend: &dyn ProxyBackend,
+    backend: &dyn OperatorBackend,
     console: &ConsoleContext,
     path: &Path,
     prepared: &Prepared,

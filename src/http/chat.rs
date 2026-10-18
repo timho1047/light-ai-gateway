@@ -19,7 +19,7 @@
 //!      and records the request when the stream ends or the client goes away.
 
 use super::{
-    AppState, ProxyBackend, error_response, error_response_retry, read_bounded,
+    AppState, RequestBackend, error_response, error_response_retry, read_bounded,
     upstream_error_message,
 };
 use crate::accounts::{AttemptPlan, PlanError, Reservation};
@@ -72,7 +72,7 @@ pub(super) async fn chat_completions(
 ) -> Response {
     // One snapshot for the whole request: routing, retries, timeouts and the
     // price it settles at all come from the configuration that admitted it.
-    let runtime = state.backend.runtime();
+    let runtime = state.request.runtime();
 
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
         return error_response(
@@ -109,7 +109,7 @@ pub(super) async fn chat_completions(
     // Captured outside the retry loop so a total failure can still be recorded.
     let request_started = now();
 
-    let route = match state.backend.resolve(&runtime, &client_model) {
+    let route = match state.request.resolve(&runtime, &client_model) {
         Ok(route) => route,
         Err(e) => {
             return error_response(
@@ -122,7 +122,7 @@ pub(super) async fn chat_completions(
 
     let estimated_prompt_tokens = crate::meter::estimate_prompt_tokens(&value);
     let est_cost = estimate_request_cost(
-        state.backend.as_ref(),
+        state.request.as_ref(),
         &runtime,
         &route.provider,
         &route.model,
@@ -159,7 +159,7 @@ pub(super) async fn chat_completions(
     let mut previous_account: Option<String> = None;
 
     while attempt_no <= max_attempts {
-        let reservation = match state.backend.plan(
+        let reservation = match state.request.plan(
             &runtime,
             &client_model,
             session_key.as_deref(),
@@ -169,7 +169,7 @@ pub(super) async fn chat_completions(
             &tried,
         ) {
             Ok((_route, reservation)) => reservation,
-            Err(err) => return plan_error_response(&err, state.backend.as_ref()),
+            Err(err) => return plan_error_response(&err, state.request.as_ref()),
         };
         // Switching accounts is worth one extra round trip: it happens only
         // after the previous account has already failed, so the client is
@@ -180,7 +180,7 @@ pub(super) async fn chat_completions(
             && previous != qualified
         {
             state
-                .backend
+                .request
                 .ensure_fresh(&runtime, &reservation.provider, &reservation.account_id)
                 .await;
         }
@@ -195,7 +195,7 @@ pub(super) async fn chat_completions(
         // or the client hanging up while we wait -- gives the commitment back
         // through the reservation's Drop.
 
-        let Some(account) = state.backend.account(&reservation.qualified_account()) else {
+        let Some(account) = state.request.account(&reservation.qualified_account()) else {
             tracing::error!(account = %reservation.account_id, "the planned account vanished from the pool");
             // Release the reservation that select() just committed. Returning
             // without recording the attempt left an estimate committed against
@@ -203,7 +203,7 @@ pub(super) async fn chat_completions(
             // in the hard gate would keep counting it for the life of the
             // process -- shrinking the headroom every later request sees.
             record_attempt_failure(
-                state.backend.as_ref(),
+                state.request.as_ref(),
                 reservation,
                 UpstreamErrorClass::Other,
                 None,
@@ -227,7 +227,7 @@ pub(super) async fn chat_completions(
         let started_at = now();
         let started = Instant::now();
         let request = state
-            .backend
+            .request
             .http(&runtime)
             .post(&url)
             .bearer_auth(account.api_key.expose())
@@ -255,7 +255,7 @@ pub(super) async fn chat_completions(
                 }
                 .classify();
                 record_attempt_failure(
-                    state.backend.as_ref(),
+                    state.request.as_ref(),
                     reservation,
                     class,
                     None,
@@ -286,7 +286,7 @@ pub(super) async fn chat_completions(
             Err(_) => {
                 let class = UpstreamErrorClass::Timeout;
                 record_attempt_failure(
-                    state.backend.as_ref(),
+                    state.request.as_ref(),
                     reservation,
                     class,
                     None,
@@ -336,7 +336,7 @@ pub(super) async fn chat_completions(
             // and passing the bare id meant this never matched anything, so the
             // probe-confirmed "the window is spent" branch was unreachable.
             let window_exhausted_hint = state
-                .backend
+                .request
                 .account(&reservation.qualified_account())
                 .map(|acct| {
                     acct.covered_gates()
@@ -360,7 +360,7 @@ pub(super) async fn chat_completions(
             // updated.
             let provider = reservation.provider.clone();
             record_attempt_failure(
-                state.backend.as_ref(),
+                state.request.as_ref(),
                 reservation,
                 class,
                 retry_after,
@@ -380,7 +380,7 @@ pub(super) async fn chat_completions(
             } else {
                 status_for_class(class)
             };
-            let client_retry = retry_after.or_else(|| state.backend.retry_after_for(&provider));
+            let client_retry = retry_after.or_else(|| state.request.retry_after_for(&provider));
             last_failure = Some(Failure {
                 status: client_status,
                 kind: class,
@@ -424,7 +424,7 @@ pub(super) async fn chat_completions(
         // body never had.
         let is_sse = content_type.contains("text/event-stream");
         let finalizer = Finalizer {
-            backend: state.backend.clone(),
+            backend: state.request.clone(),
             runtime: runtime.clone(),
             reservation,
             request_id: request_id.clone(),
@@ -472,10 +472,10 @@ pub(super) async fn chat_completions(
             // Every attempt failed. Record the request itself so failures show
             // up in history instead of existing only as orphaned attempt rows.
             if let Some(plan) = last_plan.as_ref()
-                && let Some(account) = state.backend.account(&plan.qualified_account())
+                && let Some(account) = state.request.account(&plan.qualified_account())
             {
                 let total_ms = (now() - request_started).whole_milliseconds().max(0) as u64;
-                state.backend.record_failed_request(RequestRecord {
+                state.request.record_failed_request(RequestRecord {
                     request_id: request_id.clone(),
                     ts: request_started,
                     session_key: session_key.clone(),
@@ -542,7 +542,7 @@ fn status_for_class(class: UpstreamErrorClass) -> StatusCode {
     }
 }
 
-fn plan_error_response(err: &PlanError, backend: &dyn ProxyBackend) -> Response {
+fn plan_error_response(err: &PlanError, backend: &dyn RequestBackend) -> Response {
     match err {
         PlanError::NoEligibleAccount {
             provider,
@@ -573,7 +573,7 @@ fn plan_error_response(err: &PlanError, backend: &dyn ProxyBackend) -> Response 
 // same list one line up without making anything clearer.
 #[allow(clippy::too_many_arguments)]
 fn record_attempt_failure(
-    backend: &dyn ProxyBackend,
+    backend: &dyn RequestBackend,
     reservation: Reservation,
     class: UpstreamErrorClass,
     retry_after: Option<Duration>,
@@ -603,7 +603,7 @@ fn record_attempt_failure(
 }
 
 fn estimate_request_cost(
-    backend: &dyn ProxyBackend,
+    backend: &dyn RequestBackend,
     runtime: &Runtime,
     provider: &str,
     model: &str,
@@ -665,7 +665,7 @@ fn provider_request_id(headers: &HeaderMap) -> Option<String> {
 /// upstream has already produced (and billed) whatever was streamed, so
 /// dropping the partial usage on the floor would understate the ledger.
 pub(super) struct Finalizer {
-    pub(super) backend: Arc<dyn ProxyBackend>,
+    pub(super) backend: Arc<dyn RequestBackend>,
     /// The snapshot that admitted this attempt; settlement prices from it.
     pub(super) runtime: Arc<Runtime>,
     /// The attempt's commitment. The relay settles it when the body ends, and
