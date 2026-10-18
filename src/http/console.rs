@@ -807,10 +807,10 @@ pub(super) async fn keys_test(
                 crate::keys::KeyTestOutcome::NoProbe { chars } => {
                     s.keys_test_no_probe.replacen("{}", &chars.to_string(), 1)
                 }
-                crate::keys::KeyTestOutcome::Probed { probe, gates } => s
+                crate::keys::KeyTestOutcome::Probed { probe, gates, .. } => s
                     .keys_test_probed
                     .replacen("{}", &probe, 1)
-                    .replacen("{}", &gates.to_string(), 1),
+                    .replacen("{}", &gates.len().to_string(), 1),
             };
             (
                 StatusCode::OK,

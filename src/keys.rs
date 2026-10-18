@@ -6,6 +6,7 @@
 //! compared without branching on content.
 
 use crate::config::{Config, SecretRef};
+use crate::domain::Gate;
 use crate::secrets::{CredentialStore, LOCAL_KEY_ACCOUNT, LOCAL_KEY_PROVIDER};
 use anyhow::{Context, Result, bail};
 
@@ -159,7 +160,7 @@ pub fn remove(creds: &CredentialStore, provider: &str, account: &str) -> Result<
 }
 
 /// What a credential test proved.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum KeyTestOutcome {
     /// The gateway's own access token: no provider has heard of it, so its
     /// presence and length are the whole check.
@@ -167,8 +168,12 @@ pub enum KeyTestOutcome {
     /// A provider key resolved, but this provider exposes no quota endpoint to
     /// prove it against.
     NoProbe { chars: usize },
-    /// The provider answered and read this many gates.
-    Probed { probe: String, gates: usize },
+    /// The provider answered and read these gates, in this currency.
+    Probed {
+        probe: String,
+        gates: Vec<Gate>,
+        currency: String,
+    },
 }
 
 /// Resolve one credential and, when the provider has a quota endpoint, prove it.
@@ -235,7 +240,8 @@ pub async fn probe(
         Ok(Err(error)) => bail!("{}", error.message),
         Ok(Ok(outcome)) => Ok(KeyTestOutcome::Probed {
             probe: quota_probe.name().to_string(),
-            gates: outcome.gates.len(),
+            gates: outcome.gates,
+            currency: modelled.currency,
         }),
     }
 }

@@ -4,7 +4,7 @@ use super::probe_client;
 use super::status::board_amount;
 use super::{KeysArgs, KeysCommand};
 use crate::ansi::Palette;
-use crate::config::{Config, SecretRef};
+use crate::config::Config;
 use crate::domain::{Gate, GateClass, GateKind};
 use crate::secrets::{CredentialStore, LOCAL_KEY_ACCOUNT, LOCAL_KEY_PROVIDER};
 use anyhow::{Context, Result, bail};
@@ -149,6 +149,10 @@ fn local_token_status(creds: &CredentialStore) -> Result<Option<usize>> {
 }
 
 /// Resolve the stored credential and prove it works against the provider.
+///
+/// The account model, credential resolution, client policy and bounded probe
+/// all live in keys::probe; this function only prints the outcome in the
+/// terminal's established layout.
 async fn cmd_keys_test(
     config: &Config,
     creds: &CredentialStore,
@@ -156,15 +160,11 @@ async fn cmd_keys_test(
     account: &str,
     pal: &Palette,
 ) -> Result<()> {
-    // The gateway's own access token guards this process's port; no provider has
-    // ever heard of it, so there is nothing to probe. Its status is the whole
-    // check, and saying that is better than "unknown provider".
     if provider == LOCAL_KEY_PROVIDER && account == LOCAL_KEY_ACCOUNT {
         return match local_token_status(creds)? {
             Some(length) => {
                 println!(
-                    "{provider}/{account}: {} - stored ({length} chars); this is the token \
-                     clients must send in Authorization",
+                    "{provider}/{account}: {} - stored ({length} chars); this is the token                      clients must send in Authorization",
                     pal.green("ok")
                 );
                 Ok(())
@@ -173,73 +173,45 @@ async fn cmd_keys_test(
         };
     }
 
-    let p = config
-        .providers
-        .get(provider)
-        .with_context(|| format!("unknown provider {provider:?}"))?;
-    let account_cfg = p
-        .accounts
-        .get(account)
-        .with_context(|| format!("unknown account {account:?} under provider {provider:?}"))?;
-
-    // Build just this one account so the test cannot be satisfied by another
-    // account's credential.
-    let secret_ref = account_cfg.key.clone().unwrap_or(SecretRef::Keychain);
-    let key = secret_ref
-        .resolve(creds, provider, account)
-        .with_context(|| format!("resolving the credential for {provider}/{account}"))?;
-
-    let Some(probe) = crate::quota::probe_for(p.adapter, &p.probe_base()) else {
-        println!(
-            "{provider}/{account}: credential found ({} chars), but this provider has no quota probe to test against",
-            key.expose().len()
-        );
-        return Ok(());
-    };
-
-    let account_model = crate::domain::Account {
-        id: account.to_string(),
-        provider: provider.to_string(),
-        label: account_cfg
-            .label
-            .clone()
-            .unwrap_or_else(|| account.to_string()),
-        base_url: p.base_url.trim_end_matches('/').to_string(),
-        api_key: key,
-        currency: account_cfg
-            .currency
-            .clone()
-            .unwrap_or_else(|| p.currency.clone()),
-        gates: Vec::new(),
-        state: crate::domain::AccountState::Unknown,
-        available_at: None,
-        window_started_at: None,
-        credit_multiplier: rust_decimal::Decimal::ONE,
-        rpm_limit: None,
-        concurrency_limit: None,
-        allow_metered: None,
-        last_probe_at: None,
-        last_error: None,
-    };
-
     let client = probe_client(config)?;
-
-    match probe.probe(&account_model, &client).await {
-        Ok(outcome) => {
+    match crate::keys::probe(
+        config,
+        creds,
+        provider,
+        account,
+        &client,
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    {
+        Ok(crate::keys::KeyTestOutcome::LocalToken { chars }) => {
             println!(
-                "{provider}/{account}: {} - {} credentials accepted, {} gates read",
-                pal.green("ok"),
-                probe.name(),
-                outcome.gates.len()
-            );
-            println!(
-                "{}",
-                gate_reading(&outcome.gates, &account_model.currency, pal)
+                "{provider}/{account}: {} - stored ({chars} chars); this is the token                  clients must send in Authorization",
+                pal.green("ok")
             );
             Ok(())
         }
-        Err(e) => {
-            println!("{provider}/{account}: {} - {e}", pal.red("FAILED"));
+        Ok(crate::keys::KeyTestOutcome::NoProbe { chars }) => {
+            println!(
+                "{provider}/{account}: credential found ({chars} chars), but this provider                  has no quota probe to test against"
+            );
+            Ok(())
+        }
+        Ok(crate::keys::KeyTestOutcome::Probed {
+            probe,
+            gates,
+            currency,
+        }) => {
+            println!(
+                "{provider}/{account}: {} - {probe} credentials accepted, {} gates read",
+                pal.green("ok"),
+                gates.len()
+            );
+            println!("{}", gate_reading(&gates, &currency, pal));
+            Ok(())
+        }
+        Err(error) => {
+            println!("{provider}/{account}: {} - {error}", pal.red("FAILED"));
             bail!("the stored credential was rejected or the probe endpoint is unreachable")
         }
     }

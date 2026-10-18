@@ -471,9 +471,10 @@ impl ProxyBackend for FakeBackend {
                 };
             }
             match self.credentials.get(provider, account) {
-                Ok(Some(key)) => Ok(crate::keys::KeyTestOutcome::Probed {
+                Ok(Some(_)) => Ok(crate::keys::KeyTestOutcome::Probed {
                     probe: "mock".to_string(),
-                    gates: key.expose().len().max(1),
+                    gates: Vec::new(),
+                    currency: "USD".to_string(),
                 }),
                 _ => Err(crate::http::ApplyError(
                     "the credential is missing or could not be resolved".to_string(),
