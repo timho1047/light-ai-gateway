@@ -1325,13 +1325,14 @@ async fn a_published_snapshot_does_not_reprice_an_in_flight_request() {
 /// the console's Host allowlist pins the port the kernel actually gave us,
 /// and the service carries peer addresses the guard can read.
 async fn spawn_console_router(backend: Arc<dyn ProxyBackend>) -> String {
+    spawn_console_router_with(backend, "/tmp/lgw-test-config.toml").await
+}
+
+/// The same router, with the configuration file path the config page describes.
+async fn spawn_console_router_with(backend: Arc<dyn ProxyBackend>, config_path: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let console = super::console::ConsoleContext::new(
-        &addr.to_string(),
-        addr.port(),
-        "/tmp/lgw-test-config.toml",
-    );
+    let console = super::console::ConsoleContext::new(&addr.to_string(), addr.port(), config_path);
     let app = build_router_with_console(backend, console);
     tokio::spawn(async move {
         let _ = axum::serve(
@@ -1511,5 +1512,93 @@ async fn the_console_is_not_behind_the_local_key() {
             .unwrap()
             .status(),
         200
+    );
+}
+
+#[tokio::test]
+async fn the_configuration_page_shows_the_file_with_literals_redacted() {
+    let toml = r#"
+[server]
+listen = "127.0.0.1:8787"
+
+[policy]
+soft_threshold = 0.75
+
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-file-SECRET"
+label = "file account"
+
+[routes]
+"mock/model" = "mock"
+
+[prices.mock."mock/model"]
+input = 0.15
+output = 0.60
+"#;
+    let config = Config::from_toml_str(toml).expect("config");
+    let accounts = config
+        .build_accounts(&crate::secrets::CredentialStore::memory())
+        .unwrap();
+    let pool = Pool::new(accounts, &config.policy);
+    activate(&pool, "mock/a1", 0);
+    let fake = Arc::new(FakeBackend::new(config, pool));
+
+    let dir = std::env::temp_dir().join(format!("lgw-config-page-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, toml).unwrap();
+
+    let addr = spawn_console_router_with(fake, path.to_str().unwrap()).await;
+    let client = reqwest::Client::new();
+    let page = client.get(format!("{addr}/config")).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains("Configuration"));
+    assert!(html.contains("server.listen"));
+    assert!(html.contains("policy.soft_threshold"));
+    assert!(html.contains("restart required"));
+    assert!(html.contains("applies live"));
+    assert!(html.contains("inline-literal"), "the key source is named");
+    assert!(
+        !html.contains("sk-file-SECRET"),
+        "the literal value is never printed"
+    );
+    assert!(
+        html.contains("&lt;redacted&gt;"),
+        "the raw view carries a redacted value"
+    );
+    assert!(html.contains(&path.display().to_string()));
+
+    let chinese = client
+        .get(format!("{addr}/config?lang=zh"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(chinese.contains("配置"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_unreadable_configuration_file_is_a_banner_not_a_crash() {
+    let addr = spawn_console_router_with(
+        fake_backend("http://127.0.0.1:1"),
+        "/tmp/lgw-no-such-config-file.toml",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let page = client.get(format!("{addr}/config")).send().await.unwrap();
+    assert_eq!(page.status(), 200);
+    let html = page.text().await.unwrap();
+    assert!(html.contains("could not be read"));
+    assert!(
+        !html.contains("raw TOML"),
+        "no raw view without a readable file"
     );
 }

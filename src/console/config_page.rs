@@ -15,7 +15,7 @@ pub struct ConfigView<'a> {
     pub path: &'a str,
     pub fingerprint: &'a str,
     pub last_applied: &'a str,
-    pub raw: &'a str,
+    pub raw: Option<&'a str>,
     pub lang: Lang,
 }
 
@@ -128,7 +128,7 @@ pub fn render(view: &ConfigView) -> String {
                 "allow_metered",
                 &cfg.allow_metered
                     .map(flag)
-                    .unwrap_or_else(|| "follows policy".to_string()),
+                    .unwrap_or_else(|| s.follows_policy.to_string()),
                 true,
                 s,
             );
@@ -202,7 +202,9 @@ pub fn render(view: &ConfigView) -> String {
         }
     }));
 
-    out.push_str(&raw_section(view, s));
+    if let Some(raw) = view.raw {
+        out.push_str(&raw_section(raw, s));
+    }
     out
 }
 
@@ -225,17 +227,18 @@ fn header(view: &ConfigView, s: &Strings) -> String {
     )
 }
 
-fn raw_section(view: &ConfigView, s: &Strings) -> String {
+fn raw_section(raw: &str, s: &Strings) -> String {
     format!(
         r#"<section class="section">
   <div class="section-head">
-    <h2 class="section-title">raw TOML</h2>
+    <h2 class="section-title">{}</h2>
     <p class="lede">{}</p>
   </div>
   <pre class="raw-toml">{}</pre>
 </section>"#,
+        esc(s.config_raw_title),
         esc(s.config_rawnote),
-        esc(view.raw),
+        esc(raw),
     )
 }
 
@@ -323,7 +326,7 @@ fn account_fields(out: &mut String, account: &AccountConfig, provider_currency: 
         &account
             .allow_metered
             .map(flag)
-            .unwrap_or_else(|| "follows provider".to_string()),
+            .unwrap_or_else(|| s.follows_provider.to_string()),
         true,
         s,
     );
@@ -367,7 +370,7 @@ mod tests {
             path: "/home/op/.light-ai-gateway/config.toml",
             fingerprint: "fnv64:deadbeef",
             last_applied: "2m ago",
-            raw,
+            raw: Some(raw),
             lang: Lang::En,
         }
     }

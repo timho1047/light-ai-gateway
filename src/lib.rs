@@ -5,6 +5,7 @@ pub mod accounts;
 pub mod ansi;
 pub mod cli;
 pub mod config;
+pub mod config_doc;
 pub mod console;
 pub mod domain;
 pub mod error;

@@ -418,6 +418,7 @@ pub(crate) fn build_router_with_console(
     // configuration from the network. A request never passes through both.
     let operator = Router::new()
         .route("/", get(console::board_page))
+        .route("/config", get(console::config_page_handler))
         .route("/console/partials/board", get(console::board_partial))
         .route("/console/assets/{*path}", get(console::asset))
         .layer(middleware::from_fn_with_state(

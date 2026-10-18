@@ -8,7 +8,8 @@
 
 use super::AppState;
 use crate::console::guard::{self, Verdict};
-use crate::console::{assets, board, copy::Lang, layout, layout::Nav};
+use crate::console::layout::esc;
+use crate::console::{assets, board, config_page, copy::Lang, layout, layout::Nav};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -26,6 +27,10 @@ pub struct ConsoleContext {
     pub listen: String,
     pub port: u16,
     pub config_path: String,
+    /// When this process loaded the file its pages describe. The read-only
+    /// configuration page reports it as the last applied time until a real
+    /// apply engine exists.
+    pub started_at: time::OffsetDateTime,
 }
 
 impl ConsoleContext {
@@ -34,6 +39,7 @@ impl ConsoleContext {
             listen: listen.to_string(),
             port,
             config_path: config_path.to_string(),
+            started_at: crate::domain::now(),
         }
     }
 
@@ -95,6 +101,52 @@ fn board_html(state: &AppState, lang: Lang) -> String {
         drift: &drift,
     };
     board::render(&input, crate::domain::now(), lang)
+}
+
+/// The read-only configuration page: the file the gateway started from, its
+/// fingerprint, every known value with its live/restart marker, and a raw view
+/// with literal credentials replaced.
+pub(super) async fn config_page_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LangQuery>,
+) -> Response {
+    let lang = query.lang();
+    let strings = lang.strings();
+    let runtime = state.backend.runtime();
+    let path = state.console.config_path.clone();
+
+    let (fingerprint, raw, mut body) =
+        match crate::config_doc::ConfigDocument::read(std::path::Path::new(&path)) {
+            Ok(document) => (
+                document.fingerprint(),
+                Some(document.redacted()),
+                String::new(),
+            ),
+            Err(error) => {
+                let message = format!("{} {error}", strings.config_unreadable);
+                let banner = format!("<div class=\"banner error\"><b>{}</b></div>", esc(&message));
+                (String::from("—"), None, banner)
+            }
+        };
+
+    let started = state
+        .console
+        .started_at
+        .replace_nanosecond(0)
+        .unwrap_or(state.console.started_at);
+    let last_applied = started
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let view = config_page::ConfigView {
+        config: runtime.config(),
+        path: &path,
+        fingerprint: &fingerprint,
+        last_applied: &last_applied,
+        raw: raw.as_deref(),
+        lang,
+    };
+    body.push_str(&config_page::render(&view));
+    page(&state, lang, Nav::Config, body)
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the
