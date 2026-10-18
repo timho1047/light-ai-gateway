@@ -356,6 +356,13 @@
             path: JSON.parse(removers[r].getAttribute("data-path"))
           });
         }
+        var entityRemovers = form.querySelectorAll("[data-remove-action].is-armed");
+        for (var er = 0; er < entityRemovers.length; er++) {
+          entries.push(Object.assign(
+            { action: entityRemovers[er].getAttribute("data-remove-action") },
+            JSON.parse(entityRemovers[er].getAttribute("data-payload"))
+          ));
+        }
         var addForms = form.querySelectorAll("[data-add-account]");
         for (var a = 0; a < addForms.length; a++) {
           var details = addForms[a];
@@ -371,6 +378,27 @@
             key_source: details.querySelector('[data-add-field="source"]').value,
             key_value: value ? value.value.trim() : ""
           });
+        }
+
+        // Routes, aliases, prices and schedules share one add-form shape: a
+        // fixed part names where the row goes, the fields name the values.
+        var entityForms = form.querySelectorAll("[data-add-form]");
+        for (var e = 0; e < entityForms.length; e++) {
+          var box = entityForms[e];
+          var entry = JSON.parse(box.getAttribute("data-static") || "{}");
+          var required = box.getAttribute("data-required");
+          var inputs = box.querySelectorAll("[data-add-field]");
+          var filled = {};
+          for (var i2 = 0; i2 < inputs.length; i2++) {
+            var name = inputs[i2].getAttribute("data-add-field");
+            var text = inputs[i2].value.trim();
+            if (!text) { continue; }
+            filled[name] = (name === "input" || name === "output" || name === "cache_read")
+              ? Number(text)
+              : text;
+          }
+          if (!filled[required]) { continue; }
+          entries.push(Object.assign({ action: box.getAttribute("data-kind") }, entry, filled));
         }
         return entries;
       }
@@ -434,7 +462,7 @@
           send(applyButton);
         });
       }
-      var removers = form.querySelectorAll("[data-account-remove]");
+      var removers = form.querySelectorAll("[data-account-remove], [data-remove-action]");
       for (var r = 0; r < removers.length; r++) {
         (function (button) {
           button.addEventListener("click", function () {

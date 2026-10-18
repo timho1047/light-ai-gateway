@@ -1593,3 +1593,27 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
     grid-template-columns: 1fr;
   }
 }
+
+.table td {
+  vertical-align: middle;
+}
+
+.table-input {
+  width: 100%;
+  min-width: 140px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.table-input:focus {
+  outline: none;
+  border-color: var(--ink);
+}
+
+.table td .btn-small {
+  white-space: nowrap;
+}

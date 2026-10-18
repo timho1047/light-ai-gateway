@@ -301,7 +301,7 @@ impl ProxyBackend for GatewayBackend {
     ) -> std::result::Result<(), ApplyError> {
         let current = self.gateway.runtime();
         let reset_providers = providers_needing_reset(current.config(), &config);
-        let prices = current.prices_arc();
+        let prices = Arc::new(current.prices().reseeded(&config.prices));
         let runtime = Runtime::new(Arc::new(config.clone()), prices)
             .map_err(|error| ApplyError(error.to_string()))?;
 

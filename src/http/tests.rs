@@ -411,7 +411,8 @@ impl ProxyBackend for FakeBackend {
     ) -> std::result::Result<(), crate::http::ApplyError> {
         let reset_providers =
             crate::http::providers_needing_reset(self.runtime().config(), &config);
-        let runtime = runtime_for(&config);
+        let prices = Arc::new(self.runtime().prices().reseeded(&config.prices));
+        let runtime = Arc::new(Runtime::new(Arc::new(config.clone()), prices).unwrap());
         let (mut accounts, unusable) = config
             .build_accounts_lenient(&crate::secrets::CredentialStore::memory())
             .map_err(|error| crate::http::ApplyError(error.to_string()))?;
@@ -1908,16 +1909,12 @@ async fn a_restart_only_apply_is_refused_by_name_and_writes_nothing() {
 async fn an_apply_of_a_section_without_a_live_path_is_refused_and_writes_nothing() {
     let (addr, _fake, path, dir) = apply_router().await;
     let before = std::fs::read(&path).unwrap();
-    // Routes still have no live apply path; this must be refused by name even
-    // though the draft itself is a valid document edit.
-    let response = post_apply(
-        &addr,
-        &apply_body(&["routes", "mock/model"], "another-provider"),
-    )
-    .await;
+    // A section the console does not manage has no live apply path; the
+    // request is refused by name rather than written and ignored.
+    let response = post_apply(&addr, &apply_body(&["no_such_section", "field"], "value")).await;
     assert_eq!(response.status(), 422);
     let html = response.text().await.unwrap();
-    assert!(html.contains("routes.mock/model"));
+    assert!(html.contains("no_such_section.field"));
     assert!(html.contains("cannot be applied"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2305,5 +2302,285 @@ async fn the_configuration_page_offers_account_add_and_remove() {
     assert!(html.contains("data-account-remove"));
     assert!(html.contains("Add an account"));
     assert!(html.contains("Remove account"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const ROUTES_TOML: &str = r#"[server]
+listen = "127.0.0.1:8787"
+
+[policy]
+max_retries = 2
+
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-mock-a1"
+
+[providers.alt]
+adapter = "none"
+base_url = "http://127.0.0.1:2/v1"
+
+[providers.alt.accounts.a1]
+key = "sk-alt-a1"
+
+[routes]
+"mock/model" = "mock"
+
+[provider_prefix_aliases]
+"alias" = "mock"
+
+[prices.mock."mock/model"]
+input = 0.15
+output = 0.60
+
+[[prices.mock."mock/model".schedules]]
+name = "peak"
+days = "*"
+hours = "00:00-23:59"
+tz = "UTC"
+input = 0.30
+output = 1.20
+"#;
+
+async fn routes_router() -> (
+    String,
+    Arc<FakeBackend>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let config = Config::from_toml_str(ROUTES_TOML).expect("valid config");
+    let fake = fake_backend_with_config(config);
+    let dir = std::env::temp_dir().join(format!(
+        "lgw-routes-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, ROUTES_TOML).unwrap();
+    let addr = spawn_console_router_with(fake.clone(), path.to_str().unwrap()).await;
+    (addr, fake, path, dir)
+}
+
+fn structural_body(draft: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(ROUTES_TOML),
+        "draft": draft,
+    })
+}
+
+#[tokio::test]
+async fn a_route_is_remapped_for_new_requests_only() {
+    let (addr, fake, _path, dir) = routes_router().await;
+    let admitted_before = fake.runtime();
+    assert_eq!(
+        admitted_before
+            .resolve("mock/model")
+            .expect("route")
+            .provider,
+        "mock"
+    );
+
+    let body = structural_body(vec![serde_json::json!({
+        "action": "set",
+        "path": ["routes", "mock/model"],
+        "value": "alt"
+    })]);
+    assert_eq!(client_apply(&addr, &body).await.status(), 200);
+
+    assert_eq!(
+        fake.runtime()
+            .resolve("mock/model")
+            .expect("route")
+            .provider,
+        "alt",
+        "a new request resolves the new mapping"
+    );
+    assert_eq!(
+        admitted_before.resolve("mock/model").unwrap().provider,
+        "mock",
+        "the snapshot that admitted an in-flight request keeps its mapping"
+    );
+
+    // Add and then remove a route; resolution follows the file exactly.
+    let current = std::fs::read_to_string(addr_path(&dir)).unwrap();
+    let added = serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(&current),
+        "draft": [{
+            "action": "add_route",
+            "model": "mock/extra",
+            "provider": "mock"
+        }]
+    });
+    assert_eq!(client_apply(&addr, &added).await.status(), 200);
+    assert_eq!(
+        fake.runtime().resolve("mock/extra").unwrap().provider,
+        "mock"
+    );
+    let fingerprint =
+        crate::config_doc::fingerprint(&std::fs::read_to_string(addr_path(&dir)).unwrap());
+    let removed = serde_json::json!({
+        "fingerprint": fingerprint,
+        "draft": [{
+            "action": "remove_route",
+            "model": "mock/extra"
+        }]
+    });
+    assert_eq!(client_apply(&addr, &removed).await.status(), 200);
+    assert!(fake.runtime().resolve("mock/extra").is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn addr_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("config.toml")
+}
+
+#[tokio::test]
+async fn an_alias_and_a_price_edit_apply_to_the_next_request() {
+    let (addr, fake, _path, dir) = routes_router().await;
+    let before_price = fake
+        .runtime()
+        .prices()
+        .estimate(
+            "mock",
+            "mock/model",
+            &TierKey::Default,
+            &TokenUsage {
+                prompt_tokens: 1_000,
+                completion_tokens: 0,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                measured: true,
+            },
+            Decimal::ONE,
+        )
+        .expect("configured price");
+
+    let body = structural_body(vec![
+        serde_json::json!({
+            "action": "set",
+            "path": ["prices", "mock", "mock/model", "input"],
+            "value": "0.9"
+        }),
+        serde_json::json!({
+            "action": "add_alias",
+            "alias": "shorty",
+            "provider": "alt"
+        }),
+    ]);
+    assert_eq!(client_apply(&addr, &body).await.status(), 200);
+
+    let resolved = fake.runtime().resolve("shorty/any-model").expect("alias");
+    assert_eq!(resolved.provider, "alt");
+    assert_eq!(resolved.model, "any-model");
+
+    let after_price = fake
+        .runtime()
+        .prices()
+        .estimate(
+            "mock",
+            "mock/model",
+            &TierKey::Default,
+            &TokenUsage {
+                prompt_tokens: 1_000,
+                completion_tokens: 0,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                measured: true,
+            },
+            Decimal::ONE,
+        )
+        .expect("re-seeded price");
+    assert!(after_price > before_price, "the configured price moved");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_schedule_can_be_removed_and_added_for_the_next_request() {
+    let (addr, fake, _dir_path, dir) = routes_router().await;
+    let at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+    assert_eq!(
+        fake.runtime().tier_at("mock", "mock/model", at),
+        TierKey::Named("peak".to_string())
+    );
+
+    let removed = structural_body(vec![serde_json::json!({
+        "action": "remove_schedule",
+        "provider": "mock",
+        "model": "mock/model",
+        "index": 0
+    })]);
+    assert_eq!(client_apply(&addr, &removed).await.status(), 200);
+    assert_eq!(
+        fake.runtime().tier_at("mock", "mock/model", at),
+        TierKey::Default,
+        "a removed schedule stops applying"
+    );
+
+    let path_now = std::fs::read_to_string(addr_path(&dir)).unwrap();
+    let added = serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(&path_now),
+        "draft": [{
+            "action": "add_schedule",
+            "provider": "mock",
+            "model": "mock/model",
+            "name": "all-day",
+            "days": "*",
+            "hours": "00:00-23:59",
+            "tz": "UTC",
+            "input": 0.2,
+            "output": 0.8
+        }]
+    });
+    assert_eq!(client_apply(&addr, &added).await.status(), 200);
+    assert_eq!(
+        fake.runtime().tier_at("mock", "mock/model", at),
+        TierKey::Named("all-day".to_string())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_failed_route_change_leaves_routes_and_prices_alone() {
+    let (addr, fake, path, dir) = routes_router().await;
+    let before = std::fs::read(&path).unwrap();
+    let body = structural_body(vec![serde_json::json!({
+        "action": "set",
+        "path": ["routes", "mock/model"],
+        "value": "no-such-provider"
+    })]);
+    let response = client_apply(&addr, &body).await;
+    assert_eq!(response.status(), 422);
+    assert!(response.text().await.unwrap().contains("routes.mock/model"));
+    assert_eq!(
+        fake.runtime().resolve("mock/model").unwrap().provider,
+        "mock"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn the_configuration_page_exposes_routes_aliases_and_prices() {
+    let (addr, _fake, _path, dir) = routes_router().await;
+    let html = reqwest::get(format!("{addr}/config?lang=en"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(html.contains("data-remove-action"));
+    assert!(html.contains("Add a route"));
+    assert!(html.contains("Add an alias"));
+    assert!(html.contains("Add a price"));
+    assert!(html.contains("Add a schedule"));
+    assert!(html.contains("Provider aliases"));
     let _ = std::fs::remove_dir_all(&dir);
 }

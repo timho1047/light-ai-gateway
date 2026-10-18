@@ -185,6 +185,33 @@ struct DraftEntry {
     /// The environment variable name or the key file path.
     #[serde(default)]
     key_value: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    input: Option<f64>,
+    #[serde(default)]
+    output: Option<f64>,
+    #[serde(default)]
+    cache_read: Option<f64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    days: Option<String>,
+    #[serde(default)]
+    hours: Option<String>,
+    #[serde(default)]
+    tz: Option<String>,
+    #[serde(default)]
+    index: Option<usize>,
+}
+
+fn required(value: Option<String>, message: &str) -> std::result::Result<String, String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(message.to_string()),
+    }
 }
 
 /// Turn the wire form into document actions, refusing a half-specified one
@@ -230,6 +257,59 @@ fn draft_actions(entries: Vec<DraftEntry>) -> std::result::Result<Vec<DraftActio
                     key,
                 });
             }
+            "add_route" => actions.push(DraftAction::AddRoute {
+                model: required(entry.model, "a route needs a model")?,
+                provider: required(entry.provider, "a route needs a provider")?,
+            }),
+            "remove_route" => actions.push(DraftAction::RemoveRoute {
+                model: required(entry.model, "a route needs a model")?,
+            }),
+            "add_alias" => actions.push(DraftAction::AddAlias {
+                alias: required(entry.alias, "an alias needs a name")?,
+                provider: required(entry.provider, "an alias needs a provider")?,
+            }),
+            "remove_alias" => actions.push(DraftAction::RemoveAlias {
+                alias: required(entry.alias, "an alias needs a name")?,
+            }),
+            "add_price" => actions.push(DraftAction::AddPrice {
+                provider: required(entry.provider, "a price needs a provider")?,
+                model: required(entry.model, "a price needs a model")?,
+                input: entry
+                    .input
+                    .ok_or_else(|| "a price needs an input rate".to_string())?,
+                output: entry
+                    .output
+                    .ok_or_else(|| "a price needs an output rate".to_string())?,
+                cache_read: entry.cache_read,
+            }),
+            "remove_price" => actions.push(DraftAction::RemovePrice {
+                provider: required(entry.provider, "a price needs a provider")?,
+                model: required(entry.model, "a price needs a model")?,
+            }),
+            "add_schedule" => actions.push(DraftAction::AddSchedule {
+                provider: required(entry.provider, "a schedule needs a provider")?,
+                model: required(entry.model, "a schedule needs a model")?,
+                entry: crate::config_doc::ScheduleEntry {
+                    name: entry.name,
+                    days: required(entry.days, "a schedule needs days")?,
+                    hours: required(entry.hours, "a schedule needs hours")?,
+                    tz: entry.tz,
+                    input: entry
+                        .input
+                        .ok_or_else(|| "a schedule needs an input rate".to_string())?,
+                    output: entry
+                        .output
+                        .ok_or_else(|| "a schedule needs an output rate".to_string())?,
+                    cache_read: entry.cache_read,
+                },
+            }),
+            "remove_schedule" => actions.push(DraftAction::RemoveSchedule {
+                provider: required(entry.provider, "a schedule needs a provider")?,
+                model: required(entry.model, "a schedule needs a model")?,
+                index: entry
+                    .index
+                    .ok_or_else(|| "a schedule needs its index".to_string())?,
+            }),
             other => return Err(format!("unknown draft action {other}")),
         }
     }
@@ -453,7 +533,11 @@ fn live_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
         match action {
             DraftAction::Set(change) => {
                 let section = change.path.first().map(String::as_str).unwrap_or("");
-                if section != "policy" && section != "providers" {
+                let live = matches!(
+                    section,
+                    "policy" | "providers" | "routes" | "prices" | "provider_prefix_aliases"
+                );
+                if !live {
                     refuse(change.path.join("."));
                 }
             }
@@ -469,6 +553,14 @@ fn live_scope_refusals(actions: &[DraftAction]) -> Vec<String> {
                     refuse("providers".to_string());
                 }
             }
+            DraftAction::AddRoute { .. }
+            | DraftAction::RemoveRoute { .. }
+            | DraftAction::AddAlias { .. }
+            | DraftAction::RemoveAlias { .. }
+            | DraftAction::AddPrice { .. }
+            | DraftAction::RemovePrice { .. }
+            | DraftAction::AddSchedule { .. }
+            | DraftAction::RemoveSchedule { .. } => {}
         }
     }
     fields

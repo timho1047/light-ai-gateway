@@ -550,6 +550,22 @@ impl PriceTable {
         installed
     }
 
+    /// The next table after a configuration apply: this table's learned rates
+    /// and their observed volume survive, the configured prices come from the
+    /// new file, and a configured price the file no longer names is gone.
+    ///
+    /// Re-seeding the SAME table would leave the removed entries behind, so the
+    /// rebuild starts empty and carries only what is learned.
+    pub fn reseeded(
+        &self,
+        prices: &BTreeMap<String, BTreeMap<String, crate::config::ModelPriceConfig>>,
+    ) -> PriceTable {
+        let mut next = PriceTable::new();
+        next.load_learned(self.learned_rows());
+        next.seed_from_config(prices);
+        next
+    }
+
     /// Restore prices learned in an earlier run.
     ///
     /// Without this, every restart falls back to the conservative default until
@@ -2049,6 +2065,69 @@ mod tests {
                 )
                 .unwrap(),
             cost
+        );
+    }
+
+    #[test]
+    fn reseeding_keeps_learned_rates_and_drops_removed_configured_prices() {
+        let before = crate::config::Config::from_toml_str(
+            r#"
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+[providers.mock.accounts.a1]
+key = "sk-a1"
+[prices.mock."mock/model"]
+input = 0.15
+output = 0.60
+[routes]
+"mock/model" = "mock"
+"#,
+        )
+        .expect("first config");
+        let after = crate::config::Config::from_toml_str(
+            r#"
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+[providers.mock.accounts.a1]
+key = "sk-a1"
+[prices.mock."mock/newmodel"]
+input = 1.0
+output = 2.0
+[routes]
+"mock/newmodel" = "mock"
+"#,
+        )
+        .expect("second config");
+
+        let mut table = PriceTable::new();
+        table.seed_from_config(&before.prices);
+        let learned = price(100, 200, 1);
+        table.set("mock", "mock/model", &DEFAULT, learned);
+
+        let next = table.reseeded(&after.prices);
+        assert_eq!(
+            next.effective("mock", "mock/model", &DEFAULT),
+            Some(&learned),
+            "a learned rate survives a configured price being removed"
+        );
+        assert!(
+            next.entry("mock", "mock/model", &DEFAULT)
+                .expect("entry")
+                .configured
+                .is_none(),
+            "the removed configured price does not linger"
+        );
+        assert!(
+            next.is_known("mock", "mock/newmodel", &DEFAULT),
+            "the new configured price is installed"
+        );
+        assert!(
+            next.entry("mock", "mock/newmodel", &DEFAULT)
+                .unwrap()
+                .learned
+                .is_none()
         );
     }
 }

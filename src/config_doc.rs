@@ -199,7 +199,7 @@ pub enum KeySpec {
 }
 
 /// One edit to the configuration document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DraftAction {
     Set(DraftChange),
     /// Remove a whole account table. Only accounts can be removed this way; a
@@ -213,6 +213,41 @@ pub enum DraftAction {
         label: Option<String>,
         key: KeySpec,
     },
+    AddRoute {
+        model: String,
+        provider: String,
+    },
+    RemoveRoute {
+        model: String,
+    },
+    AddAlias {
+        alias: String,
+        provider: String,
+    },
+    RemoveAlias {
+        alias: String,
+    },
+    AddPrice {
+        provider: String,
+        model: String,
+        input: f64,
+        output: f64,
+        cache_read: Option<f64>,
+    },
+    RemovePrice {
+        provider: String,
+        model: String,
+    },
+    AddSchedule {
+        provider: String,
+        model: String,
+        entry: ScheduleEntry,
+    },
+    RemoveSchedule {
+        provider: String,
+        model: String,
+        index: usize,
+    },
 }
 
 impl ConfigDocument {
@@ -220,6 +255,12 @@ impl ConfigDocument {
     /// parse is the guarantee: a document the gateway cannot load is a refused
     /// draft, never a broken file.
     pub fn apply_actions(&self, actions: &[DraftAction]) -> Result<ConfigDocument, DraftError> {
+        fn rebuilt(document: DocumentMut) -> ConfigDocument {
+            ConfigDocument {
+                raw: document.to_string(),
+                document,
+            }
+        }
         let mut document = self.document.clone();
         for action in actions {
             match action {
@@ -231,6 +272,50 @@ impl ConfigDocument {
                     label,
                     key,
                 } => add_account(&mut document, provider, id, label.as_deref(), key)?,
+                DraftAction::AddRoute { model, provider } => {
+                    document = rebuilt(document).add_route(model, provider)?.document;
+                }
+                DraftAction::RemoveRoute { model } => {
+                    document = rebuilt(document).remove_route(model)?.document;
+                }
+                DraftAction::AddAlias { alias, provider } => {
+                    document = rebuilt(document).add_alias(alias, provider)?.document;
+                }
+                DraftAction::RemoveAlias { alias } => {
+                    document = rebuilt(document).remove_alias(alias)?.document;
+                }
+                DraftAction::AddPrice {
+                    provider,
+                    model,
+                    input,
+                    output,
+                    cache_read,
+                } => {
+                    document = rebuilt(document)
+                        .add_price(provider, model, *input, *output, *cache_read)?
+                        .document;
+                }
+                DraftAction::RemovePrice { provider, model } => {
+                    document = rebuilt(document).remove_price(provider, model)?.document;
+                }
+                DraftAction::AddSchedule {
+                    provider,
+                    model,
+                    entry,
+                } => {
+                    document = rebuilt(document)
+                        .add_schedule(provider, model, entry)?
+                        .document;
+                }
+                DraftAction::RemoveSchedule {
+                    provider,
+                    model,
+                    index,
+                } => {
+                    document = rebuilt(document)
+                        .remove_schedule(provider, model, *index)?
+                        .document;
+                }
             }
         }
         let raw = document.to_string();
@@ -385,6 +470,274 @@ impl ConfigDocument {
     }
 }
 
+/// One schedule row as the form supplies it; the validator decides whether the
+/// day and hour strings are usable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleEntry {
+    pub name: Option<String>,
+    pub days: String,
+    pub hours: String,
+    pub tz: Option<String>,
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: Option<f64>,
+}
+
+impl ConfigDocument {
+    pub fn add_route(&self, model: &str, provider: &str) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let table = named_table(document, "routes", "routes")?;
+            table.insert(model, Item::Value(Value::from(provider)));
+            Ok(())
+        })
+    }
+
+    pub fn remove_route(&self, model: &str) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let table = named_table(document, "routes", "routes")?;
+            if table.remove(model).is_none() {
+                return Err(DraftError {
+                    field: format!("routes.{model}"),
+                    message: "no such route".to_string(),
+                });
+            }
+            if table.is_empty() {
+                document.as_table_mut().remove("routes");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn add_alias(&self, alias: &str, provider: &str) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let table = named_table(
+                document,
+                "provider_prefix_aliases",
+                "provider_prefix_aliases",
+            )?;
+            table.insert(alias, Item::Value(Value::from(provider)));
+            Ok(())
+        })
+    }
+
+    pub fn remove_alias(&self, alias: &str) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let table = named_table(
+                document,
+                "provider_prefix_aliases",
+                "provider_prefix_aliases",
+            )?;
+            if table.remove(alias).is_none() {
+                return Err(DraftError {
+                    field: format!("provider_prefix_aliases.{alias}"),
+                    message: "no such alias".to_string(),
+                });
+            }
+            if table.is_empty() {
+                document.as_table_mut().remove("provider_prefix_aliases");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn add_price(
+        &self,
+        provider: &str,
+        model: &str,
+        input: f64,
+        output: f64,
+        cache_read: Option<f64>,
+    ) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let table = price_table(document, provider, model)?;
+            table.insert("input", Item::Value(Value::from(input)));
+            table.insert("output", Item::Value(Value::from(output)));
+            if let Some(cache_read) = cache_read {
+                table.insert("cache_read", Item::Value(Value::from(cache_read)));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn remove_price(&self, provider: &str, model: &str) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let providers = document
+                .get_mut("prices")
+                .and_then(Item::as_table_like_mut)
+                .ok_or_else(|| DraftError {
+                    field: "prices".to_string(),
+                    message: "no prices configured".to_string(),
+                })?;
+            let table = providers
+                .get_mut(provider)
+                .and_then(Item::as_table_like_mut)
+                .ok_or_else(|| DraftError {
+                    field: format!("prices.{provider}"),
+                    message: "no prices for this provider".to_string(),
+                })?;
+            if table.remove(model).is_none() {
+                return Err(DraftError {
+                    field: format!("prices.{provider}.{model}"),
+                    message: "no price for this model".to_string(),
+                });
+            }
+            if table.is_empty() {
+                providers.remove(provider);
+            }
+            if providers.is_empty() {
+                document.as_table_mut().remove("prices");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn add_schedule(
+        &self,
+        provider: &str,
+        model: &str,
+        entry: &ScheduleEntry,
+    ) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let table = price_table(document, provider, model)?;
+            if table.get("schedules").is_none() {
+                table.insert(
+                    "schedules",
+                    Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+                );
+            }
+            let schedules = table
+                .get_mut("schedules")
+                .and_then(Item::as_array_of_tables_mut)
+                .ok_or_else(|| DraftError {
+                    field: format!("prices.{provider}.{model}.schedules"),
+                    message: "schedules is not an array of tables".to_string(),
+                })?;
+            schedules.push(schedule_table(entry));
+            Ok(())
+        })
+    }
+
+    pub fn remove_schedule(
+        &self,
+        provider: &str,
+        model: &str,
+        index: usize,
+    ) -> Result<ConfigDocument, DraftError> {
+        self.mutate(|document| {
+            let field = format!("prices.{provider}.{model}.schedules");
+            let table = document
+                .get_mut("prices")
+                .and_then(Item::as_table_like_mut)
+                .and_then(|prices| prices.get_mut(provider))
+                .and_then(Item::as_table_like_mut)
+                .and_then(|prices| prices.get_mut(model))
+                .and_then(Item::as_table_like_mut)
+                .ok_or_else(|| DraftError {
+                    field: field.clone(),
+                    message: "no price for this model".to_string(),
+                })?;
+            let schedules = table
+                .get_mut("schedules")
+                .and_then(Item::as_array_of_tables_mut)
+                .ok_or_else(|| DraftError {
+                    field: field.clone(),
+                    message: "no schedules".to_string(),
+                })?;
+            if index >= schedules.len() {
+                return Err(DraftError {
+                    field: format!("{field}.{index}"),
+                    message: "no such schedule".to_string(),
+                });
+            }
+            schedules.remove(index);
+            if schedules.is_empty() {
+                table.remove("schedules");
+            }
+            Ok(())
+        })
+    }
+
+    /// Mutate a copy of the document and parse the result back. Every structural
+    /// action goes through here, so a malformed edit is a refused draft rather
+    /// than a broken file.
+    fn mutate(
+        &self,
+        edit: impl FnOnce(&mut DocumentMut) -> Result<(), DraftError>,
+    ) -> Result<ConfigDocument, DraftError> {
+        let mut document = self.document.clone();
+        edit(&mut document)?;
+        let raw = document.to_string();
+        ConfigDocument::parse(&raw).map_err(|error| DraftError {
+            field: "config".to_string(),
+            message: error.to_string(),
+        })
+    }
+}
+
+fn named_table<'a>(
+    document: &'a mut DocumentMut,
+    name: &str,
+    field: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, DraftError> {
+    if document.get(name).is_none() {
+        document.insert(name, Item::Table(toml_edit::Table::new()));
+    }
+    document
+        .get_mut(name)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field: field.to_string(),
+            message: format!("{name} is not a table"),
+        })
+}
+
+fn price_table<'a>(
+    document: &'a mut DocumentMut,
+    provider: &str,
+    model: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, DraftError> {
+    let field = format!("prices.{provider}.{model}");
+    let prices = named_table(document, "prices", "prices")?;
+    if prices.get(provider).is_none() {
+        prices.insert(provider, Item::Table(toml_edit::Table::new()));
+    }
+    let table = prices
+        .get_mut(provider)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field: field.clone(),
+            message: format!("prices.{provider} is not a table"),
+        })?;
+    if table.get(model).is_none() {
+        table.insert(model, Item::Table(toml_edit::Table::new()));
+    }
+    table
+        .get_mut(model)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| DraftError {
+            field,
+            message: format!("prices.{provider}.{model} is not a table"),
+        })
+}
+
+fn schedule_table(entry: &ScheduleEntry) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    if let Some(name) = entry.name.as_deref().filter(|name| !name.trim().is_empty()) {
+        table.insert("name", Item::Value(Value::from(name)));
+    }
+    table.insert("days", Item::Value(Value::from(entry.days.as_str())));
+    table.insert("hours", Item::Value(Value::from(entry.hours.as_str())));
+    if let Some(tz) = entry.tz.as_deref().filter(|tz| !tz.trim().is_empty()) {
+        table.insert("tz", Item::Value(Value::from(tz)));
+    }
+    table.insert("input", Item::Value(Value::from(entry.input)));
+    table.insert("output", Item::Value(Value::from(entry.output)));
+    if let Some(cache_read) = entry.cache_read {
+        table.insert("cache_read", Item::Value(Value::from(cache_read)));
+    }
+    table
+}
+
 /// The kinds of leaf the console's forms can write. Only these fields may be
 /// created when the file omits them; an existing leaf of any type can still be
 /// edited, but a path nobody whitelisted can never be invented.
@@ -413,6 +766,17 @@ pub fn editable_kind(path: &[String]) -> Option<ValueKind> {
         | ["providers", _, "accounts", _, "credit_multiplier"] => Some(ValueKind::Float),
         ["providers", _, "accounts", _, "concurrency_limit"]
         | ["providers", _, "accounts", _, "rpm_limit"] => Some(ValueKind::Integer),
+        ["routes", _] | ["provider_prefix_aliases", _] => Some(ValueKind::String),
+        ["prices", _, _, "input"] | ["prices", _, _, "output"] | ["prices", _, _, "cache_read"] => {
+            Some(ValueKind::Float)
+        }
+        ["prices", _, _, "schedules", _, "name"]
+        | ["prices", _, _, "schedules", _, "days"]
+        | ["prices", _, _, "schedules", _, "hours"]
+        | ["prices", _, _, "schedules", _, "tz"] => Some(ValueKind::String),
+        ["prices", _, _, "schedules", _, "input"]
+        | ["prices", _, _, "schedules", _, "output"]
+        | ["prices", _, _, "schedules", _, "cache_read"] => Some(ValueKind::Float),
         ["policy", "soft_threshold"]
         | ["policy", "drift_threshold"]
         | ["policy", "hard_margin"] => Some(ValueKind::Float),
@@ -439,25 +803,7 @@ fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), 
     }
     let kind = editable_kind(&change.path);
     let (parents, leaf) = change.path.split_at(change.path.len() - 1);
-    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
-    for segment in parents {
-        if table.get(segment).is_none() {
-            let Some(_) = kind else {
-                return Err(DraftError {
-                    field: field.clone(),
-                    message: "unknown field".to_string(),
-                });
-            };
-            table.insert(segment, Item::Table(toml_edit::Table::new()));
-        }
-        let Some(next) = table.get_mut(segment).and_then(Item::as_table_like_mut) else {
-            return Err(DraftError {
-                field: field.clone(),
-                message: format!("{segment} is not a table"),
-            });
-        };
-        table = next;
-    }
+    let table = parent_table(document, parents, kind, &field)?;
     if let Some(item) = table.get_mut(leaf[0].as_str()) {
         return set_leaf(item, &change.value).map_err(|message| DraftError {
             field: field.clone(),
@@ -476,6 +822,74 @@ fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), 
     })?;
     table.insert(leaf[0].as_str(), Item::Value(value));
     Ok(())
+}
+
+/// Walk (and, for whitelisted leaves, create) the parent path of a change.
+///
+/// A numeric segment is an index into an array of tables: schedules are
+/// addressed as schedules.0.name, which is how a form field can edit one
+/// schedule row without replacing the whole block.
+fn parent_table<'a>(
+    document: &'a mut DocumentMut,
+    segments: &[String],
+    kind: Option<ValueKind>,
+    field: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, DraftError> {
+    descend(document.as_table_mut(), segments, kind, field)
+}
+
+fn descend<'a>(
+    table: &'a mut dyn toml_edit::TableLike,
+    segments: &[String],
+    kind: Option<ValueKind>,
+    field: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike, DraftError> {
+    let Some((segment, rest)) = segments.split_first() else {
+        return Ok(table);
+    };
+    if segment.parse::<usize>().is_ok() {
+        return Err(DraftError {
+            field: field.to_string(),
+            message: "no such schedule".to_string(),
+        });
+    }
+    if table.get(segment).is_none() {
+        let Some(_) = kind else {
+            return Err(DraftError {
+                field: field.to_string(),
+                message: "unknown field".to_string(),
+            });
+        };
+        table.insert(segment, Item::Table(toml_edit::Table::new()));
+    }
+    let item = table.get_mut(segment).ok_or_else(|| DraftError {
+        field: field.to_string(),
+        message: "unknown field".to_string(),
+    })?;
+    if let Item::ArrayOfTables(entries) = item {
+        let Some((index_segment, rest)) = rest.split_first() else {
+            return Err(DraftError {
+                field: field.to_string(),
+                message: "a schedule needs a numeric index".to_string(),
+            });
+        };
+        let index = index_segment.parse::<usize>().map_err(|_| DraftError {
+            field: field.to_string(),
+            message: "a schedule needs a numeric index".to_string(),
+        })?;
+        let entry = entries.get_mut(index).ok_or_else(|| DraftError {
+            field: field.to_string(),
+            message: "no such schedule".to_string(),
+        })?;
+        return descend(entry, rest, kind, field);
+    }
+    let Some(next) = item.as_table_like_mut() else {
+        return Err(DraftError {
+            field: field.to_string(),
+            message: format!("{segment} is not a table"),
+        });
+    };
+    descend(next, rest, kind, field)
 }
 
 fn value_for(kind: ValueKind, text: &str) -> Result<Value, String> {
@@ -833,6 +1247,124 @@ keep = "this field"
                 value: (*value).to_string(),
             })
             .collect()
+    }
+
+    const STRUCTURAL_DOC: &str = r#"
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-a1"
+
+[providers.alt]
+adapter = "none"
+base_url = "http://127.0.0.1:2/v1"
+
+[providers.alt.accounts.a1]
+key = "sk-alt"
+
+[routes]
+"mock/model" = "mock"
+
+[provider_prefix_aliases]
+"alias" = "mock"
+
+[prices.mock."mock/model"]
+input = 0.15
+output = 0.60
+
+[[prices.mock."mock/model".schedules]]
+name = "peak"
+days = "*"
+hours = "00:00-23:59"
+tz = "UTC"
+input = 0.30
+output = 1.20
+"#;
+
+    #[test]
+    fn routes_and_aliases_can_be_added_changed_and_removed() {
+        let document = ConfigDocument::parse(STRUCTURAL_DOC).expect("parse");
+        let edited = document
+            .add_route("mock/new", "alt")
+            .expect("add route")
+            .add_alias("short", "alt")
+            .expect("add alias")
+            .remove_route("mock/model")
+            .expect("remove route");
+        let raw = edited.raw();
+        crate::config::Config::from_toml_str(raw).expect("valid configuration");
+        assert!(raw.contains("mock/new"));
+        assert!(raw.contains("short"));
+        assert!(!raw.contains("\"mock/model\" = \"mock\""));
+
+        let changed = edited
+            .apply_actions(&[DraftAction::Set(DraftChange {
+                path: vec!["routes".to_string(), "mock/new".to_string()],
+                value: "mock".to_string(),
+            })])
+            .expect("remap route");
+        let config = crate::config::Config::from_toml_str(changed.raw()).expect("valid");
+        assert_eq!(config.routes["mock/new"], "mock");
+
+        let last_route = changed.remove_route("mock/new").expect("remove last route");
+        assert!(!last_route.raw().contains("[routes]"));
+        let last_alias = document.remove_alias("alias").expect("remove last alias");
+        assert!(!last_alias.raw().contains("provider_prefix_aliases"));
+    }
+
+    #[test]
+    fn prices_can_be_added_removed_and_rescheduled() {
+        let document = ConfigDocument::parse(STRUCTURAL_DOC).expect("parse");
+        let with_price = document
+            .add_price("mock", "newmodel", 1.0, 2.0, Some(0.1))
+            .expect("add price");
+        crate::config::Config::from_toml_str(with_price.raw()).expect("valid configuration");
+        assert!(with_price.raw().contains("newmodel"));
+
+        let without = document
+            .remove_price("mock", "mock/model")
+            .expect("remove price");
+        crate::config::Config::from_toml_str(without.raw()).expect("valid configuration");
+        assert!(!without.raw().contains("input = 0.15"));
+
+        let entry = ScheduleEntry {
+            name: Some("night".to_string()),
+            days: "sat,sun".to_string(),
+            hours: "00:00-06:00".to_string(),
+            tz: Some("+08:00".to_string()),
+            input: 0.05,
+            output: 0.2,
+            cache_read: None,
+        };
+        let scheduled = document
+            .add_schedule("mock", "mock/model", &entry)
+            .expect("add schedule");
+        crate::config::Config::from_toml_str(scheduled.raw()).expect("valid configuration");
+        assert!(scheduled.raw().contains("night"));
+
+        // Edit one schedule in place through its index.
+        let edited = scheduled
+            .apply_actions(&[DraftAction::Set(DraftChange {
+                path: vec![
+                    "prices".to_string(),
+                    "mock".to_string(),
+                    "mock/model".to_string(),
+                    "schedules".to_string(),
+                    "1".to_string(),
+                    "input".to_string(),
+                ],
+                value: "0.07".to_string(),
+            })])
+            .expect("edit schedule");
+        crate::config::Config::from_toml_str(edited.raw()).expect("valid configuration");
+        assert!(edited.raw().contains("0.07"));
+
+        let removed = scheduled
+            .remove_schedule("mock", "mock/model", 0)
+            .expect("remove schedule");
+        assert!(!removed.raw().contains("peak"));
     }
 
     #[test]

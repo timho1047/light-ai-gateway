@@ -232,64 +232,248 @@ pub fn render(view: &ConfigView) -> String {
 
     out.push_str(&section(s.section_routes, |body| {
         if view.config.routes.is_empty() {
-            let _ = write!(body, "<div class=\"empty\">{}</div>", esc(s.no_routes));
+            let _ = write!(body, r#"<div class="empty">{}</div>"#, esc(s.no_routes));
         } else {
             body.push_str(
-                "<table class=\"table\"><thead><tr><th>routes.&lt;model&gt;</th><th>provider</th></tr></thead><tbody>",
+                r#"<table class="table"><thead><tr><th>routes.&lt;model&gt;</th><th>provider</th><th></th></tr></thead><tbody>"#,
             );
             for (model, provider) in &view.config.routes {
-                let _ = write!(
-                    body,
-                    "<tr><td class=\"mono\">{}</td><td class=\"mono\">{}</td></tr>",
-                    esc(model),
-                    esc(provider)
-                );
+                let _ = write!(body, r#"<tr><td class="mono">{}</td><td>"#, esc(model));
+                leaf_input(body, &["routes", model], provider);
+                body.push_str("</td><td>");
+                let payload = serde_json::json!({ "model": model }).to_string();
+                remove_button(body, "remove_route", &payload, s);
+                body.push_str("</td></tr>");
             }
             body.push_str("</tbody></table>");
         }
+        let payload = serde_json::json!({}).to_string();
+        add_form(
+            body,
+            "add_route",
+            s.config_add_route,
+            &payload,
+            "model",
+            &[("model", s.config_model), ("provider", s.config_provider)],
+        );
+    }));
+
+    out.push_str(&section(s.section_aliases, |body| {
+        if view.config.provider_prefix_aliases.is_empty() {
+            let _ = write!(body, r#"<div class="empty">{}</div>"#, esc(s.no_aliases));
+        } else {
+            body.push_str(
+                r#"<table class="table"><thead><tr><th>alias</th><th>provider</th><th></th></tr></thead><tbody>"#,
+            );
+            for (alias, provider) in &view.config.provider_prefix_aliases {
+                let _ = write!(body, r#"<tr><td class="mono">{}</td><td>"#, esc(alias));
+                leaf_input(body, &["provider_prefix_aliases", alias], provider);
+                body.push_str("</td><td>");
+                let payload = serde_json::json!({ "alias": alias }).to_string();
+                remove_button(body, "remove_alias", &payload, s);
+                body.push_str("</td></tr>");
+            }
+            body.push_str("</tbody></table>");
+        }
+        let payload = serde_json::json!({}).to_string();
+        add_form(
+            body,
+            "add_alias",
+            s.config_add_alias,
+            &payload,
+            "alias",
+            &[("alias", s.config_alias), ("provider", s.config_provider)],
+        );
     }));
 
     out.push_str(&section(s.section_prices, |body| {
         if view.config.prices.is_empty() {
-            let _ = write!(body, "<div class=\"empty\">{}</div>", esc(s.no_prices));
+            let _ = write!(body, r#"<div class="empty">{}</div>"#, esc(s.no_prices));
         }
         for (provider, models) in &view.config.prices {
             for (model, price) in models {
                 subhead(body, &format!("prices.{provider}.{model}"));
-                live(body, "input / M", &fnum(price.input), s);
-                live(body, "output / M", &fnum(price.output), s);
-                live(
+                editable_text(
                     body,
-                    "cache read / M",
-                    &price
-                        .cache_read
-                        .map(fnum)
-                        .unwrap_or_else(|| "input / 10".to_string()),
+                    &["prices", provider, model, "input"],
+                    s.config_input_m,
+                    &fnum(price.input),
+                    true,
                     s,
                 );
-                if !price.schedules.is_empty() {
-                    subhead(body, s.config_schedules);
+                editable_text(
+                    body,
+                    &["prices", provider, model, "output"],
+                    s.config_output_m,
+                    &fnum(price.output),
+                    true,
+                    s,
+                );
+                editable_text(
+                    body,
+                    &["prices", provider, model, "cache_read"],
+                    s.config_cache_m,
+                    &price.cache_read.map(fnum).unwrap_or_default(),
+                    true,
+                    s,
+                );
+                let price_payload =
+                    serde_json::json!({ "provider": provider, "model": model }).to_string();
+                body.push_str(r#"<div class="account-actions">"#);
+                remove_button(body, "remove_price", &price_payload, s);
+                body.push_str("</div>");
+
+                if price.schedules.is_empty() {
+                    let _ = write!(
+                        body,
+                        r#"<div class="hint">{}</div>"#,
+                        esc(s.config_no_schedules)
+                    );
                 }
                 for (index, tier) in price.schedules.iter().enumerate() {
-                    let name = tier
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| format!("#{}", index + 1));
-                    let row = format!(
-                        "{} · days {} · hours {} · tz {} · in {} · out {} · cache {}",
-                        name,
-                        tier.days,
-                        tier.hours,
-                        tier.tz.as_deref().unwrap_or("UTC"),
-                        fnum(tier.input),
-                        fnum(tier.output),
-                        tier.cache_read
-                            .map(fnum)
-                            .unwrap_or_else(|| "input / 10".to_string()),
+                    let index_text = index.to_string();
+                    subhead(body, &format!("{} #{}", s.config_schedules, index + 1));
+                    let name_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "name",
+                    ];
+                    editable_text(
+                        body,
+                        &name_path,
+                        s.config_schedule_name,
+                        tier.name.as_deref().unwrap_or(""),
+                        true,
+                        s,
                     );
-                    live(body, "schedule", &row, s);
+                    let days_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "days",
+                    ];
+                    editable_text(body, &days_path, s.config_days, &tier.days, true, s);
+                    let hours_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "hours",
+                    ];
+                    editable_text(body, &hours_path, s.config_hours, &tier.hours, true, s);
+                    let tz_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "tz",
+                    ];
+                    editable_text(
+                        body,
+                        &tz_path,
+                        s.config_tz,
+                        tier.tz.as_deref().unwrap_or(""),
+                        true,
+                        s,
+                    );
+                    let input_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "input",
+                    ];
+                    editable_text(
+                        body,
+                        &input_path,
+                        s.config_input_m,
+                        &fnum(tier.input),
+                        true,
+                        s,
+                    );
+                    let output_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "output",
+                    ];
+                    editable_text(
+                        body,
+                        &output_path,
+                        s.config_output_m,
+                        &fnum(tier.output),
+                        true,
+                        s,
+                    );
+                    let cache_path = [
+                        "prices",
+                        provider.as_str(),
+                        model.as_str(),
+                        "schedules",
+                        index_text.as_str(),
+                        "cache_read",
+                    ];
+                    editable_text(
+                        body,
+                        &cache_path,
+                        s.config_cache_m,
+                        &tier.cache_read.map(fnum).unwrap_or_default(),
+                        true,
+                        s,
+                    );
+                    let schedule_payload = serde_json::json!({
+                        "provider": provider,
+                        "model": model,
+                        "index": index
+                    })
+                    .to_string();
+                    body.push_str(r#"<div class="account-actions">"#);
+                    remove_button(body, "remove_schedule", &schedule_payload, s);
+                    body.push_str("</div>");
                 }
+                let schedule_payload =
+                    serde_json::json!({ "provider": provider, "model": model }).to_string();
+                add_form(
+                    body,
+                    "add_schedule",
+                    s.config_add_schedule,
+                    &schedule_payload,
+                    "days",
+                    &[
+                        ("name", s.config_schedule_name),
+                        ("days", s.config_days),
+                        ("hours", s.config_hours),
+                        ("tz", s.config_tz),
+                        ("input", s.config_input_m),
+                        ("output", s.config_output_m),
+                        ("cache_read", s.config_cache_m),
+                    ],
+                );
             }
+            let price_payload = serde_json::json!({ "provider": provider }).to_string();
+            add_form(
+                body,
+                "add_price",
+                s.config_add_price,
+                &price_payload,
+                "model",
+                &[
+                    ("model", s.config_model),
+                    ("input", s.config_input_m),
+                    ("output", s.config_output_m),
+                    ("cache_read", s.config_cache_m),
+                ],
+            );
         }
     }));
 
@@ -300,6 +484,55 @@ pub fn render(view: &ConfigView) -> String {
         out.push_str(&raw_section(raw, s));
     }
     out
+}
+
+fn leaf_input(out: &mut String, path: &[&str], value: &str) {
+    let _ = write!(
+        out,
+        r#"<input class="table-input" type="text" value="{}" data-path="{}" data-initial="{}" spellcheck="false" autocomplete="off">"#,
+        esc(value),
+        esc(&data_path(path)),
+        esc(value),
+    );
+}
+
+fn remove_button(out: &mut String, action: &str, payload: &str, s: &Strings) {
+    let _ = write!(
+        out,
+        r#"<button class="btn btn-small danger" type="button" data-remove-action="{}" data-payload="{}" data-remove-label="{}" data-undo-label="{}">{}</button>"#,
+        esc(action),
+        esc(payload),
+        esc(s.config_remove),
+        esc(s.config_remove_undo_short),
+        esc(s.config_remove),
+    );
+}
+
+fn add_form(
+    out: &mut String,
+    kind: &str,
+    title: &str,
+    payload: &str,
+    required: &str,
+    fields: &[(&str, &str)],
+) {
+    let _ = write!(
+        out,
+        r#"<details class="add-account" data-add-form data-kind="{}" data-static="{}" data-required="{}"><summary>{}</summary><div class="add-account-grid">"#,
+        esc(kind),
+        esc(payload),
+        esc(required),
+        esc(title),
+    );
+    for (name, label) in fields {
+        let _ = write!(
+            out,
+            r#"<label><span class="field-label mono">{}</span><input type="text" data-add-field="{}" autocomplete="off" spellcheck="false"></label>"#,
+            esc(label),
+            esc(name),
+        );
+    }
+    out.push_str("</div></details>");
 }
 
 fn add_account_form(provider: &str, s: &Strings) -> String {
@@ -579,10 +812,6 @@ fn section(title: &str, build: impl FnOnce(&mut String)) -> String {
 
 fn subhead(out: &mut String, label: &str) {
     let _ = write!(out, "<h3 class=\"section-sub mono\">{}</h3>", esc(label));
-}
-
-fn live(out: &mut String, label: &str, value: &str, s: &Strings) {
-    field(out, label, value, true, s);
 }
 
 fn field(out: &mut String, label: &str, value: &str, applies_live: bool, s: &Strings) {
