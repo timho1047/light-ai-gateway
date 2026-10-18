@@ -3,10 +3,11 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use light_ai_gateway::launcher::{
-    ExitOutcome, LaunchOptions, LaunchOutcome, Launcher, Status, UpdateOptions, follow_log,
-    read_tail,
+    ExitOutcome, LaunchOptions, LaunchOutcome, Launcher, Status, UpdateOptions, console_url,
+    follow_log, read_tail,
 };
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,6 +61,12 @@ fn main() -> Result<()> {
             match launcher.launch(&LaunchOptions::new(config, cwd))? {
                 LaunchOutcome::Started(state) => {
                     println!("started lgw (pid {})", state.pid);
+                    if let Some(base) = console_url(&launcher.paths().log, Duration::from_secs(5)) {
+                        println!("api:     {base}/v1");
+                        println!("console: {base}/");
+                    } else {
+                        println!("api:     not reported yet; see lgwl log");
+                    }
                     println!("log: {}", launcher.paths().log.display());
                     println!("follow it with: lgwl log");
                 }
@@ -95,6 +102,10 @@ fn main() -> Result<()> {
             println!("updated from {}", outcome.repo.display());
             if outcome.restarted {
                 println!("lgw was restarted with its previous arguments");
+                if let Some(base) = console_url(&launcher.paths().log, Duration::from_secs(5)) {
+                    println!("api:     {base}/v1");
+                    println!("console: {base}/");
+                }
             } else if outcome.was_running {
                 println!("lgw was stopped for the update; start it with: lgwl launch");
             } else {

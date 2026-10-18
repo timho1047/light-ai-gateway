@@ -31,6 +31,11 @@ implemented.
 `--config` is passed through to `lgw`; without it, `lgw` uses its normal
 resolution order relative to the directory `lgwl launch` was run from.
 
+After starting, `launch` waits briefly for the startup line and prints the API
+base (`.../v1`) and console URL. The address comes from the log, so a
+configured port 0 still prints the port the kernel actually bound. `update`
+prints the same pair when it restarts the gateway.
+
 ## Process identity
 
 The launcher stores more than a pid. A state record contains the pid, the

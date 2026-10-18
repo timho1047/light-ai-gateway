@@ -370,6 +370,35 @@ impl Launcher {
     }
 }
 
+/// Wait for the startup line that names the address the kernel actually bound.
+/// The configured listen address may be port 0, so the log is the only truthful
+/// source for the URL a client should use.
+pub fn console_url(log: &Path, timeout: Duration) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(lines) = read_tail(log, 200)
+            && let Some(url) = parse_console_url(&lines)
+        {
+            return Some(url);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn parse_console_url(lines: &[String]) -> Option<String> {
+    for line in lines.iter().rev() {
+        let Some((_, rest)) = line.split_once("console=") else {
+            continue;
+        };
+        let token = rest.split_whitespace().next()?;
+        return Some(token.trim_end_matches('/').to_string());
+    }
+    None
+}
+
 /// Tail the log without loading it more than once per command.
 pub fn read_tail(path: &Path, lines: usize) -> Result<Vec<String>> {
     let text = fs::read_to_string(path).unwrap_or_default();
@@ -684,6 +713,20 @@ mod tests {
         drop(file);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[test]
+    fn the_console_url_is_read_from_the_startup_line() {
+        let lines = vec![
+            "lgw: starting proxy".to_string(),
+            "INFO light-ai-gateway listening listen=127.0.0.1:8787 console=http://127.0.0.1:8787/"
+                .to_string(),
+        ];
+        assert_eq!(
+            parse_console_url(&lines),
+            Some("http://127.0.0.1:8787".to_string())
+        );
+        assert_eq!(parse_console_url(&[]), None);
     }
 
     #[test]
