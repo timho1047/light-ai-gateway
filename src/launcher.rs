@@ -31,6 +31,7 @@ pub struct Paths {
     pub dir: PathBuf,
     pub state: PathBuf,
     pub log: PathBuf,
+    pub ready: PathBuf,
     pub lock: PathBuf,
     pub manifest: PathBuf,
 }
@@ -40,6 +41,7 @@ impl Paths {
         Paths {
             state: dir.join("state.json"),
             log: dir.join("lgw.log"),
+            ready: dir.join("ready.json"),
             lock: dir.join("lgwl.lock"),
             manifest: dir.join("install.conf"),
             dir,
@@ -256,6 +258,7 @@ impl Launcher {
             remove_state(&self.paths)?;
         }
 
+        let _ = fs::remove_file(&self.paths.ready);
         rotate_log(&self.paths.log, LOG_ROTATE_BYTES)?;
         let mut log = OpenOptions::new()
             .create(true)
@@ -281,6 +284,7 @@ impl Launcher {
             .args(&options.args)
             .arg("serve")
             .current_dir(&options.cwd)
+            .env("LGW_READY_FILE", &self.paths.ready)
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(stderr);
@@ -362,6 +366,7 @@ impl Launcher {
                 if forced { " after SIGKILL" } else { "" }
             ),
         );
+        let _ = fs::remove_file(&self.paths.ready);
         remove_state(&self.paths)?;
         Ok(ExitOutcome::Stopped {
             pid: state.pid,
@@ -370,13 +375,16 @@ impl Launcher {
     }
 }
 
-/// Wait for the startup line that names the address the kernel actually bound.
-/// The configured listen address may be port 0, so the log is the only truthful
-/// source for the URL a client should use.
-pub fn console_url(log: &Path, timeout: Duration) -> Option<String> {
+/// Wait for the address the kernel actually bound. A new child publishes it as
+/// a readiness record; the log parser stays only as a fallback for a process
+/// started before the handshake existed.
+pub fn console_url(paths: &Paths, timeout: Duration) -> Option<String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if let Ok(lines) = read_tail(log, 200)
+        if let Some(url) = crate::readiness::read(&paths.ready) {
+            return Some(url);
+        }
+        if let Ok(lines) = read_tail(&paths.log, 200)
             && let Some(url) = parse_console_url(&lines)
         {
             return Some(url);
@@ -773,6 +781,22 @@ mod tests {
         assert_eq!(parse_console_url(&[]), None);
     }
 
+    #[test]
+    fn the_ready_record_wins_over_the_legacy_log_line() {
+        let paths = temp_paths("ready");
+        paths.ensure().unwrap();
+        fs::write(
+            &paths.log,
+            "INFO light-ai-gateway listening console=http://127.0.0.1:1111/\n",
+        )
+        .unwrap();
+        crate::readiness::write(&paths.ready, "http://127.0.0.1:2222/").unwrap();
+        assert_eq!(
+            console_url(&paths, Duration::ZERO),
+            Some("http://127.0.0.1:2222".to_string())
+        );
+        let _ = fs::remove_dir_all(&paths.dir);
+    }
     #[test]
     fn launch_tracks_the_process_and_exit_stops_it() {
         let paths = temp_paths("lifecycle");

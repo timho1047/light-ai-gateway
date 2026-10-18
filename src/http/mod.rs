@@ -698,6 +698,11 @@ pub async fn serve(config: Config, config_path: &std::path::Path) -> Result<()> 
         .with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr().context("reading the bound address")?;
     let console = console::ConsoleContext::new(&local.to_string(), local.port(), &config_path);
+    if let Some(result) = crate::readiness::publish(&format!("http://{local}/"))
+        && let Err(error) = result
+    {
+        tracing::warn!(error = %error, "could not publish the startup record");
+    }
     let shutdown_gateway = gateway.clone();
     let backend = Arc::new(GatewayBackend::new(gateway));
     let app = build_router_with_console(backend.clone(), console.clone());

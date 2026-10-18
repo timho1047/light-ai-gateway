@@ -53,7 +53,7 @@ enum Command {
 }
 
 fn print_urls(launcher: &Launcher, wait: Duration, fallback: bool) {
-    match console_url(&launcher.paths().log, wait) {
+    match console_url(launcher.paths(), wait) {
         Some(base) => {
             println!("api:     {base}/v1");
             println!("console: {base}/");
