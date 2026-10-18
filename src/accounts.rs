@@ -375,6 +375,67 @@ impl From<&PolicyConfig> for PoolPolicy {
     }
 }
 
+/// What a reconciliation changed, including which accounts the caller should
+/// probe now.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconfigured {
+    pub added: Vec<String>,
+    pub reset: Vec<String>,
+    pub retired: Vec<String>,
+    /// Retired accounts whose last in-flight attempt has now settled.
+    pub dropped: Vec<String>,
+    /// (provider, account id) pairs that need a fresh probe before serving.
+    pub probe: Vec<(ProviderId, AccountId)>,
+}
+
+/// The last_error marker that records "no longer configured", distinct from an
+/// operator disabling an account: only adding the account back clears it.
+pub const RETIRED_BY_APPLY: &str = "retired by configuration apply (no longer in the file)";
+
+fn retired_by_apply(account: &Account) -> bool {
+    account.state == AccountState::Disabled
+        && account.last_error.as_deref() == Some(RETIRED_BY_APPLY)
+}
+
+/// Copy the fields that come from configuration onto the account that keeps the
+/// runtime state. Readings, sticky bindings, pacing windows and in-flight
+/// commitments are deliberately absent: they belong to the live account.
+fn adopt_config(keep: &mut Account, fresh: &Account) {
+    keep.label = fresh.label.clone();
+    keep.base_url = fresh.base_url.clone();
+    keep.api_key = fresh.api_key.clone();
+    keep.currency = fresh.currency.clone();
+    keep.credit_multiplier = fresh.credit_multiplier;
+    keep.rpm_limit = fresh.rpm_limit;
+    keep.concurrency_limit = fresh.concurrency_limit;
+    keep.allow_metered = fresh.allow_metered;
+}
+
+fn forget_reading(account: &mut Account) {
+    account.state = AccountState::Unknown;
+    account.gates.clear();
+    account.available_at = None;
+    account.window_started_at = None;
+    account.last_probe_at = None;
+    account.last_error = None;
+}
+
+/// A newly added account serves nothing until its first probe. An account whose
+/// credential could not be resolved keeps the Disabled state and its reason.
+fn as_added(mut fresh: Account) -> Account {
+    if fresh.state != AccountState::Disabled {
+        forget_reading(&mut fresh);
+    }
+    fresh
+}
+
+fn has_in_flight(inner: &PoolInner, qualified: &str) -> bool {
+    inner
+        .inflight
+        .get(qualified)
+        .is_some_and(|entry| entry.count > 0)
+}
+
 impl Pool {
     pub fn new(accounts: Vec<Account>, policy: &PolicyConfig) -> Self {
         Pool {
@@ -419,6 +480,99 @@ impl Pool {
             Ok(mut current) => *current = next,
             Err(poisoned) => *poisoned.into_inner() = next,
         }
+    }
+
+    /// Reconcile the pool with the accounts a configuration describes.
+    ///
+    /// Accounts that stay keep everything runtime-shaped: readings, sticky
+    /// bindings, pacing windows and in-flight commitments. Their
+    /// configuration-derived fields are updated in place, so the next attempt
+    /// uses the new limits without losing what the account knows about itself.
+    /// Accounts that leave are retired rather than deleted: they stop being
+    /// selected, but an attempt already in flight can still settle. A retired
+    /// account is dropped once it is settled and the file still leaves it out.
+    ///
+    /// `reset_providers` names providers whose adapter or base URL changed; their
+    /// accounts go back to Unknown and stay out of selection until re-probed,
+    /// because every reading they hold was taken against a different endpoint.
+    pub fn reconfigure(&self, fresh: Vec<Account>, reset_providers: &[ProviderId]) -> Reconfigured {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut outcome = Reconfigured::default();
+        let mut pending: HashMap<String, Account> =
+            fresh.into_iter().map(|a| (a.qualified(), a)).collect();
+        let existing = std::mem::take(&mut inner.accounts);
+        let mut accounts: Vec<Account> = Vec::with_capacity(existing.len() + pending.len());
+        let mut forget_sticky_for: Vec<String> = Vec::new();
+
+        for mut account in existing {
+            let qualified = account.qualified();
+            let Some(fresh) = pending.remove(&qualified) else {
+                // No longer configured.
+                if retired_by_apply(&account) {
+                    if has_in_flight(&inner, &qualified) {
+                        accounts.push(account);
+                    } else {
+                        outcome.dropped.push(qualified);
+                    }
+                } else if has_in_flight(&inner, &qualified) {
+                    account.state = AccountState::Disabled;
+                    account.last_error = Some(RETIRED_BY_APPLY.to_string());
+                    outcome.retired.push(qualified.clone());
+                    forget_sticky_for.push(qualified);
+                    accounts.push(account);
+                } else {
+                    account.state = AccountState::Disabled;
+                    account.last_error = Some(RETIRED_BY_APPLY.to_string());
+                    outcome.retired.push(qualified.clone());
+                    outcome.dropped.push(qualified.clone());
+                    forget_sticky_for.push(qualified);
+                }
+                continue;
+            };
+
+            if retired_by_apply(&account) {
+                // Added back: this is a new account, not the retired shell.
+                accounts.push(as_added(fresh));
+                outcome.added.push(qualified);
+                continue;
+            }
+
+            adopt_config(&mut account, &fresh);
+            if fresh.state == AccountState::Disabled {
+                // The new credential source cannot be resolved; keep the
+                // readings but stop selecting the account until it is fixed.
+                account.state = AccountState::Disabled;
+                account.last_error = fresh.last_error.clone();
+            } else if reset_providers.contains(&account.provider) {
+                forget_reading(&mut account);
+                outcome
+                    .probe
+                    .push((account.provider.clone(), account.id.clone()));
+                outcome.reset.push(qualified);
+            }
+            accounts.push(account);
+        }
+
+        for (qualified, fresh) in pending {
+            let account = as_added(fresh);
+            if account.state != AccountState::Disabled {
+                outcome
+                    .probe
+                    .push((account.provider.clone(), account.id.clone()));
+            }
+            outcome.added.push(qualified);
+            accounts.push(account);
+        }
+
+        for qualified in &outcome.dropped {
+            inner.inflight.remove(qualified);
+            inner.rpm_window.remove(qualified);
+        }
+        for qualified in &forget_sticky_for {
+            forget_sticky(&mut inner, qualified);
+        }
+        inner.accounts = accounts;
+        outcome
     }
 
     pub fn note_activity(&self) {
@@ -1453,6 +1607,209 @@ mod tests {
     /// spending it is off. Before the class split this account reported
     /// has_covered() == true and was refused as "headroom below the estimate",
     /// naming a covered window that does not exist.
+    #[test]
+    fn reconfiguring_keeps_readings_sticky_sessions_and_commitments() {
+        let pool = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![gate(
+                    GateKind::FiveHour,
+                    Decimal::from(10),
+                    Decimal::from(4),
+                    None,
+                )],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        let first = pool
+            .select("p", "", Some("s1"), Decimal::ONE, "r1", 0, &[])
+            .expect("one account is eligible");
+        assert_eq!(first.plan().account_id, "a");
+        first.settle(Decimal::ZERO, false);
+
+        let mut fresh = acct("a", "p", Vec::new(), AccountState::Active);
+        fresh.label = "renamed".to_string();
+        fresh.currency = "CNY".to_string();
+        fresh.credit_multiplier = Decimal::from(2);
+        fresh.rpm_limit = Some(7);
+        fresh.concurrency_limit = Some(2);
+        fresh.allow_metered = Some(true);
+        let outcome = pool.reconfigure(vec![fresh], &[]);
+        assert!(outcome.added.is_empty());
+        assert!(outcome.reset.is_empty());
+        assert!(outcome.retired.is_empty());
+
+        let snapshot = pool.snapshot();
+        let kept = snapshot.iter().find(|a| a.id == "a").expect("account kept");
+        assert_eq!(kept.label, "renamed");
+        assert_eq!(kept.currency, "CNY");
+        assert_eq!(kept.credit_multiplier, Decimal::from(2));
+        assert_eq!(kept.rpm_limit, Some(7));
+        assert_eq!(kept.concurrency_limit, Some(2));
+        assert_eq!(kept.allow_metered, Some(true));
+        assert_eq!(kept.state, AccountState::Active);
+        assert_eq!(kept.gates.len(), 1, "readings survive an apply");
+        assert_eq!(kept.gates[0].used, Decimal::from(4));
+
+        let again = pool
+            .select("p", "", Some("s1"), Decimal::ONE, "r2", 0, &[])
+            .expect("the sticky session still has an account");
+        assert_eq!(again.plan().account_id, "a", "sticky binding survives");
+        again.settle(Decimal::ZERO, false);
+    }
+
+    #[test]
+    fn a_new_account_is_unknown_and_serves_nothing_until_probed() {
+        let pool = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![gate(
+                    GateKind::FiveHour,
+                    Decimal::from(10),
+                    Decimal::from(1),
+                    None,
+                )],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        let outcome = pool.reconfigure(
+            vec![
+                acct("a", "p", Vec::new(), AccountState::Active),
+                acct("b", "p", Vec::new(), AccountState::Active),
+            ],
+            &[],
+        );
+        assert_eq!(outcome.added, vec!["p/b".to_string()]);
+        assert!(outcome.probe.contains(&("p".to_string(), "b".to_string())));
+
+        let new = pool
+            .snapshot()
+            .into_iter()
+            .find(|a| a.id == "b")
+            .expect("the new account is in the pool");
+        assert_eq!(new.state, AccountState::Unknown);
+        assert!(new.gates.is_empty());
+
+        let chosen = pool
+            .select("p", "", None, Decimal::ONE, "r1", 0, &[])
+            .expect("the known account serves");
+        assert_eq!(
+            chosen.plan().account_id,
+            "a",
+            "the unknown account is skipped"
+        );
+        chosen.settle(Decimal::ZERO, false);
+
+        pool.apply_probe(
+            "p/b",
+            vec![gate(
+                GateKind::FiveHour,
+                Decimal::from(10),
+                Decimal::from(1),
+                None,
+            )],
+            now(),
+        );
+        let probed = pool.snapshot().into_iter().find(|a| a.id == "b").unwrap();
+        assert_eq!(probed.state, AccountState::Active);
+        assert_eq!(probed.gates.len(), 1);
+    }
+
+    #[test]
+    fn a_removed_account_retires_after_its_in_flight_attempt_settles() {
+        let pool = Pool::new(
+            vec![
+                acct(
+                    "a",
+                    "p",
+                    vec![gate(
+                        GateKind::FiveHour,
+                        Decimal::from(10),
+                        Decimal::from(1),
+                        None,
+                    )],
+                    AccountState::Active,
+                ),
+                acct(
+                    "b",
+                    "p",
+                    vec![gate(
+                        GateKind::FiveHour,
+                        Decimal::from(10),
+                        Decimal::from(1),
+                        None,
+                    )],
+                    AccountState::Active,
+                ),
+            ],
+            &policy(),
+        );
+        let reservation = pool
+            .select("p", "", None, Decimal::ONE, "r1", 0, &[])
+            .expect("eligible");
+        let victim = reservation.qualified_account();
+        let (victim_id, keeper) = if victim == "p/a" {
+            ("a", "b")
+        } else {
+            ("b", "a")
+        };
+        let keep_fresh = acct(keeper, "p", Vec::new(), AccountState::Active);
+
+        let outcome = pool.reconfigure(vec![keep_fresh.clone()], &[]);
+        assert_eq!(outcome.retired, vec![victim.clone()]);
+        let retired = pool
+            .snapshot()
+            .into_iter()
+            .find(|a| a.id == victim_id)
+            .expect("the retired account stays until it settles");
+        assert_eq!(retired.state, AccountState::Disabled);
+        assert_eq!(retired.last_error.as_deref(), Some(RETIRED_BY_APPLY));
+
+        reservation.settle(Decimal::ZERO, false);
+        assert_eq!(pool.inflight_count(&victim), 0);
+
+        let cleanup = pool.reconfigure(vec![keep_fresh], &[]);
+        assert!(cleanup.dropped.contains(&victim));
+        assert!(
+            pool.snapshot().iter().all(|a| a.id != victim_id),
+            "a settled retired account is dropped from the pool"
+        );
+    }
+
+    #[test]
+    fn a_changed_provider_binding_resets_its_accounts_to_unknown() {
+        let pool = Pool::new(
+            vec![acct(
+                "a",
+                "p",
+                vec![gate(
+                    GateKind::FiveHour,
+                    Decimal::from(10),
+                    Decimal::from(3),
+                    None,
+                )],
+                AccountState::Active,
+            )],
+            &policy(),
+        );
+        let outcome = pool.reconfigure(
+            vec![acct("a", "p", Vec::new(), AccountState::Active)],
+            &["p".to_string()],
+        );
+        assert_eq!(outcome.reset, vec!["p/a".to_string()]);
+        assert!(outcome.probe.contains(&("p".to_string(), "a".to_string())));
+        let account = &pool.snapshot()[0];
+        assert_eq!(account.state, AccountState::Unknown);
+        assert!(
+            account.gates.is_empty(),
+            "a reading from the old endpoint is worthless"
+        );
+    }
+
     #[test]
     fn a_free_allowance_alone_is_not_covered_money() {
         let p = Pool::new(

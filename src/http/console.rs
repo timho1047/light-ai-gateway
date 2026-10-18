@@ -371,7 +371,7 @@ fn live_scope_refusals(changes: &[DraftChange]) -> Vec<String> {
     let mut fields: Vec<String> = Vec::new();
     for change in changes {
         let section = change.path.first().map(String::as_str).unwrap_or("");
-        if section != "policy" {
+        if section != "policy" && section != "providers" {
             let field = change.path.join(".");
             if !fields.contains(&field) {
                 fields.push(field);

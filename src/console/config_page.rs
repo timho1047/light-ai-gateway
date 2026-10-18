@@ -170,18 +170,42 @@ pub fn render(view: &ConfigView) -> String {
         }
         for (provider, cfg) in &view.config.providers {
             subhead(body, &format!("providers.{provider}"));
-            field(body, "adapter", adapter_name(cfg.adapter), true, s);
-            field(body, "base_url", &cfg.base_url, true, s);
-            field(
+            let provider_path: [&str; 2] = ["providers", provider.as_str()];
+            editable_text(
                 body,
-                "probe_base_url",
-                cfg.probe_base_url.as_deref().unwrap_or("—"),
+                &[provider_path[0], provider_path[1], "adapter"],
+                "adapter",
+                adapter_name(cfg.adapter),
                 true,
                 s,
             );
-            field(body, "currency", &cfg.currency, true, s);
-            field(
+            editable_text(
                 body,
+                &[provider_path[0], provider_path[1], "base_url"],
+                "base_url",
+                &cfg.base_url,
+                true,
+                s,
+            );
+            editable_text(
+                body,
+                &[provider_path[0], provider_path[1], "probe_base_url"],
+                "probe_base_url",
+                cfg.probe_base_url.as_deref().unwrap_or(""),
+                true,
+                s,
+            );
+            editable_text(
+                body,
+                &[provider_path[0], provider_path[1], "currency"],
+                "currency",
+                &cfg.currency,
+                true,
+                s,
+            );
+            editable_text(
+                body,
+                &[provider_path[0], provider_path[1], "credit_multiplier"],
                 "credit_multiplier",
                 &cfg.credit_multiplier
                     .map(fnum)
@@ -200,7 +224,7 @@ pub fn render(view: &ConfigView) -> String {
             );
             for (id, account) in &cfg.accounts {
                 subhead(body, &format!("providers.{provider}.accounts.{id}"));
-                account_fields(body, account, &cfg.currency, s);
+                account_fields(body, provider, id, account, &cfg.currency, s);
             }
         }
     }));
@@ -549,8 +573,15 @@ fn field(out: &mut String, label: &str, value: &str, applies_live: bool, s: &Str
     );
 }
 
-fn account_fields(out: &mut String, account: &AccountConfig, provider_currency: &str, s: &Strings) {
-    let label = account.label.clone().unwrap_or_else(|| "—".to_string());
+fn account_fields(
+    out: &mut String,
+    provider: &str,
+    id: &str,
+    account: &AccountConfig,
+    provider_currency: &str,
+    s: &Strings,
+) {
+    let label = account.label.clone().unwrap_or_default();
     let source = account
         .key
         .as_ref()
@@ -560,11 +591,45 @@ fn account_fields(out: &mut String, account: &AccountConfig, provider_currency: 
         .currency
         .clone()
         .unwrap_or_else(|| provider_currency.to_string());
-    field(out, "label", &label, true, s);
-    field(out, "key source", &source, true, s);
-    field(out, "currency", &currency, true, s);
-    field(
+    let account_path: [&str; 4] = ["providers", provider, "accounts", id];
+    editable_text(
         out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "label",
+        ],
+        "label",
+        &label,
+        true,
+        s,
+    );
+    field(out, "key source", &source, true, s);
+    editable_text(
+        out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "currency",
+        ],
+        "currency",
+        &currency,
+        true,
+        s,
+    );
+    editable_text(
+        out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "credit_multiplier",
+        ],
         "credit_multiplier",
         &account
             .credit_multiplier
@@ -573,23 +638,34 @@ fn account_fields(out: &mut String, account: &AccountConfig, provider_currency: 
         true,
         s,
     );
-    field(
+    editable_text(
         out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "concurrency_limit",
+        ],
         "concurrency_limit",
         &account
             .concurrency_limit
             .map(|v| v.to_string())
-            .unwrap_or_else(|| "—".to_string()),
+            .unwrap_or_default(),
         true,
         s,
     );
-    field(
+    editable_text(
         out,
+        &[
+            account_path[0],
+            account_path[1],
+            account_path[2],
+            account_path[3],
+            "rpm_limit",
+        ],
         "rpm_limit",
-        &account
-            .rpm_limit
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "—".to_string()),
+        &account.rpm_limit.map(|v| v.to_string()).unwrap_or_default(),
         true,
         s,
     );

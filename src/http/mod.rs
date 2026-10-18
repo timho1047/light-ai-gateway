@@ -36,6 +36,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
 
+/// Providers whose endpoint or adapter changed. Their accounts have to be
+/// re-probed before they serve: every reading they hold was taken against a
+/// different endpoint.
+fn providers_needing_reset(old: &Config, new: &Config) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (name, provider) in &new.providers {
+        if let Some(previous) = old.providers.get(name)
+            && (previous.adapter != provider.adapter
+                || previous.base_url != provider.base_url
+                || previous.probe_base_url != provider.probe_base_url)
+        {
+            changed.push(name.clone());
+        }
+    }
+    changed
+}
+
 /// Why a validated configuration could not be made live. The file and the
 /// running snapshot are both unchanged when this is returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,12 +299,40 @@ impl ProxyBackend for GatewayBackend {
         config: Config,
         write: &mut dyn FnMut() -> std::io::Result<()>,
     ) -> std::result::Result<(), ApplyError> {
-        let prices = self.gateway.runtime().prices_arc();
+        let current = self.gateway.runtime();
+        let reset_providers = providers_needing_reset(current.config(), &config);
+        let prices = current.prices_arc();
         let runtime = Runtime::new(Arc::new(config.clone()), prices)
             .map_err(|error| ApplyError(error.to_string()))?;
+
+        // Everything the credential store can refuse happens before the write.
+        let (mut accounts, unusable) = config
+            .build_accounts_lenient(&self.gateway.credentials)
+            .map_err(|error| ApplyError(error.to_string()))?;
+        accounts.extend(unusable);
+        if accounts.is_empty() {
+            return Err(ApplyError(
+                "no account could be loaded: every configured account is missing a credential"
+                    .to_string(),
+            ));
+        }
+
         write().map_err(|error| ApplyError(format!("writing the configuration: {error}")))?;
         self.gateway.pool.retune(&config.policy);
         self.gateway.install_runtime(Arc::new(runtime));
+        let outcome = self.gateway.pool.reconfigure(accounts, &reset_providers);
+
+        // New and reset accounts stay out of selection until a probe succeeds.
+        // The apply has already succeeded; a probe that fails publishes its
+        // error through the account's last_error on the next attempt.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            for (provider, account) in outcome.probe {
+                let gateway = self.gateway.clone();
+                handle.spawn(async move {
+                    gateway.probe_account(&provider, &account).await;
+                });
+            }
+        }
         Ok(())
     }
 

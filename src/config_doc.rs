@@ -245,6 +245,16 @@ pub fn editable_kind(path: &[String]) -> Option<ValueKind> {
     let path: Vec<&str> = path.iter().map(String::as_str).collect();
     match path.as_slice() {
         ["server", "listen"] | ["server", "db_path"] => Some(ValueKind::String),
+        ["providers", _, "adapter"]
+        | ["providers", _, "base_url"]
+        | ["providers", _, "probe_base_url"]
+        | ["providers", _, "currency"]
+        | ["providers", _, "accounts", _, "label"]
+        | ["providers", _, "accounts", _, "currency"] => Some(ValueKind::String),
+        ["providers", _, "credit_multiplier"]
+        | ["providers", _, "accounts", _, "credit_multiplier"] => Some(ValueKind::Float),
+        ["providers", _, "accounts", _, "concurrency_limit"]
+        | ["providers", _, "accounts", _, "rpm_limit"] => Some(ValueKind::Integer),
         ["policy", "soft_threshold"]
         | ["policy", "drift_threshold"]
         | ["policy", "hard_margin"] => Some(ValueKind::Float),

@@ -409,10 +409,17 @@ impl ProxyBackend for FakeBackend {
         config: Config,
         write: &mut dyn FnMut() -> std::io::Result<()>,
     ) -> std::result::Result<(), crate::http::ApplyError> {
+        let reset_providers =
+            crate::http::providers_needing_reset(self.runtime().config(), &config);
         let runtime = runtime_for(&config);
+        let (mut accounts, unusable) = config
+            .build_accounts_lenient(&crate::secrets::CredentialStore::memory())
+            .map_err(|error| crate::http::ApplyError(error.to_string()))?;
+        accounts.extend(unusable);
         write().map_err(|error| crate::http::ApplyError(error.to_string()))?;
         self.pool.retune(&config.policy);
         self.install_runtime(runtime);
+        self.pool.reconfigure(accounts, &reset_providers);
         *self.applied.lock().unwrap() = Some(config);
         Ok(())
     }
@@ -1901,17 +1908,16 @@ async fn a_restart_only_apply_is_refused_by_name_and_writes_nothing() {
 async fn an_apply_of_a_section_without_a_live_path_is_refused_and_writes_nothing() {
     let (addr, _fake, path, dir) = apply_router().await;
     let before = std::fs::read(&path).unwrap();
+    // Routes still have no live apply path; this must be refused by name even
+    // though the draft itself is a valid document edit.
     let response = post_apply(
         &addr,
-        &apply_body(
-            &["providers", "mock", "base_url"],
-            "https://elsewhere.example/v1",
-        ),
+        &apply_body(&["routes", "mock/model"], "another-provider"),
     )
     .await;
     assert_eq!(response.status(), 422);
     let html = response.text().await.unwrap();
-    assert!(html.contains("providers.mock.base_url"));
+    assert!(html.contains("routes.mock/model"));
     assert!(html.contains("cannot be applied"));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2079,4 +2085,132 @@ async fn an_invalid_apply_changes_neither_the_file_nor_the_snapshot() {
     );
     assert_eq!(fake.runtime().config().policy.soft_threshold, 0.8);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn compiled_body(changes: &[(&[&str], &str)]) -> serde_json::Value {
+    let draft: Vec<serde_json::Value> = changes
+        .iter()
+        .map(|(path, value)| {
+            serde_json::json!({
+                "path": path,
+                "value": value,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(APPLY_TOML),
+        "draft": draft,
+    })
+}
+
+#[tokio::test]
+async fn applying_an_account_edit_keeps_its_readings_and_sticky_state() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let before = fake
+        .pool
+        .snapshot()
+        .into_iter()
+        .find(|a| a.id == "a1")
+        .expect("a1 is in the pool");
+    assert_eq!(before.gates[0].used, Decimal::from(1));
+
+    let response = client_apply(
+        &addr,
+        &compiled_body(&[
+            (&["providers", "mock", "accounts", "a1", "label"], "renamed"),
+            (&["providers", "mock", "accounts", "a1", "rpm_limit"], "5"),
+        ]),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("label = \"renamed\""));
+    assert!(on_disk.contains("rpm_limit = 5"));
+
+    let after = fake
+        .pool
+        .snapshot()
+        .into_iter()
+        .find(|a| a.id == "a1")
+        .expect("a1 stays in the pool");
+    assert_eq!(after.label, "renamed");
+    assert_eq!(after.rpm_limit, Some(5));
+    assert_eq!(after.state, crate::domain::AccountState::Active);
+    assert_eq!(after.gates[0].used, Decimal::from(1), "readings survive");
+    let published = fake.applied.lock().unwrap().clone().expect("published");
+    let account = &published.providers["mock"].accounts["a1"];
+    assert_eq!(account.label.as_deref(), Some("renamed"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn changing_a_provider_endpoint_resets_its_accounts_to_unknown() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let response = client_apply(
+        &addr,
+        &compiled_body(&[(&["providers", "mock", "base_url"], "http://127.0.0.1:2/v1")]),
+    )
+    .await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("base_url = \"http://127.0.0.1:2/v1\"")
+    );
+    for account in fake.pool.snapshot() {
+        assert_eq!(
+            account.state,
+            crate::domain::AccountState::Unknown,
+            "a reading from the old endpoint must not serve the new one"
+        );
+        assert!(account.gates.is_empty());
+    }
+    assert_eq!(
+        fake.runtime().config().providers["mock"].base_url,
+        "http://127.0.0.1:2/v1"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_invalid_account_edit_leaves_the_pool_and_file_unchanged() {
+    let (addr, fake, path, dir) = apply_router().await;
+    let before_file = std::fs::read(&path).unwrap();
+    let before_pool = fake.pool.snapshot();
+    let response = client_apply(
+        &addr,
+        &compiled_body(&[(
+            &["providers", "mock", "accounts", "a1", "rpm_limit"],
+            "many",
+        )]),
+    )
+    .await;
+    assert_eq!(response.status(), 422);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("providers.mock.accounts.a1.rpm_limit"));
+    assert!(html.contains("not an integer"));
+    assert_eq!(std::fs::read(&path).unwrap(), before_file);
+    assert!(fake.applied.lock().unwrap().is_none());
+    let after_pool = fake.pool.snapshot();
+    assert_eq!(after_pool.len(), before_pool.len());
+    for (before, after) in before_pool.iter().zip(after_pool.iter()) {
+        assert_eq!(before.gates.len(), after.gates.len());
+        for (left, right) in before.gates.iter().zip(after.gates.iter()) {
+            assert_eq!(left.kind, right.kind);
+            assert_eq!(left.used, right.used);
+            assert_eq!(left.cap, right.cap);
+        }
+        assert_eq!(before.state, after.state);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn client_apply(addr: &str, body: &serde_json::Value) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{addr}/console/api/config/apply?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(body)
+        .send()
+        .await
+        .unwrap()
 }
