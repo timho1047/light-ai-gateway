@@ -169,10 +169,19 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (provider, model, tier)
 );
 
--- Only ts is indexed. account_id and session_key are written and never
--- filtered on; attempts(request_id) and usage_daily(day) duplicate the leftmost
--- column of their table's primary key, which already has an index.
-CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
+-- Timestamp alone answers "the newest N requests". The console's usage,
+-- requests, latency and failure views add a time range to a provider, model,
+-- account or coverage filter, so each of those leads with the filter column and
+-- ends with ts; one index per filtered dimension keeps those scans narrow without
+-- changing what is stored. attempts is the latency and failure source, filtered
+-- by provider over a window.
+CREATE INDEX IF NOT EXISTS idx_requests_ts            ON requests(ts);
+CREATE INDEX IF NOT EXISTS idx_requests_provider_ts   ON requests(provider, ts);
+CREATE INDEX IF NOT EXISTS idx_requests_model_ts      ON requests(model, ts);
+CREATE INDEX IF NOT EXISTS idx_requests_account_ts    ON requests(account_id, ts);
+CREATE INDEX IF NOT EXISTS idx_requests_coverage_ts   ON requests(coverage, ts);
+CREATE INDEX IF NOT EXISTS idx_attempts_provider_started
+    ON attempts(provider, started_at);
 "#;
 
 /// Bumped whenever a change cannot be applied to existing rows in place.
@@ -181,7 +190,12 @@ CREATE INDEX IF NOT EXISTS idx_requests_ts       ON requests(ts);
 /// written under the old key cannot be attributed to a provider, so the account
 /// and gate tables are rebuilt rather than guessed at. Usage history already
 /// carried provider and is preserved.
-pub const SCHEMA_VERSION: i64 = 7;
+///
+/// 8: the console's usage, requests and latency views need indexes on the
+/// filtered dimensions. Additive only: the statements are in SCHEMA and
+/// IF NOT EXISTS, so an older ledger gains them when it is opened for writing
+/// and no row is rewritten.
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The version at which account identity changed from id alone to
 /// (provider, id). Only a database older than THIS needs the rebuild; later
@@ -1647,6 +1661,59 @@ mod tests {
         // Idempotent: a second call must not rebuild anything.
         init_schema(&conn).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// The console filters usage rows by provider, model, account and coverage
+    /// inside a time range; those scans must stay indexed. A ledger written by
+    /// an older build gains the indexes on the next write-open and keeps its rows.
+    #[test]
+    fn the_console_indexes_arrive_without_rewriting_rows() {
+        let db = TempDb::new("console-indexes");
+        {
+            let mut conn = crate::store::open(&db.path).expect("create");
+            insert_req(&mut conn, &request("kept", 1_000, "p", "a", "m", "1"));
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_requests_provider_ts;
+                 DROP INDEX IF EXISTS idx_requests_model_ts;
+                 DROP INDEX IF EXISTS idx_requests_account_ts;
+                 DROP INDEX IF EXISTS idx_requests_coverage_ts;
+                 DROP INDEX IF EXISTS idx_attempts_provider_started;
+                 INSERT INTO meta (key, value) VALUES ('schema_version', '7')
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
+            )
+            .expect("simulate a ledger written before the console indexes");
+        }
+
+        let conn = crate::store::open(&db.path).expect("open and migrate");
+
+        let names: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query");
+            rows.collect::<rusqlite::Result<Vec<_>>>().expect("collect")
+        };
+        for expected in [
+            "idx_requests_provider_ts",
+            "idx_requests_model_ts",
+            "idx_requests_account_ts",
+            "idx_requests_coverage_ts",
+            "idx_attempts_provider_started",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected}: {names:?}"
+            );
+        }
+        assert_eq!(schema_version(&conn).expect("version"), SCHEMA_VERSION);
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM requests WHERE id = 'kept'", [], |r| {
+                r.get(0)
+            })
+            .expect("count kept row");
+        assert_eq!(kept, 1, "adding indexes must not rewrite request rows");
     }
 
     #[test]
