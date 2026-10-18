@@ -2,8 +2,8 @@
 
 [English](0004-console-in-the-binary.md) | **简体中文**
 
-安装路径是 `cargo install --path . --locked`，产出一个自包含的二进制；仓库里没有 Node
-工具链，也没有 CI。用 Vite/React 做控制台，要么得装 Node 才能构建 —— 打破那条安装
+安装路径是 `cargo install --path . --locked`，产出两个自包含的二进制（网关和一个小型启动器）；
+仓库里没有 Node 工具链，也没有 CI。用 Vite/React 做控制台，要么得装 Node 才能构建 —— 打破那条安装
 承诺 —— 要么就得把生成出来的产物提交进仓库。所以控制台是 Rust 服务端渲染的 HTML，加
 少量手写 JavaScript；CSS、JS 和图标用 `include_str!` / `include_bytes!` 嵌进去。开发用
 的覆盖开关（`LGW_UI_DIR`）会从磁盘读资源。运行时没有 CDN，也没有第三方脚本；字体走系统

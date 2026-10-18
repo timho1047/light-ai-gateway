@@ -2,8 +2,9 @@
 
 **English** | [简体中文](0004-console-in-the-binary.zh-CN.md)
 
-The install path is `cargo install --path . --locked` producing one
-self-contained binary, and the repository has no Node toolchain and no CI. A
+The install path is `cargo install --path . --locked` producing self-contained
+binaries (the gateway and its small launcher), and the repository has no Node
+toolchain and no CI. A
 Vite/React console would either require Node to build -- breaking that install
 claim -- or commit generated artefacts. The console is therefore server-rendered
 HTML from Rust plus a small amount of hand-written JavaScript, with CSS, JS and

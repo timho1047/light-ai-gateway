@@ -52,11 +52,13 @@ Requires Rust **1.88 or newer**. The credential store binds to macOS Keychain,
 Windows Credential Manager and the freedesktop Secret Service; only macOS needs
 the signing step below.
 
-The build produces one self-contained binary: no runtime, no interpreter.
+The build produces two self-contained binaries, `lgw` and `lgwl`, with no runtime
+and no interpreter.
 
     cargo install --path . --locked
 
-That builds in release mode and puts `lgw` on your PATH (`~/.cargo/bin`). Check it:
+That builds in release mode and puts both binaries on your PATH (`~/.cargo/bin`).
+Check them:
 
     lgw --version
 
@@ -64,7 +66,7 @@ That builds in release mode and puts `lgw` on your PATH (`~/.cargo/bin`). Check 
 
     scripts/lgw-install.sh
 
-It runs the same `cargo install` and then signs the result. Skip it and the keychain
+It runs the same `cargo install` and then signs both binaries. Skip it and the keychain
 asks for your password once per key, on every run -- see
 [Credentials](#credentials). The first time you also need
 `scripts/lgw-identity.sh`, which creates the certificate.
@@ -81,7 +83,9 @@ To remove it again:
 
     cargo uninstall light-ai-gateway
 
-Re-run cargo install after pulling changes; it replaces the binary in place.
+After pulling changes, run `lgwl update`. It stops a running gateway, re-runs this
+installer, and restarts the gateway with the same arguments; `--no-restart` leaves it
+stopped. See [docs/launcher.md](docs/launcher.md).
 
 ## Quick start
 
@@ -93,7 +97,12 @@ Re-run cargo install after pulling changes; it replaces the binary in place.
     lgw keys list                                 # check everything resolves
 
     lgw doctor                                    # config, credentials, probe reachability
-    lgw serve                                     # proxy + console on http://127.0.0.1:8787/
+    lgwl launch                                   # proxy + console in the background
+    lgwl status                                   # is it running?
+    lgwl log                                      # follow its log; Ctrl-C stops only the viewer
+    lgwl exit                                     # stop it
+
+`lgw serve` remains available when you want the log in the foreground.
 
 The same address serves the console: open http://127.0.0.1:8787/ for the board,
 usage, recent requests and the configuration editor. It answers loopback
@@ -101,7 +110,9 @@ requests only and needs no login.
 
 Where things live:
 
-    ~/.cargo/bin/lgw                          the binary
+    ~/.cargo/bin/lgw                          the gateway binary
+    ~/.cargo/bin/lgwl                         the background launcher
+    ~/.light-ai-gateway/lgwl/                 launcher pid/log state
     ~/.light-ai-gateway/config.toml             configuration
     ~/.light-ai-gateway/gateway.db              usage ledger (SQLite)
     the OS credential store                     API keys

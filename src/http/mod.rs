@@ -697,6 +697,7 @@ pub async fn serve(config: Config, config_path: &std::path::Path) -> Result<()> 
         .with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr().context("reading the bound address")?;
     let console = console::ConsoleContext::new(&local.to_string(), local.port(), &config_path);
+    let shutdown_gateway = gateway.clone();
     let backend = Arc::new(GatewayBackend::new(gateway));
     let app = build_router_with_console(backend.clone(), console.clone());
     // The file is already live: mark it handled so the first watcher tick does
@@ -718,13 +719,80 @@ pub async fn serve(config: Config, config_path: &std::path::Path) -> Result<()> 
         console = %format!("http://{local}/"),
         "light-ai-gateway listening"
     );
-    axum::serve(
+    // SIGTERM is how lgwl exit asks; SIGINT keeps Ctrl-C working. The server
+    // stops accepting, lets open requests finish, then flushes the ledger. A
+    // streaming response that never ends would hold the process open forever,
+    // so a watchdog flushes and exits after a bounded wait.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let mut force_rx = shutdown_rx.clone();
+    let force_gateway = shutdown_gateway.clone();
+    let force = tokio::spawn(async move {
+        while !*force_rx.borrow_and_update() {
+            if force_rx.changed().await.is_err() {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        tracing::warn!("graceful shutdown timed out; flushing the ledger and exiting");
+        if let Err(error) = force_gateway.shutdown() {
+            tracing::error!(error = %error, "final ledger flush failed");
+        }
+        std::process::exit(0);
+    });
+    let shutdown = {
+        let mut rx = shutdown_rx;
+        async move {
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    .context("serving HTTP")?;
+    .with_graceful_shutdown(shutdown)
+    .await;
+    force.abort();
+    served.context("serving HTTP")?;
+    shutdown_gateway
+        .shutdown()
+        .context("flushing the ledger on shutdown")?;
+    tracing::info!("light-ai-gateway stopped");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        let signal = async {
+            match terminate.as_mut() {
+                Some(terminate) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = terminate.recv() => {}
+                    }
+                }
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        };
+        signal.await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    tracing::info!("shutdown signal received; draining");
 }
 
 /// Build the axum router. Exposed for integration tests.

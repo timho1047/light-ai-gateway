@@ -13,6 +13,7 @@ pub mod error;
 pub mod http;
 pub mod interval;
 pub mod keys;
+pub mod launcher;
 pub mod meter;
 pub mod prices;
 pub mod quota;

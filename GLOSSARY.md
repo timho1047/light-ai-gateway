@@ -252,3 +252,15 @@ Where an Account's key comes from: the operating-system credential store, an
 environment variable, a file, or the config file itself. The Console writes keys
 only to the credential store and never reads one back.
 _Avoid_: key field, secret ref
+
+**Launcher**:
+The lgwl program that starts, stops, updates and tails one background lgw serve
+process. It is a small process supervisor, not a service manager: no login start
+and no crash restart.
+_Avoid_: daemon, service, supervisor (it supervises one process only)
+
+**Launch record**:
+The state file that lets the Launcher recognise its gateway: pid, process start
+time, launch arguments and working directory. The start time is what makes a
+pid an identity.
+_Avoid_: pid file, lock file

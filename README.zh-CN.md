@@ -48,11 +48,11 @@
 要求 Rust **1.88 或更新**。凭据存在操作系统自带的凭据库里（macOS 钥匙串、Windows
 Credential Manager、freedesktop Secret Service），只有 macOS 需要下面那一步签名。
 
-编译产物就是一个自包含的二进制：没有运行时，没有解释器。
+编译产物是两个自包含的二进制 `lgw` 和 `lgwl`：没有运行时，没有解释器。
 
     cargo install --path . --locked
 
-它以 release 模式编译，并把 `lgw` 装进 PATH（`~/.cargo/bin`）。验证一下：
+它以 release 模式编译，并把两个二进制装进 PATH（`~/.cargo/bin`）。验证一下：
 
     lgw --version
 
@@ -60,7 +60,7 @@ Credential Manager、freedesktop Secret Service），只有 macOS 需要下面�
 
     scripts/lgw-install.sh
 
-它做的是同一条 `cargo install`，然后给产物签名。跳过这步，钥匙串会在每次运行时按每个
+它做的是同一条 `cargo install`，然后给两个二进制签名。跳过这步，钥匙串会在每次运行时按每个
 已存的 key 弹一次密码框 —— 见 [凭据](#凭据)。第一次还需要先跑
 `scripts/lgw-identity.sh` 生成证书。
 
@@ -76,7 +76,8 @@ Credential Manager、freedesktop Secret Service），只有 macOS 需要下面�
 
     cargo uninstall light-ai-gateway
 
-拉到新代码后重新 `cargo install` 就行，它会原地替换掉旧二进制。
+拉到新代码后运行 `lgwl update`：它会停掉正在运行的网关、重跑安装器，并用原参数重启；
+`--no-restart` 则保持停止。详见 [docs/launcher.zh-CN.md](docs/launcher.zh-CN.md)。
 
 ## 快速开始
 
@@ -88,14 +89,21 @@ Credential Manager、freedesktop Secret Service），只有 macOS 需要下面�
     lgw keys list                                 # 确认都能解析出密钥
 
     lgw doctor                                    # 配置、凭据、探测连通性
-    lgw serve                                     # 代理 + 控制台，都在 http://127.0.0.1:8787/
+    lgwl launch                                   # 后台启动代理 + 控制台
+    lgwl status                                   # 在跑吗？
+    lgwl log                                      # 跟随日志；Ctrl-C 只退出查看器
+    lgwl exit                                     # 停掉它
+
+想在终端里直接看日志时，仍可以用 `lgw serve`。
 
 同一个地址也提供控制台：打开 http://127.0.0.1:8787/，看板、用量、最近的请求和配置编辑器
 都在这里。它只回应 loopback 请求，不需要登录。
 
 各文件的位置：
 
-    ~/.cargo/bin/lgw                          二进制本体
+    ~/.cargo/bin/lgw                          网关二进制
+    ~/.cargo/bin/lgwl                         后台启动器
+    ~/.light-ai-gateway/lgwl/                 启动器 pid/日志状态
     ~/.light-ai-gateway/config.toml           配置
     ~/.light-ai-gateway/gateway.db            用量账本（SQLite）
     操作系统的凭据库                          API key
