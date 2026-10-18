@@ -11,3 +11,4 @@ pub mod config_page;
 pub mod copy;
 pub mod guard;
 pub mod layout;
+pub mod violations;

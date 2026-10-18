@@ -14,6 +14,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Value};
 
 /// One read of the configuration file, kept as bytes-shaped TOML.
+#[derive(Debug)]
 pub struct ConfigDocument {
     raw: String,
     document: DocumentMut,
@@ -124,6 +125,250 @@ fn redact_item(item: &mut Item) {
     *item = Item::Value(redacted);
 }
 
+/// One field the configuration form wants to change: a path from the document
+/// root (a key per segment) and the text the operator typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftChange {
+    pub path: Vec<String>,
+    pub value: String,
+}
+
+/// A draft that cannot be applied to the document, named by the field it
+/// touches. The message is technical detail; the console localises the field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftError {
+    pub field: String,
+    pub message: String,
+}
+
+impl ConfigDocument {
+    /// Apply changes to a copy of this document.
+    ///
+    /// Only existing leaves can be changed, and the leaf's own type decides how
+    /// the text is parsed: an integer stays an integer, a boolean stays a
+    /// boolean. Nothing is added or removed, so comments, key order, unknown
+    /// fields and array-of-table blocks all survive by construction. The result
+    /// is parsed back, which is what makes a malformed edit an error instead of
+    /// a broken file.
+    pub fn with_draft(&self, changes: &[DraftChange]) -> Result<ConfigDocument, DraftError> {
+        let mut document = self.document.clone();
+        for change in changes {
+            apply_change(&mut document, change)?;
+        }
+        let raw = document.to_string();
+        ConfigDocument::parse(&raw).map_err(|error| DraftError {
+            field: "config".to_string(),
+            message: error.to_string(),
+        })
+    }
+}
+
+/// The kinds of leaf the console's forms can write. Only these fields may be
+/// created when the file omits them; an existing leaf of any type can still be
+/// edited, but a path nobody whitelisted can never be invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueKind {
+    String,
+    Integer,
+    Float,
+    Boolean,
+}
+
+/// The fields the configuration form may add when the TOML file does not spell
+/// them out (they exist in the process as defaults). Keep this in step with the
+/// inputs the page renders.
+pub fn editable_kind(path: &[String]) -> Option<ValueKind> {
+    let path: Vec<&str> = path.iter().map(String::as_str).collect();
+    match path.as_slice() {
+        ["server", "listen"] | ["server", "db_path"] => Some(ValueKind::String),
+        ["policy", "soft_threshold"]
+        | ["policy", "drift_threshold"]
+        | ["policy", "hard_margin"] => Some(ValueKind::Float),
+        ["policy", "allow_metered"] | ["policy", "probe_before_switch"] => Some(ValueKind::Boolean),
+        ["policy", "poll_interval_secs"]
+        | ["policy", "poll_interval_active_secs"]
+        | ["policy", "poll_interval_idle_secs"]
+        | ["policy", "max_retries"]
+        | ["policy", "connect_timeout_secs"]
+        | ["policy", "ttft_timeout_secs"]
+        | ["policy", "idle_timeout_secs"]
+        | ["policy", "max_body_bytes"] => Some(ValueKind::Integer),
+        _ => None,
+    }
+}
+
+fn apply_change(document: &mut DocumentMut, change: &DraftChange) -> Result<(), DraftError> {
+    let field = change.path.join(".");
+    if change.path.is_empty() {
+        return Err(DraftError {
+            field,
+            message: "a change needs a field path".to_string(),
+        });
+    }
+    let kind = editable_kind(&change.path);
+    let (parents, leaf) = change.path.split_at(change.path.len() - 1);
+    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+    for segment in parents {
+        if table.get(segment).is_none() {
+            let Some(_) = kind else {
+                return Err(DraftError {
+                    field: field.clone(),
+                    message: "unknown field".to_string(),
+                });
+            };
+            table.insert(segment, Item::Table(toml_edit::Table::new()));
+        }
+        let Some(next) = table.get_mut(segment).and_then(Item::as_table_like_mut) else {
+            return Err(DraftError {
+                field: field.clone(),
+                message: format!("{segment} is not a table"),
+            });
+        };
+        table = next;
+    }
+    if let Some(item) = table.get_mut(leaf[0].as_str()) {
+        return set_leaf(item, &change.value).map_err(|message| DraftError {
+            field: field.clone(),
+            message,
+        });
+    }
+    let Some(kind) = kind else {
+        return Err(DraftError {
+            field: field.clone(),
+            message: "unknown field".to_string(),
+        });
+    };
+    let value = value_for(kind, &change.value).map_err(|message| DraftError {
+        field: field.clone(),
+        message,
+    })?;
+    table.insert(leaf[0].as_str(), Item::Value(value));
+    Ok(())
+}
+
+fn value_for(kind: ValueKind, text: &str) -> Result<Value, String> {
+    Ok(match kind {
+        ValueKind::String => Value::from(text),
+        ValueKind::Integer => Value::from(
+            text.trim()
+                .parse::<i64>()
+                .map_err(|_| "not an integer".to_string())?,
+        ),
+        ValueKind::Float => Value::from(
+            text.trim()
+                .parse::<f64>()
+                .map_err(|_| "not a number".to_string())?,
+        ),
+        ValueKind::Boolean => Value::from(
+            text.trim()
+                .parse::<bool>()
+                .map_err(|_| "not true or false".to_string())?,
+        ),
+    })
+}
+
+/// Replace a leaf with newly typed text while keeping its whitespace and any
+/// trailing comment. The replacement's type follows the value already there.
+fn set_leaf(item: &mut Item, text: &str) -> Result<(), String> {
+    let Some(value) = item.as_value() else {
+        return Err("this field is not a single value".to_string());
+    };
+    let decoration = value.decor().clone();
+    let mut replacement = match value {
+        Value::String(_) => Value::from(text),
+        Value::Integer(_) => Value::from(
+            text.trim()
+                .parse::<i64>()
+                .map_err(|_| "not an integer".to_string())?,
+        ),
+        Value::Float(_) => Value::from(
+            text.trim()
+                .parse::<f64>()
+                .map_err(|_| "not a number".to_string())?,
+        ),
+        Value::Boolean(_) => Value::from(
+            text.trim()
+                .parse::<bool>()
+                .map_err(|_| "not true or false".to_string())?,
+        ),
+        _ => return Err("this field type cannot be edited here".to_string()),
+    };
+    *replacement.decor_mut() = decoration;
+    *item = Item::Value(replacement);
+    Ok(())
+}
+
+/// What one line of a document diff is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    Same,
+    Removed,
+    Added,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+/// A line diff between two reads of the file. Longest common subsequence, which
+/// is enough for a configuration file and never reorders a line to make a
+/// smaller diff.
+pub fn diff(left: &ConfigDocument, right: &ConfigDocument) -> Vec<DiffLine> {
+    let a: Vec<&str> = left.raw().lines().collect();
+    let b: Vec<&str> = right.raw().lines().collect();
+    let mut lengths = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lengths[i][j] = if a[i] == b[j] {
+                lengths[i + 1][j + 1] + 1
+            } else {
+                lengths[i + 1][j].max(lengths[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push(DiffLine {
+                kind: DiffKind::Same,
+                text: a[i].to_string(),
+            });
+            i += 1;
+            j += 1;
+        } else if lengths[i + 1][j] >= lengths[i][j + 1] {
+            out.push(DiffLine {
+                kind: DiffKind::Removed,
+                text: a[i].to_string(),
+            });
+            i += 1;
+        } else {
+            out.push(DiffLine {
+                kind: DiffKind::Added,
+                text: b[j].to_string(),
+            });
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        out.push(DiffLine {
+            kind: DiffKind::Removed,
+            text: a[i].to_string(),
+        });
+        i += 1;
+    }
+    while j < b.len() {
+        out.push(DiffLine {
+            kind: DiffKind::Added,
+            text: b[j].to_string(),
+        });
+        j += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +414,130 @@ key = { env = "XKIRO_KEY_2" }
         assert_eq!(a, fingerprint("listen = \"127.0.0.1:8787\"\n"));
         assert_ne!(a, b);
         assert_eq!(a.len(), 16);
+    }
+
+    const DRAFTABLE: &str = r#"
+[server]
+listen = "127.0.0.1:8787"   # keep this comment
+
+[policy]
+soft_threshold = 0.80
+max_retries = 2
+allow_metered = false
+
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.acc-1]
+label = "first"
+
+[unknown]
+keep = "this field"
+"#;
+
+    fn changes(pairs: &[(&[&str], &str)]) -> Vec<DraftChange> {
+        pairs
+            .iter()
+            .map(|(path, value)| DraftChange {
+                path: path.iter().map(|segment| (*segment).to_string()).collect(),
+                value: (*value).to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_draft_keeps_comments_order_and_unknown_fields() {
+        let document = ConfigDocument::parse(DRAFTABLE).expect("parse");
+        let edited = document
+            .with_draft(&changes(&[
+                (&["policy", "soft_threshold"], "0.75"),
+                (&["policy", "max_retries"], "3"),
+                (&["policy", "allow_metered"], "true"),
+                (
+                    &["providers", "mock", "base_url"],
+                    "https://api.example.test/v1",
+                ),
+                (
+                    &["providers", "mock", "accounts", "acc-1", "label"],
+                    "renamed",
+                ),
+            ]))
+            .expect("draft applies");
+        let raw = edited.raw();
+        assert!(raw.contains("soft_threshold = 0.75"));
+        assert!(raw.contains("max_retries = 3"));
+        assert!(raw.contains("allow_metered = true"));
+        assert!(raw.contains("https://api.example.test/v1"));
+        assert!(raw.contains("label = \"renamed\""));
+        assert!(raw.contains("# keep this comment"));
+        assert!(raw.contains("[unknown]"));
+        assert!(raw.contains("keep = \"this field\""));
+        assert!(
+            raw.find("[server]").unwrap() < raw.find("[unknown]").unwrap(),
+            "top-level table order is preserved"
+        );
+        assert!(
+            document.raw().contains("soft_threshold = 0.80"),
+            "the original is untouched"
+        );
+    }
+
+    #[test]
+    fn a_whitelisted_missing_field_is_created_with_its_type() {
+        let document = ConfigDocument::parse("[policy]\nsoft_threshold = 0.8\n").expect("parse");
+        let edited = document
+            .with_draft(&changes(&[
+                (&["policy", "poll_interval_secs"], "300"),
+                (&["policy", "probe_before_switch"], "true"),
+            ]))
+            .expect("defaults can be written down");
+        let raw = edited.raw();
+        assert!(raw.contains("poll_interval_secs = 300"));
+        assert!(raw.contains("probe_before_switch = true"));
+        assert!(raw.contains("soft_threshold = 0.8"));
+    }
+
+    #[test]
+    fn a_draft_cannot_invent_a_field_or_misread_its_type() {
+        let document = ConfigDocument::parse(DRAFTABLE).expect("parse");
+        let missing = document
+            .with_draft(&changes(&[(&["policy", "nope"], "1")]))
+            .expect_err("unknown field");
+        assert_eq!(missing.field, "policy.nope");
+
+        let wrong_type = document
+            .with_draft(&changes(&[(&["policy", "max_retries"], "many")]))
+            .expect_err("not an integer");
+        assert_eq!(wrong_type.field, "policy.max_retries");
+
+        let wrong_shape = document
+            .with_draft(&changes(&[(&["policy", "soft_threshold", "deep"], "1")]))
+            .expect_err("a float is not a table");
+        assert_eq!(wrong_shape.field, "policy.soft_threshold.deep");
+    }
+
+    #[test]
+    fn the_diff_names_the_removed_and_added_lines() {
+        let document = ConfigDocument::parse(DRAFTABLE).expect("parse");
+        let edited = document
+            .with_draft(&changes(&[(&["policy", "soft_threshold"], "0.75")]))
+            .expect("draft applies");
+        let changes_diff = diff(&document, &edited);
+        assert!(changes_diff.iter().any(|line| {
+            line.kind == DiffKind::Removed && line.text.contains("soft_threshold = 0.80")
+        }));
+        assert!(changes_diff.iter().any(|line| {
+            line.kind == DiffKind::Added && line.text.contains("soft_threshold = 0.75")
+        }));
+        assert!(
+            changes_diff
+                .iter()
+                .any(|line| line.kind == DiffKind::Same && line.text.contains("[policy]"))
+        );
+
+        let same = diff(&document, &document);
+        assert!(same.iter().all(|line| line.kind == DiffKind::Same));
     }
 
     #[test]

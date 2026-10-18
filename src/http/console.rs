@@ -7,9 +7,12 @@
 //! console's own header; a cross-site form can send none of the three.
 
 use super::AppState;
+use crate::config::Config;
+use crate::config_doc::{self, ConfigDocument, DraftChange};
 use crate::console::guard::{self, Verdict};
 use crate::console::layout::esc;
 use crate::console::{assets, board, config_page, copy::Lang, layout, layout::Nav};
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -147,6 +150,95 @@ pub(super) async fn config_page_handler(
     };
     body.push_str(&config_page::render(&view));
     page(&state, lang, Nav::Config, body)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ValidateRequest {
+    fingerprint: String,
+    draft: Vec<DraftEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DraftEntry {
+    path: Vec<String>,
+    value: String,
+}
+
+/// Check a draft without writing it: apply the changes to a copy of the file,
+/// run the same validator every command uses, and return the lines that would
+/// move. A form built against an older file is refused instead of validated
+/// against the wrong document.
+pub(super) async fn config_validate(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LangQuery>,
+    Json(request): Json<ValidateRequest>,
+) -> Response {
+    let lang = query.lang();
+    let path = state.console.config_path.clone();
+
+    let original = match ConfigDocument::read(std::path::Path::new(&path)) {
+        Ok(document) => document,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::failed(&path, &error.to_string(), lang),
+            );
+        }
+    };
+    if original.fingerprint() != request.fingerprint {
+        return fragment(StatusCode::CONFLICT, config_page::stale(lang));
+    }
+
+    let changes: Vec<DraftChange> = request
+        .draft
+        .into_iter()
+        .map(|entry| DraftChange {
+            path: entry.path,
+            value: entry.value,
+        })
+        .collect();
+    let edited = match original.with_draft(&changes) {
+        Ok(document) => document,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::rejected(&error.field, None, &error.message, lang),
+            );
+        }
+    };
+
+    let config: Config = match toml::from_str(edited.raw()) {
+        Ok(config) => config,
+        Err(error) => {
+            return fragment(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                config_page::rejected("config", None, &error.to_string(), lang),
+            );
+        }
+    };
+    if let Some(violation) = config.violation() {
+        return fragment(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            config_page::rejected(
+                &violation.field,
+                Some(violation.code),
+                &violation.message,
+                lang,
+            ),
+        );
+    }
+
+    let diff = config_doc::diff(&original, &edited);
+    fragment(StatusCode::OK, config_page::validated(&diff, lang))
+}
+
+fn fragment(status: StatusCode, html: String) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        Body::from(html),
+    )
+        .into_response()
 }
 
 /// CSS, JavaScript, the theme bootstrap and the favicon, all embedded in the

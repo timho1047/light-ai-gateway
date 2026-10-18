@@ -568,6 +568,34 @@ pub struct ResolvedRoute {
     pub model: String,
 }
 
+/// The first reason a configuration cannot be used.
+///
+/// `code` names the rule and `field` locates it in the TOML; both are stable so
+/// the console can translate a failure and highlight the setting without
+/// parsing the English `message`, which is what the CLI prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigViolation {
+    pub code: &'static str,
+    pub field: String,
+    pub message: String,
+}
+
+impl ConfigViolation {
+    fn new(code: &'static str, field: impl Into<String>, message: impl Into<String>) -> Self {
+        ConfigViolation {
+            code,
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Config> {
         let path = path.as_ref();
@@ -585,25 +613,40 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn validate(&self) -> Result<()> {
+    /// The first reason this configuration cannot be used, if any.
+    ///
+    /// The code names the rule and the field points at the TOML location; both
+    /// are stable so the console can translate the failure and highlight the
+    /// setting without parsing the English message. `None` means valid.
+    pub fn violation(&self) -> Option<ConfigViolation> {
         if !(0.0..=1.0).contains(&self.policy.soft_threshold) {
-            bail!(
-                "policy.soft_threshold must be within 0.0..=1.0, got {}",
-                self.policy.soft_threshold
-            );
+            return Some(ConfigViolation::new(
+                "soft_threshold_out_of_range",
+                "policy.soft_threshold",
+                format!(
+                    "policy.soft_threshold must be within 0.0..=1.0, got {}",
+                    self.policy.soft_threshold
+                ),
+            ));
         }
         if self.policy.soft_threshold >= 1.0 {
-            bail!(
+            return Some(ConfigViolation::new(
+                "soft_threshold_not_below_hard_gate",
+                "policy.soft_threshold",
                 "policy.soft_threshold must stay below 1.0: the gap between the soft \
                  threshold and the hard gate is the reserve that stops requests \
-                 overflowing into metered spend"
-            );
+                 overflowing into metered spend",
+            ));
         }
         if self.policy.max_retries > 8 {
-            bail!(
-                "policy.max_retries must be <= 8, got {}",
-                self.policy.max_retries
-            );
+            return Some(ConfigViolation::new(
+                "max_retries_too_high",
+                "policy.max_retries",
+                format!(
+                    "policy.max_retries must be <= 8, got {}",
+                    self.policy.max_retries
+                ),
+            ));
         }
         // Every unknown in this file is resolved in the direction that cannot
         // spend money. A negative or non-finite margin silently shrinks the
@@ -611,16 +654,24 @@ impl Config {
         // unconvertible value into zero -- removing, without a word, exactly the
         // protection the operator thought they had configured.
         if !self.policy.hard_margin.is_finite() || self.policy.hard_margin < 0.0 {
-            bail!(
-                "policy.hard_margin must be a finite value >= 0.0, got {}",
-                self.policy.hard_margin
-            );
+            return Some(ConfigViolation::new(
+                "hard_margin_invalid",
+                "policy.hard_margin",
+                format!(
+                    "policy.hard_margin must be a finite value >= 0.0, got {}",
+                    self.policy.hard_margin
+                ),
+            ));
         }
         if !self.policy.drift_threshold.is_finite() || self.policy.drift_threshold < 0.0 {
-            bail!(
-                "policy.drift_threshold must be a finite value >= 0.0, got {}",
-                self.policy.drift_threshold
-            );
+            return Some(ConfigViolation::new(
+                "drift_threshold_invalid",
+                "policy.drift_threshold",
+                format!(
+                    "policy.drift_threshold must be a finite value >= 0.0, got {}",
+                    self.policy.drift_threshold
+                ),
+            ));
         }
 
         // A loopback bind with no local key is a deliberate local-trust
@@ -632,16 +683,24 @@ impl Config {
             && let Ok(addr) = self.server.listen.parse::<std::net::SocketAddr>()
             && !addr.ip().is_loopback()
         {
-            bail!(
-                "server.listen {} is not loopback and [server] local_key is unset, so anything \
-                 able to reach that address could spend the pooled quota. Set local_key (lgw \
-                 keys add local gateway) or bind 127.0.0.1",
-                self.server.listen
-            );
+            return Some(ConfigViolation::new(
+                "listen_requires_local_key",
+                "server.listen",
+                format!(
+                    "server.listen {} is not loopback and [server] local_key is unset, so anything \
+                     able to reach that address could spend the pooled quota. Set local_key (lgw \
+                     keys add local gateway) or bind 127.0.0.1",
+                    self.server.listen
+                ),
+            ));
         }
 
         if self.providers.is_empty() {
-            bail!("no providers configured");
+            return Some(ConfigViolation::new(
+                "no_providers",
+                "providers",
+                "no providers configured",
+            ));
         }
 
         for (provider, models) in &self.prices {
@@ -653,20 +712,28 @@ impl Config {
                 let mut seen: Vec<String> = Vec::new();
                 for (i, s) in p.schedules.iter().enumerate() {
                     if s.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
-                        bail!(
-                            "[prices.{provider}.{model}] a tier name must not be empty: it is \
-                             the key its learned price is stored under"
-                        );
+                        return Some(ConfigViolation::new(
+                            "price_tier_name_empty",
+                            format!("prices.{provider}.{model}.schedules.{i}.name"),
+                            format!(
+                                "[prices.{provider}.{model}] a tier name must not be empty: it is \
+                                 the key its learned price is stored under"
+                            ),
+                        ));
                     }
                     let name = s
                         .name
                         .clone()
                         .unwrap_or_else(|| format!("schedule {}", i + 1));
                     if seen.contains(&name) {
-                        bail!(
-                            "[prices.{provider}.{model}] two price tiers are both named {name:?}: \
-                             the name is the key a learned price is stored under"
-                        );
+                        return Some(ConfigViolation::new(
+                            "price_tier_name_duplicate",
+                            format!("prices.{provider}.{model}.schedules.{i}.name"),
+                            format!(
+                                "[prices.{provider}.{model}] two price tiers are both named {name:?}: \
+                                 the name is the key a learned price is stored under"
+                            ),
+                        ));
                     }
                     seen.push(name);
                 }
@@ -675,7 +742,11 @@ impl Config {
 
         for (name, p) in &self.providers {
             if p.base_url.trim().is_empty() {
-                bail!("provider {name}: base_url must not be empty");
+                return Some(ConfigViolation::new(
+                    "base_url_empty",
+                    format!("providers.{name}.base_url"),
+                    format!("provider {name}: base_url must not be empty"),
+                ));
             }
             // An account only leaves AccountState::Unknown after a successful
             // probe, so a provider with no quota source can never be selected.
@@ -711,7 +782,11 @@ impl Config {
             // same stored secret, so it is rejected at the boundary rather than
             // discovered later as a mysteriously shared key.
             if name.contains('/') {
-                bail!("provider name {name:?} must not contain a slash");
+                return Some(ConfigViolation::new(
+                    "provider_name_contains_slash",
+                    "providers",
+                    format!("provider name {name:?} must not contain a slash"),
+                ));
             }
             // A malformed URL otherwise survives every check here and only
             // fails at request time, on the traffic path, for every client --
@@ -723,14 +798,29 @@ impl Config {
                 ("probe_base_url", p.probe_base_url.as_deref()),
             ] {
                 let Some(url) = url else { continue };
-                let parsed = reqwest::Url::parse(url).map_err(|e| {
-                    anyhow!("provider {name}: {field} {url:?} is not an absolute URL: {e}")
-                })?;
+                let parsed = match reqwest::Url::parse(url) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        return Some(ConfigViolation::new(
+                            "url_not_absolute",
+                            format!("providers.{name}.{field}"),
+                            format!("provider {name}: {field} {url:?} is not an absolute URL: {e}"),
+                        ));
+                    }
+                };
                 if !matches!(parsed.scheme(), "http" | "https") {
-                    bail!("provider {name}: {field} {url:?} must use http or https");
+                    return Some(ConfigViolation::new(
+                        "url_scheme_not_http",
+                        format!("providers.{name}.{field}"),
+                        format!("provider {name}: {field} {url:?} must use http or https"),
+                    ));
                 }
                 let Some(host) = parsed.host_str() else {
-                    bail!("provider {name}: {field} {url:?} names no host");
+                    return Some(ConfigViolation::new(
+                        "url_missing_host",
+                        format!("providers.{name}.{field}"),
+                        format!("provider {name}: {field} {url:?} names no host"),
+                    ));
                 };
                 // The key rides this URL in an Authorization header. Cleartext
                 // to a remote host hands it to anything on the path; loopback is
@@ -744,60 +834,119 @@ impl Config {
                     );
                 }
             }
-            for multiplier in [p.credit_multiplier]
-                .into_iter()
-                .chain(p.accounts.values().map(|a| a.credit_multiplier))
+            if let Some(m) = p.credit_multiplier
+                && (!m.is_finite() || m <= 0.0)
             {
-                let Some(m) = multiplier else { continue };
+                return Some(ConfigViolation::new(
+                    "credit_multiplier_invalid",
+                    format!("providers.{name}.credit_multiplier"),
+                    format!("provider {name}: credit_multiplier must be finite and > 0, got {m}"),
+                ));
+            }
+            for (acct, a) in &p.accounts {
+                let Some(m) = a.credit_multiplier else {
+                    continue;
+                };
                 if !m.is_finite() || m <= 0.0 {
-                    bail!("provider {name}: credit_multiplier must be finite and > 0, got {m}");
+                    return Some(ConfigViolation::new(
+                        "credit_multiplier_invalid",
+                        format!("providers.{name}.accounts.{acct}.credit_multiplier"),
+                        format!(
+                            "provider {name}: credit_multiplier must be finite and > 0, got {m}"
+                        ),
+                    ));
                 }
             }
             if p.accounts.is_empty() {
-                bail!("provider {name}: no accounts configured");
+                return Some(ConfigViolation::new(
+                    "provider_has_no_accounts",
+                    format!("providers.{name}.accounts"),
+                    format!("provider {name}: no accounts configured"),
+                ));
             }
             for (acct, a) in &p.accounts {
                 let _ = a; // secret resolution happens in build_accounts
                 if acct.trim().is_empty() {
-                    bail!("provider {name}: account id must not be empty");
+                    return Some(ConfigViolation::new(
+                        "account_id_empty",
+                        format!("providers.{name}.accounts"),
+                        format!("provider {name}: account id must not be empty"),
+                    ));
                 }
                 if acct.contains('/') {
-                    bail!(
-                        "provider {name}: account id {acct:?} must not contain a slash,                          because provider/account is the credential-store key"
-                    );
+                    return Some(ConfigViolation::new(
+                        "account_id_contains_slash",
+                        format!("providers.{name}.accounts"),
+                        format!(
+                            "provider {name}: account id {acct:?} must not contain a slash,                          because provider/account is the credential-store key"
+                        ),
+                    ));
                 }
             }
         }
 
         for (model, provider) in &self.routes {
             if !self.providers.contains_key(provider) {
-                bail!("route {model} points at unknown provider {provider}");
+                return Some(ConfigViolation::new(
+                    "route_unknown_provider",
+                    format!("routes.{model}"),
+                    format!("route {model} points at unknown provider {provider}"),
+                ));
             }
         }
 
         for (alias, provider) in &self.provider_prefix_aliases {
             if !self.providers.contains_key(provider) {
-                bail!("provider_prefix_aliases {alias} points at unknown provider {provider}");
+                return Some(ConfigViolation::new(
+                    "provider_prefix_alias_unknown_provider",
+                    format!("provider_prefix_aliases.{alias}"),
+                    format!(
+                        "provider_prefix_aliases {alias} points at unknown provider {provider}"
+                    ),
+                ));
             }
         }
 
         for (provider, models) in &self.prices {
             if !self.providers.contains_key(provider) {
-                bail!("[prices.{provider}] names an unknown provider");
+                return Some(ConfigViolation::new(
+                    "prices_unknown_provider",
+                    format!("prices.{provider}"),
+                    format!("[prices.{provider}] names an unknown provider"),
+                ));
             }
             for (model, price) in models {
                 if model.trim().is_empty() {
-                    bail!("[prices.{provider}] has an empty model name");
+                    return Some(ConfigViolation::new(
+                        "price_model_name_empty",
+                        format!("prices.{provider}"),
+                        format!("[prices.{provider}] has an empty model name"),
+                    ));
                 }
                 // Surface a malformed window at startup rather than as a
                 // silently wrong price at request time.
-                price.schedule(provider, model)?;
+                if let Err(e) = price.schedule(provider, model) {
+                    return Some(ConfigViolation::new(
+                        "price_schedule_invalid",
+                        format!("prices.{provider}.{model}.schedules"),
+                        format!("{e:#}"),
+                    ));
+                }
             }
         }
 
         // Two providers claiming the same base model name is the collision this
         // design deliberately avoids; the prefix alias is the escape hatch.
-        Ok(())
+        None
+    }
+
+    /// Reject a configuration that cannot be used, with the operator-facing
+    /// English message the CLI prints.
+    pub fn validate(&self) -> Result<()> {
+        match self.violation() {
+            Some(v) => Err(anyhow!(v.message)),
+            None => Ok(()),
+        }
     }
 
     /// Resolve a client-supplied model name to a provider and upstream model.
@@ -1847,5 +1996,152 @@ base_url = "https://api.xkiro.com/v1"
         let mut cfg = cfg_with_two_providers();
         cfg.providers.get_mut("xkiro").unwrap().credit_multiplier = Some(f64::NAN);
         assert!(cfg.validate().is_err());
+    }
+
+    fn violation_of(cfg: &Config) -> ConfigViolation {
+        cfg.violation().expect("configuration must be invalid")
+    }
+
+    fn validate_message(cfg: &Config) -> String {
+        cfg.validate()
+            .expect_err("configuration must be invalid")
+            .to_string()
+    }
+
+    /// The console translates and highlights from these two fields, so they are
+    /// part of the contract: renaming one silently breaks every error card that
+    /// reads it, and the English message is not a substitute.
+    #[test]
+    fn violations_name_a_stable_code_and_field() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.soft_threshold = 1.5;
+        let v = violation_of(&cfg);
+        assert_eq!(v.code, "soft_threshold_out_of_range");
+        assert_eq!(v.field, "policy.soft_threshold");
+        assert_eq!(v.to_string(), v.message, "Display prints the message");
+
+        // 1.0 passes the range check and is refused by the reserve check, so it
+        // is a distinct code rather than the same failure spelled twice.
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.soft_threshold = 1.0;
+        let v = violation_of(&cfg);
+        assert_eq!(v.code, "soft_threshold_not_below_hard_gate");
+        assert_eq!(v.field, "policy.soft_threshold");
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.clear();
+        let v = violation_of(&cfg);
+        assert_eq!(v.code, "no_providers");
+        assert_eq!(v.field, "providers");
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.routes.insert("m".to_string(), "nope".to_string());
+        let v = violation_of(&cfg);
+        assert_eq!(v.code, "route_unknown_provider");
+        assert_eq!(v.field, "routes.m");
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().base_url = "api.example.com/v1".to_string();
+        let v = violation_of(&cfg);
+        assert_eq!(v.code, "url_not_absolute");
+        assert_eq!(v.field, "providers.xkiro.base_url");
+    }
+
+    /// validate() is what the CLI calls, so its text is the English an operator
+    /// already sees; the structured form must not move a byte of it.
+    #[test]
+    fn validate_keeps_the_old_english_messages() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.soft_threshold = 1.5;
+        let expected = "policy.soft_threshold must be within 0.0..=1.0, got 1.5";
+        assert_eq!(validate_message(&cfg), expected);
+        assert_eq!(violation_of(&cfg).message, expected);
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.soft_threshold = 1.0;
+        let expected = "policy.soft_threshold must stay below 1.0: the gap between the soft \
+                        threshold and the hard gate is the reserve that stops requests \
+                        overflowing into metered spend";
+        assert_eq!(validate_message(&cfg), expected);
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.clear();
+        assert_eq!(validate_message(&cfg), "no providers configured");
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.routes.insert("m".to_string(), "nope".to_string());
+        assert_eq!(
+            validate_message(&cfg),
+            "route m points at unknown provider nope"
+        );
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.providers.get_mut("xkiro").unwrap().base_url = "api.example.com/v1".to_string();
+        assert_eq!(
+            validate_message(&cfg),
+            "provider xkiro: base_url \"api.example.com/v1\" is not an absolute URL: \
+             relative URL without a base"
+        );
+    }
+
+    /// A config with several faults reports the check that came first before the
+    /// refactor, not the one that happens to be easiest to compute.
+    #[test]
+    fn the_first_failure_in_check_order_is_reported() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.soft_threshold = 2.0;
+        cfg.providers.clear();
+        assert_eq!(violation_of(&cfg).code, "soft_threshold_out_of_range");
+
+        let mut cfg = cfg_with_two_providers();
+        cfg.policy.max_retries = 9;
+        cfg.policy.hard_margin = -1.0;
+        cfg.providers.clear();
+        assert_eq!(violation_of(&cfg).code, "max_retries_too_high");
+
+        // Provider faults are found before route faults, so the bad URL wins
+        // over the unknown route even though it is checked in a nested loop.
+        let mut cfg = cfg_with_two_providers();
+        cfg.routes.insert("m".to_string(), "nope".to_string());
+        cfg.providers.get_mut("xkiro").unwrap().base_url = "api.example.com/v1".to_string();
+        assert_eq!(violation_of(&cfg).code, "url_not_absolute");
+    }
+
+    /// The schedule error arrives as an anyhow context chain. A violation carries
+    /// one string, so the chain is flattened with the same separator that
+    /// alternate Display printed before; dropping the tail would hide which
+    /// window and field failed.
+    #[test]
+    fn a_malformed_schedule_keeps_its_full_message() {
+        let mut cfg = cfg_with_two_providers();
+        cfg.prices.insert(
+            "xkiro".to_string(),
+            BTreeMap::from([(
+                "m".to_string(),
+                ModelPriceConfig {
+                    input: 1.0,
+                    output: 2.0,
+                    cache_read: None,
+                    schedules: vec![ScheduleConfig {
+                        name: None,
+                        days: "mon-fri".to_string(),
+                        hours: "01:00-01:00".to_string(),
+                        tz: None,
+                        input: 1.0,
+                        output: 2.0,
+                        cache_read: None,
+                    }],
+                },
+            )]),
+        );
+        let v = violation_of(&cfg);
+        assert_eq!(v.code, "price_schedule_invalid");
+        assert_eq!(v.field, "prices.xkiro.m.schedules");
+        assert_eq!(
+            v.message,
+            "[prices.xkiro.m] schedule 1: hours: hour range \"01:00-01:00\" is empty; \
+             start and end are the same"
+        );
+        assert_eq!(validate_message(&cfg), v.message);
     }
 }

@@ -1,13 +1,16 @@
-//! The Configuration page, rendered as a report.
+//! The Configuration page: a draft editor over the file the gateway is running.
 //!
-//! It shows the file the gateway is actually running, every known value, which
-//! fields apply live and which need a restart, and a read-only view of the raw
-//! document with literal secrets already redacted by the caller. This slice is
-//! read-only: the editable draft and the apply pipeline land in later tasks.
+//! Server and policy fields are inputs; provider, account, route and price rows
+//! are still a report until their edit paths land. Every field carries a live or
+//! restart-only marker, and the raw TOML view below shows the file with literal
+//! secrets redacted. Validating a draft never writes: it checks the changed file
+//! and shows the exact lines that would move.
 
 use super::copy::{Lang, Strings};
 use super::layout::esc;
+use super::violations;
 use crate::config::{AccountConfig, Config, QuotaAdapter};
+use crate::config_doc::{DiffKind, DiffLine};
 use std::fmt::Write;
 
 pub struct ConfigView<'a> {
@@ -23,11 +26,24 @@ pub fn render(view: &ConfigView) -> String {
     let s = view.lang.strings();
     let mut out = String::new();
     out.push_str(&header(view, s));
+    let _ = write!(
+        out,
+        "<form id=\"config-form\" data-config-draft data-fingerprint=\"{}\">",
+        esc(view.fingerprint)
+    );
 
     out.push_str(&section(s.section_server, |body| {
-        field(body, "server.listen", &view.config.server.listen, false, s);
-        field(
+        editable_text(
             body,
+            &["server", "listen"],
+            "server.listen",
+            &view.config.server.listen,
+            false,
+            s,
+        );
+        editable_text(
+            body,
+            &["server", "db_path"],
             "server.db_path",
             &view.config.server.db_path,
             false,
@@ -42,55 +58,105 @@ pub fn render(view: &ConfigView) -> String {
 
     out.push_str(&section(s.section_policy, |body| {
         let p = &view.config.policy;
-        live(body, "policy.soft_threshold", &fnum(p.soft_threshold), s);
-        live(body, "policy.allow_metered", &flag(p.allow_metered), s);
-        live(
+        editable_text(
             body,
+            &["policy", "soft_threshold"],
+            "policy.soft_threshold",
+            &fnum(p.soft_threshold),
+            true,
+            s,
+        );
+        editable_bool(
+            body,
+            &["policy", "allow_metered"],
+            "policy.allow_metered",
+            p.allow_metered,
+            true,
+            s,
+        );
+        editable_text(
+            body,
+            &["policy", "poll_interval_secs"],
             "policy.poll_interval_secs",
             &p.poll_interval_secs.to_string(),
+            true,
             s,
         );
-        live(
+        editable_text(
             body,
+            &["policy", "poll_interval_active_secs"],
             "policy.poll_interval_active_secs",
             &p.poll_interval_active_secs.to_string(),
+            true,
             s,
         );
-        live(
+        editable_text(
             body,
+            &["policy", "poll_interval_idle_secs"],
             "policy.poll_interval_idle_secs",
             &p.poll_interval_idle_secs.to_string(),
+            true,
             s,
         );
-        live(body, "policy.drift_threshold", &fnum(p.drift_threshold), s);
-        live(body, "policy.hard_margin", &fnum(p.hard_margin), s);
-        live(body, "policy.max_retries", &p.max_retries.to_string(), s);
-        live(
+        editable_text(
             body,
+            &["policy", "drift_threshold"],
+            "policy.drift_threshold",
+            &fnum(p.drift_threshold),
+            true,
+            s,
+        );
+        editable_text(
+            body,
+            &["policy", "hard_margin"],
+            "policy.hard_margin",
+            &fnum(p.hard_margin),
+            true,
+            s,
+        );
+        editable_text(
+            body,
+            &["policy", "max_retries"],
+            "policy.max_retries",
+            &p.max_retries.to_string(),
+            true,
+            s,
+        );
+        editable_text(
+            body,
+            &["policy", "connect_timeout_secs"],
             "policy.connect_timeout_secs",
             &p.connect_timeout_secs.to_string(),
+            true,
             s,
         );
-        live(
+        editable_text(
             body,
+            &["policy", "ttft_timeout_secs"],
             "policy.ttft_timeout_secs",
             &p.ttft_timeout_secs.to_string(),
+            true,
             s,
         );
-        live(
+        editable_text(
             body,
+            &["policy", "idle_timeout_secs"],
             "policy.idle_timeout_secs",
             &p.idle_timeout_secs.to_string(),
+            true,
             s,
         );
-        live(
+        editable_bool(
             body,
+            &["policy", "probe_before_switch"],
             "policy.probe_before_switch",
-            &flag(p.probe_before_switch),
+            p.probe_before_switch,
+            true,
             s,
         );
-        field(
+        editable_text(
             body,
+            &["policy", "max_body_bytes"],
             "policy.max_body_bytes",
             &p.max_body_bytes.to_string(),
             false,
@@ -202,10 +268,172 @@ pub fn render(view: &ConfigView) -> String {
         }
     }));
 
+    out.push_str(&config_actions(view, s));
+    out.push_str("</form>");
+
     if let Some(raw) = view.raw {
         out.push_str(&raw_section(raw, s));
     }
     out
+}
+
+/// What the form sends: one entry per changed leaf, the path split into TOML
+/// keys so a model name containing a dot or slash is never parsed as structure.
+fn data_path(path: &[&str]) -> String {
+    let segments: Vec<String> = path
+        .iter()
+        .map(|segment| format!("\"{segment}\""))
+        .collect();
+    format!("[{}]", segments.join(","))
+}
+
+fn marker(live: bool, s: &Strings) -> String {
+    let (class, text) = if live {
+        ("live", s.config_live)
+    } else {
+        ("restart", s.config_restart)
+    };
+    format!("<span class=\"tag {}\">{}</span>", class, esc(text))
+}
+
+fn editable_text(
+    out: &mut String,
+    path: &[&str],
+    label: &str,
+    value: &str,
+    live: bool,
+    s: &Strings,
+) {
+    let _ = write!(
+        out,
+        r#"<div class="field"><span class="field-label mono">{}</span><input type="text" value="{}" data-path="{}" data-initial="{}" spellcheck="false" autocomplete="off"><span class="hint">{}</span></div>"#,
+        esc(label),
+        esc(value),
+        esc(&data_path(path)),
+        esc(value),
+        marker(live, s),
+    );
+}
+
+fn editable_bool(
+    out: &mut String,
+    path: &[&str],
+    label: &str,
+    value: bool,
+    live: bool,
+    s: &Strings,
+) {
+    let true_selected = if value { " selected" } else { "" };
+    let false_selected = if value { "" } else { " selected" };
+    let _ = write!(
+        out,
+        r#"<div class="field"><span class="field-label mono">{}</span><select data-path="{}" data-initial="{}"><option value="true"{true_selected}>true</option><option value="false"{false_selected}>false</option></select><span class="hint">{}</span></div>"#,
+        esc(label),
+        esc(&data_path(path)),
+        if value { "true" } else { "false" },
+        marker(live, s),
+    );
+}
+
+fn config_actions(view: &ConfigView, s: &Strings) -> String {
+    let url = format!("/console/api/config/validate?lang={}", view.lang.code());
+    format!(
+        r#"<div class="config-actions">
+  <button class="btn btn-primary" type="button" data-config-validate data-validate-url="{}">{}</button>
+  <span class="hint">{}</span>
+</div>
+<div class="config-result" data-config-result aria-live="polite"></div>"#,
+        esc(&url),
+        esc(s.config_validate),
+        esc(s.config_validate_note),
+    )
+}
+
+const CHANGED_ONLY: [DiffKind; 2] = [DiffKind::Removed, DiffKind::Added];
+
+/// The panel after a valid draft: the exact lines that would move, and nothing
+/// else. The page still writes nothing; the apply path is a later task.
+pub fn validated(diff: &[DiffLine], lang: Lang) -> String {
+    let s = lang.strings();
+    let mut body = format!(
+        "<div class=\"banner ok\"><b>{}</b></div>",
+        esc(s.config_draft_ok)
+    );
+    let changed: Vec<&DiffLine> = diff
+        .iter()
+        .filter(|line| CHANGED_ONLY.contains(&line.kind))
+        .collect();
+    if changed.is_empty() {
+        let _ = write!(
+            body,
+            "<div class=\"empty\">{}</div>",
+            esc(s.config_no_changes)
+        );
+        return body;
+    }
+    let mut pre = String::new();
+    for line in changed {
+        let (sign, class) = match line.kind {
+            DiffKind::Removed => ("-", "minus"),
+            DiffKind::Added => ("+", "plus"),
+            DiffKind::Same => continue,
+        };
+        let _ = writeln!(
+            pre,
+            "<span class=\"{class}\">{sign}{}</span>",
+            esc(&line.text)
+        );
+    }
+    let _ = write!(
+        body,
+        r#"<div class="diff"><div class="diff-head">{}</div><pre>{}</pre></div>"#,
+        esc(s.config_diff_title),
+        pre.trim_end(),
+    );
+    body
+}
+
+/// The panel after a rejected draft: the field, a page-language headline from
+/// the stable code, and the validator's English sentence as technical detail.
+pub fn rejected(field: &str, code: Option<&str>, message: &str, lang: Lang) -> String {
+    let s = lang.strings();
+    let headline = code
+        .and_then(|code| violations::headline(lang, code))
+        .unwrap_or(message);
+    let detail = if code.is_some() && lang == Lang::Zh {
+        format!("<div class=\"detail mono\">{}</div>", esc(message))
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<div class="banner error"><b>{}</b></div>
+<ul class="error-list"><li><span class="field-label mono">{}</span><div>{}</div>{}</li></ul>"#,
+        esc(s.config_draft_invalid),
+        esc(field),
+        esc(headline),
+        detail,
+    )
+}
+
+/// The draft was built against a file that has moved since.
+pub fn stale(lang: Lang) -> String {
+    let s = lang.strings();
+    format!(
+        "<div class=\"banner warn\"><b>{}</b></div>",
+        esc(s.config_stale)
+    )
+}
+
+/// A file that cannot be read or parsed; the draft never reached the validator.
+pub fn failed(field: &str, message: &str, lang: Lang) -> String {
+    let s = lang.strings();
+    format!(
+        r#"<div class="banner error"><b>{}</b></div>
+<ul class="error-list"><li><span class="field-label mono">{}</span><div class="detail mono">{}</div></li></ul>"#,
+        esc(s.config_draft_invalid),
+        esc(field),
+        esc(message),
+    )
 }
 
 fn header(view: &ConfigView, s: &Strings) -> String {
@@ -363,6 +591,7 @@ fn flag(v: bool) -> String {
 mod tests {
     use super::*;
     use crate::config::sample_toml;
+    use crate::config_doc::{self, ConfigDocument, DraftChange};
 
     fn view<'a>(config: &'a Config, raw: &'a str) -> ConfigView<'a> {
         ConfigView {
@@ -377,6 +606,57 @@ mod tests {
 
     fn sample() -> Config {
         Config::from_toml_str(sample_toml()).expect("sample config")
+    }
+
+    #[test]
+    fn a_rejected_draft_names_the_field_and_speaks_the_page_language() {
+        let html = rejected(
+            "policy.soft_threshold",
+            Some("soft_threshold_out_of_range"),
+            "policy.soft_threshold must be within 0.0..=1.0, got 1.5",
+            Lang::Zh,
+        );
+        assert!(html.contains("policy.soft_threshold"));
+        assert!(html.contains("0.0 到 1.0"));
+        assert!(
+            html.contains("must be within 0.0..=1.0"),
+            "English detail is kept"
+        );
+        let english = rejected(
+            "policy.soft_threshold",
+            Some("soft_threshold_out_of_range"),
+            "bad",
+            Lang::En,
+        );
+        assert!(english.contains("bad"));
+    }
+
+    #[test]
+    fn a_valid_draft_shows_only_the_moved_lines() {
+        let document = ConfigDocument::parse("[policy]\nsoft_threshold = 0.8\n").expect("doc");
+        let edited = document
+            .with_draft(&[DraftChange {
+                path: vec!["policy".to_string(), "soft_threshold".to_string()],
+                value: "0.75".to_string(),
+            }])
+            .expect("draft");
+        let html = validated(&config_doc::diff(&document, &edited), Lang::En);
+        assert!(html.contains("-soft_threshold = 0.8"));
+        assert!(html.contains("+soft_threshold = 0.75"));
+        assert!(html.contains("Pending change"));
+        assert!(
+            !html.contains("[policy]"),
+            "unchanged lines are not repeated"
+        );
+
+        let same = validated(&config_doc::diff(&document, &document), Lang::En);
+        assert!(same.contains("No line would change."));
+    }
+
+    #[test]
+    fn a_stale_draft_asks_for_a_reload() {
+        let html = stale(Lang::En);
+        assert!(html.contains("changed after this page loaded"));
     }
 
     #[test]

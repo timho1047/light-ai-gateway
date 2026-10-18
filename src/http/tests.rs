@@ -1602,3 +1602,149 @@ async fn an_unreadable_configuration_file_is_a_banner_not_a_crash() {
         "no raw view without a readable file"
     );
 }
+
+const VALIDATE_TOML: &str = r#"[server]
+listen = "127.0.0.1:8787"
+
+[policy]
+soft_threshold = 0.8
+
+[providers.mock]
+adapter = "none"
+base_url = "http://127.0.0.1:1/v1"
+
+[providers.mock.accounts.a1]
+key = "sk-validate-SECRET"
+label = "validated account"
+
+[routes]
+"mock/model" = "mock"
+"#;
+
+/// A console router whose configuration page describes a real temporary file,
+/// with a backend built from the same configuration.
+async fn validate_router() -> (String, std::path::PathBuf, std::path::PathBuf) {
+    let config = Config::from_toml_str(VALIDATE_TOML).expect("valid config");
+    let accounts = config
+        .build_accounts(&crate::secrets::CredentialStore::memory())
+        .unwrap();
+    let pool = Pool::new(accounts, &config.policy);
+    activate(&pool, "mock/a1", 0);
+    let fake = Arc::new(FakeBackend::new(config, pool));
+
+    let unique = format!(
+        "lgw-validate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, VALIDATE_TOML).unwrap();
+
+    let addr = spawn_console_router_with(fake, path.to_str().unwrap()).await;
+    (addr, path, dir)
+}
+
+fn draft_body(value: &str) -> serde_json::Value {
+    serde_json::json!({
+        "fingerprint": crate::config_doc::fingerprint(VALIDATE_TOML),
+        "draft": [{"path": ["policy", "soft_threshold"], "value": value}]
+    })
+}
+
+#[tokio::test]
+async fn a_valid_draft_shows_the_diff_and_writes_nothing() {
+    let (addr, path, dir) = validate_router().await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{addr}/console/api/config/validate?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&draft_body("0.75"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let html = response.text().await.unwrap();
+    assert!(html.contains("-soft_threshold = 0.8"));
+    assert!(html.contains("+soft_threshold = 0.75"));
+    assert!(html.contains("Pending change"));
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("soft_threshold = 0.8"),
+        "validate must not write"
+    );
+    assert!(!on_disk.contains("soft_threshold = 0.75"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn an_invalid_draft_is_a_field_error_in_both_languages() {
+    let (addr, _path, dir) = validate_router().await;
+    let client = reqwest::Client::new();
+    let english = client
+        .post(format!("{addr}/console/api/config/validate?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&draft_body("1.5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(english.status(), 422);
+    let html = english.text().await.unwrap();
+    assert!(html.contains("policy.soft_threshold"));
+    assert!(html.contains("must be within 0.0..=1.0"));
+
+    let chinese = client
+        .post(format!("{addr}/console/api/config/validate?lang=zh"))
+        .header("x-lgw-console", "1")
+        .json(&draft_body("1.5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(chinese.status(), 422);
+    let html = chinese.text().await.unwrap();
+    assert!(html.contains("0.0 到 1.0"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_draft_from_an_older_file_asks_for_a_reload() {
+    let (addr, _path, dir) = validate_router().await;
+    let client = reqwest::Client::new();
+    let stale = client
+        .post(format!("{addr}/console/api/config/validate?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({
+            "fingerprint": "0000000000000000",
+            "draft": [{"path": ["policy", "soft_threshold"], "value": "0.75"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 409);
+    assert!(
+        stale
+            .text()
+            .await
+            .unwrap()
+            .contains("changed after this page loaded")
+    );
+
+    let unknown = client
+        .post(format!("{addr}/console/api/config/validate?lang=en"))
+        .header("x-lgw-console", "1")
+        .json(&serde_json::json!({
+            "fingerprint": crate::config_doc::fingerprint(VALIDATE_TOML),
+            "draft": [{"path": ["policy", "made_up"], "value": "1"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), 422);
+    assert!(unknown.text().await.unwrap().contains("policy.made_up"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

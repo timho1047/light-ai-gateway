@@ -419,6 +419,10 @@ pub(crate) fn build_router_with_console(
     let operator = Router::new()
         .route("/", get(console::board_page))
         .route("/config", get(console::config_page_handler))
+        .route(
+            "/console/api/config/validate",
+            post(console::config_validate),
+        )
         .route("/console/partials/board", get(console::board_partial))
         .route("/console/assets/{*path}", get(console::asset))
         .layer(middleware::from_fn_with_state(

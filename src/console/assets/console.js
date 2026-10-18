@@ -314,6 +314,85 @@
     });
   }
 
+
+  /* -------------------------------------------- configuration drafts */
+
+  // The configuration form posts the changed leaves, never the whole file:
+  // each entry carries the TOML path as segments, so a model name with a dot or
+  // a slash is never split by a string parser on either side.
+  var draftForms = document.querySelectorAll("form[data-config-draft]");
+  for (var df = 0; df < draftForms.length; df++) {
+    (function (form) {
+      var button = form.querySelector("[data-config-validate]");
+      var result = document.querySelector("[data-config-result]");
+      var fields = form.querySelectorAll("[data-path]");
+
+      function draft() {
+        var entries = [];
+        for (var i = 0; i < fields.length; i++) {
+          var field = fields[i];
+          if (field.value === field.getAttribute("data-initial")) {
+            continue;
+          }
+          entries.push({
+            path: JSON.parse(field.getAttribute("data-path")),
+            value: field.value
+          });
+        }
+        return entries;
+      }
+
+      async function validate() {
+        if (!button || !result) { return; }
+        button.disabled = true;
+        result.setAttribute("aria-busy", "true");
+        try {
+          var response = await fetch(button.getAttribute("data-validate-url"), {
+            method: "POST",
+            headers: headers(),
+            credentials: "same-origin",
+            body: JSON.stringify({
+              fingerprint: form.getAttribute("data-fingerprint"),
+              draft: draft()
+            })
+          });
+          result.innerHTML = await response.text();
+          result.classList.toggle("is-error", !response.ok);
+        } catch (error) {
+          result.textContent = String(error);
+          result.classList.add("is-error");
+        } finally {
+          button.disabled = false;
+          result.removeAttribute("aria-busy");
+        }
+      }
+
+      if (button) {
+        button.addEventListener("click", validate);
+      }
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        validate();
+      });
+
+      for (var f = 0; f < fields.length; f++) {
+        (function (field) {
+          function mark() {
+            var row = field.closest(".field");
+            if (row) {
+              row.classList.toggle(
+                "changed",
+                field.value !== field.getAttribute("data-initial")
+              );
+            }
+          }
+          field.addEventListener("input", mark);
+          field.addEventListener("change", mark);
+        })(fields[f]);
+      }
+    })(draftForms[df]);
+  }
+
   /* flash messages vanish on their own; a close chip can remove them early */
   var flashes = document.querySelectorAll(".flash .close");
   for (var s = 0; s < flashes.length; s++) {

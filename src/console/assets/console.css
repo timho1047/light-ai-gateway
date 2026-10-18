@@ -1479,3 +1479,54 @@ html[data-theme="dark"] .theme-toggle .theme-dark-label { display: none; }
     grid-template-columns: 1fr;
   }
 }
+
+.config-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 22px 0 8px;
+}
+
+.config-actions .hint {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.config-result {
+  margin-bottom: 18px;
+}
+
+.config-result[aria-busy="true"] {
+  opacity: 0.6;
+}
+
+.field.changed select {
+  border-color: var(--warn);
+}
+
+.diff .same {
+  color: var(--faint);
+}
+
+.error-list {
+  margin: 0 0 18px;
+  padding: 0;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.error-list li {
+  display: grid;
+  gap: 4px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+}
+
+.error-list .detail {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--muted);
+}
